@@ -7,7 +7,8 @@
 //   OnOK()     runs on the JS main thread     → converts to Napi::Value.
 //
 // EvalResult captures everything the kernel sends for one cell:
-//   cellIndex, outputName, return value, Print[] lines, and messages.
+//   cellIndex (1-based, tracked by WstpSession::nextLine_), outputName,
+//   return value, Print[] lines, and messages.
 // This means the Node.js event loop is NEVER blocked, so abort() fires
 // correctly while Execute() is waiting inside WSNextPacket() on the thread pool.
 // =============================================================================
@@ -54,8 +55,8 @@ struct WExpr {
 // EvalResult — everything the kernel sends for one cell (thread-pool safe).
 // ---------------------------------------------------------------------------
 struct EvalResult {
-    int64_t                  cellIndex  = 0;   // from InputNamePacket  "In[42]:="
-    std::string              outputName;       // from OutputNamePacket "Out[42]=" (empty if Null)
+    int64_t                  cellIndex  = 0;   // 1-based counter, tracked by WstpSession::nextLine_
+    std::string              outputName;       // "Out[n]=" when result is non-Null, "" otherwise
     WExpr                    result;           // the ReturnPacket payload
     std::vector<std::string> print;            // TextPacket lines in order
     std::vector<std::string> messages;         // e.g. "Power::infy: Infinite expression..."
@@ -671,14 +672,16 @@ public:
                    std::string                   expr,
                    EvalOptions                   opts,
                    std::atomic<bool>&            abortFlag,
-                   std::function<void()>         completionCb)
+                   std::function<void()>         completionCb,
+                   int64_t                       cellIndex)
         : Napi::AsyncWorker(deferred.Env()),
           deferred_(std::move(deferred)),
           lp_(lp),
           expr_(std::move(expr)),
           opts_(std::move(opts)),
           abortFlag_(abortFlag),
-          completionCb_(std::move(completionCb))
+          completionCb_(std::move(completionCb)),
+          cellIndex_(cellIndex)
     {}
 
     // ---- thread-pool thread: send packet; block until response ----
@@ -691,6 +694,20 @@ public:
             SetError("Failed to send EvaluatePacket to kernel");
         } else {
             result_ = DrainToEvalResult(lp_, &opts_);
+            // Stamp the cell index we pre-captured before queuing.
+            result_.cellIndex = cellIndex_;
+            // Derive outputName: "Out[n]=" unless result is Null or aborted.
+            // EvaluatePacket never sends OutputNamePacket, so we compute it.
+            if (!result_.aborted && result_.result.kind == WExpr::Symbol) {
+                const std::string& sv = result_.result.strVal;
+                std::string bare = sv;
+                auto tick = sv.rfind('`');
+                if (tick != std::string::npos) bare = sv.substr(tick + 1);
+                if (bare != "Null")
+                    result_.outputName = "Out[" + std::to_string(cellIndex_) + "]=";
+            } else if (!result_.aborted && result_.result.kind != WExpr::WError) {
+                result_.outputName = "Out[" + std::to_string(cellIndex_) + "]=";
+            }
         }
         if (opts_.hasOnPrint)        opts_.onPrint.Release();
         if (opts_.hasOnMessage)      opts_.onMessage.Release();
@@ -755,6 +772,7 @@ private:
     EvalOptions              opts_;
     std::atomic<bool>&       abortFlag_;
     std::function<void()>    completionCb_;
+    int64_t                  cellIndex_;
     EvalResult               result_;
 };
 
@@ -979,7 +997,8 @@ public:
             std::move(item.expr),
             std::move(item.opts),
             abortFlag_,
-            [this]() { busy_.store(false); MaybeStartNext(); }
+            [this]() { busy_.store(false); MaybeStartNext(); },
+            nextLine_.fetch_add(1)
         );
         worker->Queue();
     }
@@ -1365,6 +1384,7 @@ private:
     WSLINK                      lp_;
     bool                        open_;
     pid_t                       kernelPid_  = 0;  // child process — killed on CleanUp
+    std::atomic<int64_t>        nextLine_{1};      // 1-based In[n] counter for EvalResult.cellIndex
     std::atomic<bool>           abortFlag_{false};
     std::atomic<bool>           busy_{false};
     std::mutex                  queueMutex_;

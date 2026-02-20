@@ -14,7 +14,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
 
 ## Table of Contents
 
-1. [Setup](#setup)
+1. [Installation](#installation)
 2. [Return types — `WExpr` and `EvalResult`](#return-types)
 3. [`WstpSession` — main evaluation session](#wstpsession)
    - [Constructor](#constructor) — launch a kernel and open a session
@@ -43,20 +43,70 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
 
 ---
 
-## Setup
+## Installation
 
-Build the native addon (requires Clang and the Wolfram WSTP SDK):
+### Prerequisites
+
+| Requirement | Notes |
+|-------------|-------|
+| macOS | Tested on macOS 13+; Linux should work with minor path changes |
+| Node.js ≥ 18 | Earlier versions may work but are untested |
+| Clang / Xcode Command Line Tools | `xcode-select --install` |
+| Wolfram Mathematica or Wolfram Engine | Provides `WolframKernel` and the WSTP SDK headers/libraries |
+
+### 1. Clone
 
 ```bash
-cd "WSTP Backend"
+git clone https://github.com/vanbaalon/mathematica-wstp-node.git
+cd mathematica-wstp-node
+```
+
+### 2. Install Node dependencies
+
+```bash
+npm install
+```
+
+This pulls in `node-addon-api` and `node-gyp` (used by the build script).
+
+### 3. Compile the native addon
+
+```bash
 bash build.sh
 ```
 
 Output: `build/Release/wstp.node`
 
+The script automatically locates the WSTP SDK inside the default Wolfram installation
+(`/Applications/Wolfram 3.app/...`).  If your Wolfram is installed elsewhere, edit the
+`WSTP_INC` and `WSTP_LIB` variables at the top of `build.sh`.
+
+### 4. Run the test suite
+
+```bash
+node test.js
+```
+
+Expected last line: `All 28 tests passed.`
+
+### 5. Quick smoke test
+
+```js
+const { WstpSession } = require('./build/Release/wstp.node');
+
+(async () => {
+  const session = new WstpSession();
+  const r = await session.evaluate('Prime[10]');
+  console.log(r.result.value);   // 29
+  console.log(r.cellIndex);      // 1
+  console.log(r.outputName);     // "Out[1]="
+  session.close();
+})();
+```
+
 **Default kernel path** (macOS): `/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel`
 
-Pass an explicit path to the `WstpSession` constructor if yours differs.
+Pass an explicit path as the first argument to `new WstpSession(path)` if yours differs.
 
 ---
 
@@ -83,8 +133,8 @@ The full result of one `evaluate()` call:
 
 ```ts
 {
-  cellIndex:  number;   // n from "In[n]:=" — increases by 1 each evaluation
-  outputName: string;   // "Out[n]=" for non-Null results, "" otherwise
+  cellIndex:  number;   // 1-based counter, increments by 1 per evaluate() call
+  outputName: string;   // "Out[n]=" when result is non-Null and non-aborted, "" otherwise
   result:     WExpr;    // the expression returned by the kernel
   print:      string[]; // lines written by Print[], EchoFunction[], etc.
   messages:   string[]; // kernel messages, e.g. "Power::infy: Infinite expression..."
@@ -123,8 +173,15 @@ session.evaluate(expr: string, opts?: EvalOptions): Promise<EvalResult>
 
 Evaluate `expr` in the kernel and return the full result.
 
-`expr` is passed to `ToExpression[]` on the kernel side.  Multiple concurrent calls are
-serialised automatically through an internal queue — it is safe to fire them without awaiting.
+`expr` is passed to `ToExpression[]` on the kernel side, so it must be valid Wolfram Language
+syntax.  Multiple concurrent calls are serialised through an internal queue — it is safe to
+fire them without awaiting.
+
+**One call = one cell.**  Newlines and semicolons inside `expr` do not split it into multiple
+evaluations; the kernel sees them as a single `CompoundExpression` and returns only the last
+value.  Use separate `evaluate()` calls to get separate `cellIndex` / `outputName` values.
+A trailing semicolon suppresses the return value (the kernel returns `Null` and `outputName`
+will be `""`).
 
 **`opts` streaming callbacks** (all optional):
 
