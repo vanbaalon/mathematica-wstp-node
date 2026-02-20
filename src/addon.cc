@@ -1233,6 +1233,10 @@ public:
     Napi::Value Abort(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
         if (!open_) return Napi::Boolean::New(env, false);
+        // Only signal the kernel if an evaluation is actually in flight.
+        // Sending WSAbortMessage to an idle kernel causes it to emit a
+        // spurious RETURNPKT[$Aborted] that would corrupt the next evaluation.
+        if (!busy_.load()) return Napi::Boolean::New(env, false);
         abortFlag_.store(true);
         int ok = WSPutMessage(lp_, WSAbortMessage);
         return Napi::Boolean::New(env, ok != 0);

@@ -8,5 +8,5 @@ node_modules/
 # macOS
 .DS_Store
 
-# Temporary / diagnostic output
+# Temporary / scratch files
 /tmp/
