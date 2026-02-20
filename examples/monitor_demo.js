@@ -44,7 +44,7 @@ const path = require('path');
 const fs   = require('fs');
 
 const { WstpSession, WstpReader } =
-    require(path.join(__dirname, 'build', 'Release', 'wstp'));
+    require(path.join(__dirname, '..', 'build', 'Release', 'wstp'));
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 

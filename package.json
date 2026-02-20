@@ -9,7 +9,7 @@
     "build": "bash build.sh",
     "build:debug": "bash build.sh debug",
     "clean": "bash build.sh clean",
-    "demo": "node demo.js"
+    "demo": "node examples/demo.js"
   },
   "dependencies": {
     "node-addon-api": "^8.0.0"

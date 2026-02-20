@@ -13,7 +13,7 @@
 const path = require('path');
 
 // Load the compiled native addon.
-const { WstpSession } = require(path.join(__dirname, 'build', 'Release', 'wstp'));
+const { WstpSession } = require(path.join(__dirname, '..', 'build', 'Release', 'wstp'));
 
 // ─── pretty-printer for the typed ExprTree ───────────────────────────────────
 function prettyExpr(node, indent = 0) {
