@@ -1,5 +1,7 @@
 # wstp-backend — API Reference
 
+**Author:** Nikolay Gromov
+
 Node.js native addon that connects to a WolframKernel process over WSTP and exposes a
 Promise-based JavaScript API.  All blocking I/O runs on the libuv thread pool; the JS event
 loop is never stalled.
@@ -15,16 +17,16 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
 1. [Setup](#setup)
 2. [Return types — `WExpr` and `EvalResult`](#return-types)
 3. [`WstpSession` — main evaluation session](#wstpsession)
-   - [Constructor](#constructor)
-   - [`evaluate(expr, opts?)`](#evaluateexpr-opts)
-   - [`sub(expr)`](#subexpr)
-   - [`abort()`](#abort)
-   - [`dialogEval(expr)`](#dialogevalexpr)
-   - [`exitDialog(retVal?)`](#exitdialogretval)
-   - [`interrupt()`](#interrupt)
-   - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath)
-   - [`close()`](#close)
-   - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen)
+   - [Constructor](#constructor) — launch a kernel and open a session
+   - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
+   - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
+   - [`abort()`](#abort) — interrupt the currently running evaluation
+   - [`dialogEval(expr)`](#dialogevalexpr) — evaluate inside an active `Dialog[]` subsession
+   - [`exitDialog(retVal?)`](#exitdialogretval) — exit the current dialog and resume the main evaluation
+   - [`interrupt()`](#interrupt) — send a low-level interrupt signal to the kernel
+   - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
+   - [`close()`](#close) — gracefully shut down the kernel and free resources
+   - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen) — read-only status flags
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
 6. [Usage examples](#usage-examples)
@@ -101,8 +103,9 @@ const session = new WstpSession(kernelPath?);
 ```
 
 Launches a `WolframKernel` process, connects over WSTP, and verifies that `$Output` routing
-is working.  If the kernel starts with broken output routing (happens on ~20 % of launches)
-the constructor automatically kills it and retries up to 3 times.
+is working.  Consecutive kernel launches occasionally start with broken output routing (a WSTP
+quirk); the constructor detects this automatically and retries up to 3 times, so it is
+transparent to callers.
 
 | Parameter | Type | Default |
 |-----------|------|---------|
