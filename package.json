@@ -1,0 +1,20 @@
+{
+  "name": "wstp-backend",
+  "version": "0.3.0",
+  "description": "Native Node.js addon wrapping WSTP — kernel sessions with evaluation queue, streaming Print/messages, and subsession support",
+  "main": "build/Release/wstp.node",
+  "types": "index.d.ts",
+  "scripts": {
+    "prebuild": "",
+    "build": "bash build.sh",
+    "build:debug": "bash build.sh debug",
+    "clean": "bash build.sh clean",
+    "demo": "node demo.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  }
+}

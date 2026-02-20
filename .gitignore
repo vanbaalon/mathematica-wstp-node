@@ -1,0 +1,12 @@
+# Compiled addon
+build/
+*.node
+
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# Temporary / diagnostic output
+/tmp/
