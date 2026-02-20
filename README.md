@@ -2,9 +2,10 @@
 
 **Author:** Nikolay Gromov
 
-Node.js native addon that connects to a WolframKernel process over WSTP and exposes a
-Promise-based JavaScript API.  All blocking I/O runs on the libuv thread pool; the JS event
-loop is never stalled.
+Native Node.js addon for Wolfram kernel communication over WSTP — supports full
+notebook-style evaluation with automatic `In`/`Out` history, real-time streaming,
+and an internal evaluation queue.  All blocking I/O runs on the libuv thread pool;
+the JS event loop is never stalled.
 
 ```js
 const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wstp.node');
@@ -15,8 +16,9 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
 ## Table of Contents
 
 1. [Installation](#installation)
-2. [Return types — `WExpr` and `EvalResult`](#return-types)
-3. [`WstpSession` — main evaluation session](#wstpsession)
+2. [Batch mode vs interactive mode](#batch-mode-vs-interactive-mode)
+3. [Return types — `WExpr` and `EvalResult`](#return-types)
+4. [`WstpSession` — main evaluation session](#wstpsession)
    - [Constructor](#constructor) — launch a kernel and open a session
    - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
    - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
@@ -27,10 +29,11 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
    - [`close()`](#close) — gracefully shut down the kernel and free resources
    - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen) — read-only status flags
-4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
-5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
-6. [Usage examples](#usage-examples)
+5. [`WstpReader` — kernel-pushed side channel](#wstpreader)
+6. [`setDiagHandler(fn)`](#setdiaghandlerfn)
+5. [Usage examples](#usage-examples)
    - [Basic evaluation](#basic-evaluation)
+   - [Interactive mode — In/Out history](#interactive-mode--inout-history)
    - [Streaming output](#streaming-output)
    - [Concurrent evaluations](#concurrent-evaluations)
    - [Priority `sub()` calls](#priority-sub-calls)
@@ -38,8 +41,8 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Dialog subsessions](#dialog-subsessions)
    - [Real-time side channel (`WstpReader`)](#real-time-side-channel-wstpreader)
    - [Parallel independent kernels](#parallel-independent-kernels)
-7. [Error handling](#error-handling)
-8. [Diagnostic logging](#diagnostic-logging)
+6. [Error handling](#error-handling)
+7. [Diagnostic logging](#diagnostic-logging)
 
 ---
 
@@ -89,6 +92,14 @@ node test.js
 
 Expected last line: `All 28 tests passed.`
 
+A more comprehensive suite (both modes + In/Out + comparison) lives in `tmp/tests_all.js`:
+
+```bash
+node tmp/tests_all.js
+```
+
+Expected last line: `All 56 tests passed.`
+
 ### 5. Quick smoke test
 
 ```js
@@ -99,7 +110,7 @@ const { WstpSession } = require('./build/Release/wstp.node');
   const r = await session.evaluate('Prime[10]');
   console.log(r.result.value);   // 29
   console.log(r.cellIndex);      // 1
-  console.log(r.outputName);     // "Out[1]="
+  console.log(r.outputName);     // "Out[1]="  (may vary by session)
   session.close();
 })();
 ```
@@ -107,6 +118,45 @@ const { WstpSession } = require('./build/Release/wstp.node');
 **Default kernel path** (macOS): `/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel`
 
 Pass an explicit path as the first argument to `new WstpSession(path)` if yours differs.
+
+---
+
+## Batch mode vs interactive mode
+
+The session constructor accepts an optional second argument:
+
+```js
+// Batch mode (default) — EvaluatePacket, bypasses kernel main loop
+const session = new WstpSession(kernelPath);
+// or explicitly:
+const session = new WstpSession(kernelPath, { interactive: false });
+
+// Interactive mode — EnterExpressionPacket, full notebook-style evaluation
+const session = new WstpSession(kernelPath, { interactive: true });
+```
+
+### Batch mode (`interactive: false`, default)
+
+Uses `EvaluatePacket` which **bypasses** the kernel's main evaluation loop.
+Fast and lightweight — the kernel evaluates the expression and returns the result
+without touching `In[n]`/`Out[n]`/`$Line`.
+
+- `In[n]`, `Out[n]`, `%`, `%%` are **not** populated by evaluations
+- `$Line` stays at 1 regardless of how many evaluations are run
+- `outputName` in `EvalResult` is always `""` in steady state
+- Suitable for scripting and batch processing where history is not needed
+
+### Interactive mode (`interactive: true`)
+
+Uses `EnterExpressionPacket` which runs each evaluation through the kernel's full
+main loop — exactly as a Mathematica notebook does.
+
+- `In[n]`, `Out[n]`, `%`, `%%` all work and persist across evaluations
+- `$Line` increments with every evaluation
+- `cellIndex` in `EvalResult` reflects the actual kernel `$Line` (not a JS counter)
+- `outputName` in `EvalResult` is `"Out[n]="` for non-Null results, `""` for suppressed
+- `$HistoryLength` controls memory usage (default `100`)
+- Suitable for notebook-like workflows and sessions that rely on running history
 
 ---
 
@@ -133,8 +183,10 @@ The full result of one `evaluate()` call:
 
 ```ts
 {
-  cellIndex:  number;   // 1-based counter, increments by 1 per evaluate() call
-  outputName: string;   // "Out[n]=" when result is non-Null and non-aborted, "" otherwise
+  cellIndex:  number;   // Batch: JS-tracked counter (1-based per session).
+                        // Interactive: kernel $Line at time of evaluation.
+  outputName: string;   // Interactive: "Out[n]=" for non-Null results; "" for suppressed.
+                        // Batch: derived from kernel OUTPUTNAMEPKT if sent.
   result:     WExpr;    // the expression returned by the kernel
   print:      string[]; // lines written by Print[], EchoFunction[], etc.
   messages:   string[]; // kernel messages, e.g. "Power::infy: Infinite expression..."
@@ -149,7 +201,7 @@ The full result of one `evaluate()` call:
 ### Constructor
 
 ```js
-const session = new WstpSession(kernelPath?);
+const session = new WstpSession(kernelPath?, options?);
 ```
 
 Launches a `WolframKernel` process, connects over WSTP, and verifies that `$Output` routing
@@ -160,6 +212,7 @@ transparent to callers.
 | Parameter | Type | Default |
 |-----------|------|---------|
 | `kernelPath` | `string` | `/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel` |
+| `options.interactive` | `boolean` | `false` — see [Batch mode vs interactive mode](#batch-mode-vs-interactive-mode) |
 
 Throws if the kernel cannot be launched or the WSTP link fails to activate.
 
@@ -504,6 +557,52 @@ console.log(n.result.value);  // 541
 // String result
 const v = await session.evaluate('"Hello, " <> "World"');
 console.log(v.result.value);  // "Hello, World"
+
+session.close();
+```
+
+---
+
+### Interactive mode — In/Out history
+
+With `{ interactive: true }` the kernel runs each evaluation through its full main loop,
+populating `In[n]`, `Out[n]`, and `%`/`%%` exactly as in a Mathematica notebook.
+
+```js
+const session = new WstpSession(KERNEL, { interactive: true });
+
+// Out[n] is populated automatically; cellIndex reflects the kernel's actual $Line
+const r1 = await session.evaluate('Prime[10]');
+console.log(r1.cellIndex);      // e.g. 1
+console.log(r1.outputName);     // "Out[1]="
+console.log(r1.result.value);   // 29
+
+// % and %% return last / second-to-last outputs
+const r2 = await session.evaluate('42');
+const pct = await session.evaluate('%');
+console.log(pct.result.value);  // 42
+
+// Out[n] is accessible from later evaluations
+const r3 = await session.evaluate('6 * 7');
+const arith = await session.evaluate(`Out[${r3.cellIndex}] + 1`);
+console.log(arith.result.value);  // 43
+
+// In[n] stores the input; it evaluates to the result of the expression
+const r4 = await session.evaluate('2 + 2');
+const inVal = await session.sub(`In[${r4.cellIndex}]`);
+console.log(inVal.value);  // 4
+
+// Suppressed evaluations (trailing ;) have empty outputName
+// but Out[n] is still stored internally by the kernel
+const r5 = await session.evaluate('77;');
+console.log(r5.outputName);   // ""
+console.log(r5.result.value); // "System`Null"
+const out5 = await session.sub(`Out[${r5.cellIndex}]`);
+console.log(out5.value);       // 77  (stored internally)
+
+// $Line tracks the kernel counter
+const line = await session.sub('$Line');
+console.log(line.value);  // r5.cellIndex + 1
 
 session.close();
 ```
