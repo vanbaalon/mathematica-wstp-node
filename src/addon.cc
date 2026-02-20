@@ -102,6 +102,9 @@ struct EvalOptions {
     bool         hasOnDialogBegin  = false;
     bool         hasOnDialogPrint  = false;
     bool         hasOnDialogEnd    = false;
+    // When true, DrainToEvalResult expects EnterExpressionPacket protocol:
+    // INPUTNAMEPKT → OUTPUTNAMEPKT → RETURNEXPRPKT (or INPUTNAMEPKT for Null).
+    bool         interactive       = false;
     CompleteCtx* ctx               = nullptr;  // non-owning; set when TSFNs are in use
 
     // Pointers to session's dialog queue — set by WstpSession::Evaluate() so the
@@ -409,26 +412,69 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
     // Outer drain loop — blocking WSNextPacket (unchanged for normal evals).
     // Dialog packets trigger the inner loop below.
     // -----------------------------------------------------------------------
+    // In EnterExpressionPacket mode the kernel sends:
+    //   Non-Null result: OUTPUTNAMEPKT → RETURNEXPRPKT
+    //                    followed by a trailing INPUTNAMEPKT (next prompt)
+    //   Null result:     INPUTNAMEPKT only (no OUTPUTNAMEPKT/RETURNEXPRPKT)
+    //
+    // So: INPUTNAMEPKT as the FIRST packet (before any OUTPUTNAMEPKT) = Null.
+    //     INPUTNAMEPKT after RETURNEXPRPKT = next-prompt trailer, consumed here
+    //     so the next evaluate() starts clean.
+    bool gotOutputName = false;
+    bool gotResult     = false;
     while (true) {
         int pkt = WSNextPacket(lp);
         DiagLog("[Eval] pkt=" + std::to_string(pkt));
 
-        if (pkt == RETURNPKT) {
+        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT) {
+            // RETURNPKT:     response to EvaluatePacket — no In/Out populated.
+            // RETURNEXPRPKT: response to EnterExpressionPacket — main loop ran,
+            //                In[n] and Out[n] are populated by the kernel.
             r.result = ReadExprRaw(lp);
             WSNewPacket(lp);
             if (r.result.kind == WExpr::Symbol && stripCtx(r.result.strVal) == "$Aborted")
                 r.aborted = true;
-            break;
+            gotResult = true;
+            // In interactive mode the kernel always follows RETURNEXPRPKT with a
+            // trailing INPUTNAMEPKT (the next "In[n+1]:=" prompt).  We must consume
+            // that packet before returning so the wire is clean for the next eval.
+            // Continue the loop; the INPUTNAMEPKT branch below will break cleanly.
+            if (!opts || !opts->interactive) break;
+            // (fall through to the next WSNextPacket iteration)
         }
         else if (pkt == INPUTNAMEPKT) {
             const char* s = nullptr; WSGetString(lp, &s);
-            if (s) { r.cellIndex = parseCellIndex(s); WSReleaseString(lp, s); }
+            std::string nameStr = s ? s : "";
+            if (s) WSReleaseString(lp, s);
             WSNewPacket(lp);
+            if (opts && opts->interactive) {
+                if (!gotOutputName && !gotResult) {
+                    // First packet = INPUTNAMEPKT with no preceding OUTPUTNAMEPKT:
+                    // kernel evaluated to Null/suppressed — this IS the result signal.
+                    // cellIndex is one less than this prompt's index.
+                    int64_t nextIdx = parseCellIndex(nameStr);
+                    r.cellIndex = (nextIdx > 1) ? nextIdx - 1 : nextIdx;
+                    r.result = WExpr::mkSymbol("System`Null");
+                    break;
+                }
+                // Trailing INPUTNAMEPKT after RETURNEXPRPKT — consume and exit.
+                // (Next eval starts with no leftover INPUTNAMEPKT on the wire.)
+                break;
+            }
+            r.cellIndex = parseCellIndex(nameStr);
         }
         else if (pkt == OUTPUTNAMEPKT) {
             const char* s = nullptr; WSGetString(lp, &s);
-            if (s) { r.outputName = s; WSReleaseString(lp, s); }
+            if (s) {
+                std::string name = s; WSReleaseString(lp, s);
+                // Kernel sends "Out[n]= " with trailing space — normalize to "Out[n]=".
+                while (!name.empty() && name.back() == ' ') name.pop_back();
+                r.outputName = name;
+                // Parse the n from "Out[n]=" to set cellIndex (interactive mode).
+                r.cellIndex = parseCellIndex(name);
+            }
             WSNewPacket(lp);
+            gotOutputName = true;
         }
         else if (pkt == TEXTPKT) {
             DiagLog("[Eval] TEXTPKT");
@@ -673,11 +719,13 @@ public:
                    EvalOptions                   opts,
                    std::atomic<bool>&            abortFlag,
                    std::function<void()>         completionCb,
-                   int64_t                       cellIndex)
+                   int64_t                       cellIndex,
+                   bool                          interactive = false)
         : Napi::AsyncWorker(deferred.Env()),
           deferred_(std::move(deferred)),
           lp_(lp),
           expr_(std::move(expr)),
+          interactive_(interactive),
           opts_(std::move(opts)),
           abortFlag_(abortFlag),
           completionCb_(std::move(completionCb)),
@@ -686,27 +734,49 @@ public:
 
     // ---- thread-pool thread: send packet; block until response ----
     void Execute() override {
-        if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
-            !WSPutFunction(lp_, "ToExpression",   1) ||
-            !WSPutString(lp_, expr_.c_str())         ||
-            !WSEndPacket(lp_)                        ||
-            !WSFlush(lp_)) {
-            SetError("Failed to send EvaluatePacket to kernel");
+        bool sent;
+        if (!interactive_) {
+            // EvaluatePacket + ToExpression: non-interactive, does NOT populate In[n]/Out[n].
+            sent = WSPutFunction(lp_, "EvaluatePacket", 1) &&
+                   WSPutFunction(lp_, "ToExpression",   1) &&
+                   WSPutString  (lp_, expr_.c_str())       &&
+                   WSEndPacket  (lp_)                      &&
+                   WSFlush      (lp_);
         } else {
+            // EnterExpressionPacket[ToExpression[str]]: goes through the kernel's
+            // full main loop — populates In[n] and Out[n] automatically, exactly
+            // as the real Mathematica frontend does.  Responds with RETURNEXPRPKT.
+            sent = WSPutFunction(lp_, "EnterExpressionPacket", 1) &&
+                   WSPutFunction(lp_, "ToExpression",          1) &&
+                   WSPutString  (lp_, expr_.c_str())              &&
+                   WSEndPacket  (lp_)                             &&
+                   WSFlush      (lp_);
+        }
+        if (!sent) {
+            SetError("Failed to send packet to kernel");
+        } else {
+            opts_.interactive = interactive_;
             result_ = DrainToEvalResult(lp_, &opts_);
-            // Stamp the cell index we pre-captured before queuing.
-            result_.cellIndex = cellIndex_;
-            // Derive outputName: "Out[n]=" unless result is Null or aborted.
-            // EvaluatePacket never sends OutputNamePacket, so we compute it.
-            if (!result_.aborted && result_.result.kind == WExpr::Symbol) {
-                const std::string& sv = result_.result.strVal;
-                std::string bare = sv;
-                auto tick = sv.rfind('`');
-                if (tick != std::string::npos) bare = sv.substr(tick + 1);
-                if (bare != "Null")
+            if (!interactive_) {
+                // EvaluatePacket mode: kernel never sends INPUTNAMEPKT/OUTPUTNAMEPKT,
+                // so stamp the pre-captured counter and derive outputName manually.
+                result_.cellIndex = cellIndex_;
+                if (!result_.aborted && result_.result.kind == WExpr::Symbol) {
+                    const std::string& sv = result_.result.strVal;
+                    std::string bare = sv;
+                    auto tick = sv.rfind('`');
+                    if (tick != std::string::npos) bare = sv.substr(tick + 1);
+                    if (bare != "Null")
+                        result_.outputName = "Out[" + std::to_string(cellIndex_) + "]=";
+                } else if (!result_.aborted && result_.result.kind != WExpr::WError) {
                     result_.outputName = "Out[" + std::to_string(cellIndex_) + "]=";
-            } else if (!result_.aborted && result_.result.kind != WExpr::WError) {
-                result_.outputName = "Out[" + std::to_string(cellIndex_) + "]=";
+                }
+            } else {
+                // EnterExpressionPacket mode: DrainToEvalResult already populated
+                // cellIndex/outputName from INPUTNAMEPKT/OUTPUTNAMEPKT.
+                // Use our counter as fallback if the kernel didn't send them.
+                if (result_.cellIndex == 0)
+                    result_.cellIndex = cellIndex_;
             }
         }
         if (opts_.hasOnPrint)        opts_.onPrint.Release();
@@ -773,6 +843,7 @@ private:
     std::atomic<bool>&       abortFlag_;
     std::function<void()>    completionCb_;
     int64_t                  cellIndex_;
+    bool                     interactive_;
     EvalResult               result_;
 };
 
@@ -817,6 +888,17 @@ public:
         std::string kernelPath = kDefaultKernel;
         if (info.Length() > 0 && info[0].IsString())
             kernelPath = info[0].As<Napi::String>().Utf8Value();
+
+        // Parse options object: new WstpSession(opts?) or new WstpSession(path, opts?)
+        // Supported options: { interactive: true } — use EnterTextPacket instead of
+        // EvaluatePacket so the kernel populates In[n]/Out[n] variables.
+        int optsIdx = (info.Length() > 0 && info[0].IsObject()) ? 0
+                    : (info.Length() > 1 && info[1].IsObject()) ? 1 : -1;
+        if (optsIdx >= 0) {
+            auto o = info[optsIdx].As<Napi::Object>();
+            if (o.Has("interactive") && o.Get("interactive").IsBoolean())
+                interactiveMode_ = o.Get("interactive").As<Napi::Boolean>().Value();
+        }
 
         WSEnvironmentParameter params = WSNewParameters(WSREVISION, WSAPIREVISION);
         wsEnv_ = WSInitialize(params);
@@ -998,7 +1080,8 @@ public:
             std::move(item.opts),
             abortFlag_,
             [this]() { busy_.store(false); MaybeStartNext(); },
-            nextLine_.fetch_add(1)
+            nextLine_.fetch_add(1),
+            interactiveMode_
         );
         worker->Queue();
     }
@@ -1387,6 +1470,7 @@ private:
     WSEnvironment               wsEnv_;
     WSLINK                      lp_;
     bool                        open_;
+    bool                        interactiveMode_ = false;  // true → EnterTextPacket, populates In/Out
     pid_t                       kernelPid_  = 0;  // child process — killed on CleanUp
     std::atomic<int64_t>        nextLine_{1};      // 1-based In[n] counter for EvalResult.cellIndex
     std::atomic<bool>           abortFlag_{false};
