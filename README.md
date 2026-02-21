@@ -39,6 +39,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Priority `sub()` calls](#priority-sub-calls)
    - [Abort a long computation](#abort-a-long-computation)
    - [Dialog subsessions](#dialog-subsessions)
+   - [Variable monitor — peeking at a running loop](#variable-monitor--peeking-at-a-running-loop)
    - [Real-time side channel (`WstpReader`)](#real-time-side-channel-wstpreader)
    - [Parallel independent kernels](#parallel-independent-kernels)
 6. [Error handling](#error-handling)
@@ -236,15 +237,16 @@ value.  Use separate `evaluate()` calls to get separate `cellIndex` / `outputNam
 A trailing semicolon suppresses the return value (the kernel returns `Null` and `outputName`
 will be `""`).
 
-**`opts` streaming callbacks** (all optional):
+**`opts` fields** (all optional):
 
-| Callback | When it fires |
-|----------|---------------|
-| `onPrint(line: string)` | Each `Print[]` or similar output line, as it arrives |
-| `onMessage(msg: string)` | Each kernel warning/error, as it arrives |
-| `onDialogBegin(level: number)` | When `Dialog[]` opens |
-| `onDialogPrint(line: string)` | `Print[]` output inside a dialog |
-| `onDialogEnd(level: number)` | When the dialog closes |
+| Option | Type | Description |
+|--------|------|-------------|
+| `onPrint(line: string)` | callback | Each `Print[]` or similar output line, as it arrives |
+| `onMessage(msg: string)` | callback | Each kernel warning/error, as it arrives |
+| `onDialogBegin(level: number)` | callback | When `Dialog[]` opens |
+| `onDialogPrint(line: string)` | callback | `Print[]` output inside a dialog |
+| `onDialogEnd(level: number)` | callback | When the dialog closes |
+| `interactive` | `boolean` | **Per-call override** of the session's interactive mode. `true` forces `EnterExpressionPacket` (populates `In`/`Out`); `false` forces `EvaluatePacket` (batch, no history). Omit to use the session default set in the constructor. |
 
 All callbacks fire on the JS main thread before the Promise resolves.  The Promise is
 guaranteed not to resolve until all queued callback deliveries have completed.
@@ -254,6 +256,14 @@ const r = await session.evaluate('Do[Print[i]; Pause[0.3], {i,1,4}]', {
     onPrint: (line) => console.log('live:', line),  // fires 4 times during eval
 });
 // r.print is also ['1','2','3','4'] — same data, delivered after eval completes
+
+// Session is interactive (default), but force this one call to be batch (no Out/In side-effects):
+const internal = await session.evaluate('VsCodeRenderNth[1, "SVG", 1.0]', { interactive: false });
+
+// Session is batch (default), but force this one call to go through the main loop:
+const r2 = await session.evaluate('x = 42', { interactive: true });
+console.log(r2.outputName);  // "Out[1]="
+console.log(r2.cellIndex);   // 1
 ```
 
 ---
@@ -739,6 +749,144 @@ await p3;
 > `Return[]` via `EvaluatePacket` is unevaluated at top level — there is no enclosing
 > structure to return from.  Only `exitDialog()` (which uses `EnterTextPacket`) truly
 > exits the dialog.
+
+---
+
+### Variable monitor — peeking at a running loop
+
+You can inspect the current value of any variable while a long computation runs, without
+aborting it.  The trick is to use the `Dialog[]`/interrupt mechanism to pause the kernel
+briefly, peek, then resume — all transparent to the running evaluation.
+
+#### How it works
+
+1. A Wolfram interrupt handler is installed that opens `Dialog[]` when `WSInterruptMessage`
+   arrives: `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]`.
+2. The long computation runs via `evaluate()` (not `await`ed).
+3. A JS monitor loop fires every second:
+   - calls `session.interrupt()` → kernel suspends mid-loop, opens `Dialog[]`
+   - polls `session.isDialogOpen` (flips when `BEGINDLGPKT` arrives)
+   - calls `session.dialogEval('i')` → reads the current value of `i`
+   - calls `session.exitDialog()` → kernel resumes from where it was interrupted
+4. When the main eval resolves the monitor stops.
+
+#### Prerequisites
+
+The interrupt handler **must** be installed before the feature is used.  In the VS Code
+extension this belongs in `resources/init.wl` so it is always active:
+
+```wolfram
+(* Add to init.wl — install once at kernel startup *)
+Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]
+```
+
+If you skip this, `session.interrupt()` is a no-op (the kernel ignores the signal) and
+`isDialogOpen` will never become `true`.
+
+#### Full example
+
+```js
+const { WstpSession } = require('./build/Release/wstp.node');
+const KERNEL = '/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel';
+const session = new WstpSession(KERNEL);
+
+// Helper: poll until predicate returns true or deadline expires
+const pollUntil = (pred, intervalMs = 50, timeoutMs = 3000) =>
+    new Promise((resolve, reject) => {
+        const deadline = Date.now() + timeoutMs;
+        const tick = () => {
+            if (pred()) return resolve();
+            if (Date.now() > deadline) return reject(new Error('pollUntil: timeout'));
+            setTimeout(tick, intervalMs);
+        };
+        tick();
+    });
+
+// Step 1: install the interrupt handler
+await session.evaluate(
+    'Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]'
+);
+
+// Step 2: start the long computation — NOT awaited, runs in background
+//         evaluate() accepts onDialogBegin/End so the drain loop services dialogs
+const mainEval = session.evaluate(
+    'Do[i = k; Pause[0.2], {k, 1, 50}]; "done"',
+    {
+        onDialogBegin: (_level) => { /* optional: log */ },
+        onDialogEnd:   (_level) => { /* optional: log */ },
+    }
+);
+
+// Step 3: variable monitor — peek at `i` every second until mainEval resolves
+let running = true;
+mainEval.finally(() => { running = false; });
+
+async function monitor() {
+    while (running) {
+        await new Promise(r => setTimeout(r, 1000));
+        if (!running) break;
+
+        // Send WSInterruptMessage → Wolfram handler opens Dialog[]
+        const sent = session.interrupt();
+        if (!sent) break;  // session closed or idle
+
+        // Wait for BEGINDLGPKT to arrive (C++ sets isDialogOpen = true)
+        try {
+            await pollUntil(() => session.isDialogOpen, 50, 3000);
+        } catch (_) {
+            // Dialog didn't open — computation may have already finished
+            break;
+        }
+
+        // Read current value of the loop variable
+        let val;
+        try {
+            val = await session.dialogEval('i');
+        } catch (e) {
+            await session.exitDialog().catch(() => {});
+            break;
+        }
+        console.log(`[monitor] i = ${val.value}`);
+
+        // Resume the main evaluation
+        await session.exitDialog();
+    }
+}
+
+await Promise.all([
+    mainEval,
+    monitor(),
+]);
+
+const r = await mainEval;
+console.log('final:', r.result.value);  // "done"
+session.close();
+```
+
+Expected output (approximate — timing depends on CPU load):
+
+```
+[monitor] i = 5
+[monitor] i = 10
+[monitor] i = 15
+...
+final: done
+```
+
+#### Extension implementation note
+
+For a VS Code notebook extension using this backend:
+
+- `init.wl` should call `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]` at
+  kernel startup.
+- The ⌥⇧↵ command flow is: `session.interrupt()` → poll `isDialogOpen` → `session
+  .dialogEval(cellCode)` → render result as `"Dialog: Out"` in the cell → `session
+  .exitDialog()`.
+- The `evaluate()` call for the main long computation **must** pass `onDialogBegin`,
+  `onDialogPrint`, and `onDialogEnd` callbacks; these wire the C++ `BEGINDLGPKT` /
+  `ENDDLGPKT` handlers that drive `isDialogOpen` and the dialog inner loop.
+- `dialogEval()` and `exitDialog()` push to `dialogQueue_` in C++, which the drain loop
+  on the thread-pool thread services between kernel packets — no second link/thread needed.
 
 ---
 
