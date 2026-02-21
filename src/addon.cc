@@ -308,13 +308,18 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
 
     // -----------------------------------------------------------------------
     // Helper: service one pending DialogRequest from dialogQueue_.
-    // Sends EvaluatePacket, drains until RETURNPKT (or ENDDLGPKT if the
-    // evaluated expression exits the dialog, e.g. Return[]).
-    // Returns true  → dialog still open, continue inner loop.
-    // Returns false → ENDDLGPKT arrived while handling this request;
-    //                 the caller (dialog inner loop) must exit.
+    //
+    // menuDlgProto = false (default, BEGINDLGPKT path):
+    //   Sends EvaluatePacket[ToExpression[...]], drains until RETURNPKT.
+    //
+    // menuDlgProto = true  (MENUPKT-dialog path, interrupt-triggered Dialog[]):
+    //   Sends EnterExpressionPacket[ToExpression[...]], drains until RETURNEXPRPKT.
+    //   The kernel uses MENUPKT as the dialog-prompt between evaluations.
+    //
+    // Returns true  → dialog still open.
+    // Returns false → dialog closed (ENDDLGPKT or exitDialog via MENUPKT 'c').
     // -----------------------------------------------------------------------
-    auto serviceDialogRequest = [&]() -> bool {
+    auto serviceDialogRequest = [&](bool menuDlgProto = false) -> bool {
         DialogRequest req;
         {
             std::lock_guard<std::mutex> lk(*opts->dialogMutex);
@@ -325,18 +330,29 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 opts->dialogPending->store(false);
         }
         // Send the expression to the kernel's dialog REPL.
-        // EvaluatePacket  — for regular evaluations (Return[] is unevaluated at top level)
-        // EnterTextPacket — for exit expressions (Return[] recognised in interactive context)
+        // menuDlgProto / EnterExpressionPacket — interrupt-triggered Dialog[] context
+        // EvaluatePacket                       — BEGINDLGPKT Dialog[] context
+        // EnterTextPacket                      — exitDialog (Return[] in interactive ctx)
         bool sent;
         if (!req.useEnterText) {
-            sent = WSPutFunction(lp, "EvaluatePacket", 1) &&
-                   WSPutFunction(lp, "ToExpression",   1) &&
-                   WSPutString  (lp, req.expr.c_str())    &&
-                   WSEndPacket  (lp)                      &&
-                   WSFlush      (lp);
+            if (menuDlgProto) {
+                // MENUPKT-dialog (interrupt-triggered): text-mode I/O.
+                // The kernel expects EnterTextPacket and returns OutputForm via TEXTPKT.
+                sent = WSPutFunction(lp, "EnterTextPacket", 1) &&
+                       WSPutUTF8String(lp, (const unsigned char *)req.expr.c_str(), (int)req.expr.size()) &&
+                       WSEndPacket  (lp)                       &&
+                       WSFlush      (lp);
+            } else {
+                // BEGINDLGPKT dialog: batch mode.
+                sent = WSPutFunction(lp, "EvaluatePacket", 1) &&
+                       WSPutFunction(lp, "ToExpression",   1) &&
+                       WSPutUTF8String(lp, (const unsigned char *)req.expr.c_str(), (int)req.expr.size()) &&
+                       WSEndPacket  (lp)                      &&
+                       WSFlush      (lp);
+            }
         } else {
             sent = WSPutFunction(lp, "EnterTextPacket", 1) &&
-                   WSPutString  (lp, req.expr.c_str())      &&
+                   WSPutUTF8String(lp, (const unsigned char *)req.expr.c_str(), (int)req.expr.size()) &&
                    WSEndPacket  (lp)                        &&
                    WSFlush      (lp);
         }
@@ -353,15 +369,61 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             req.resolve.Release();
             return true;  // link might still work; let outer loop decide
         }
-        // Read response packets until RETURNPKT or ENDDLGPKT.
+        // Read response packets until RETURNPKT/RETURNEXPRPKT or ENDDLGPKT.
         WExpr result;
+        std::string lastDlgText;  // accumulated OutputForm text for menuDlgProto dialogEval
         bool dialogEndedHere = false;
+        bool menuDlgFirstSkipped = false;   // whether the pre-result setup MENUPKT was already skipped
+        DiagLog("[SDR] waiting for response, menuDlgProto=" + std::to_string(menuDlgProto)
+                + " useEnterText=" + std::to_string(req.useEnterText));
         while (true) {
             int p2 = WSNextPacket(lp);
+            DiagLog("[SDR] p2=" + std::to_string(p2));
             if (p2 == RETURNPKT) {
                 result = ReadExprRaw(lp);
                 WSNewPacket(lp);
                 break;
+            }
+            if (p2 == RETURNTEXTPKT) {
+                // ReturnTextPacket: the dialog/inspect-mode result as OutputForm text.
+                // This is how 'i' (inspect) mode returns results in Wolfram 3.
+                const char* s = nullptr; WSGetString(lp, &s);
+                std::string txt = s ? rtrimNL(s) : ""; if (s) WSReleaseString(lp, s);
+                WSNewPacket(lp);
+                DiagLog("[SDR] RETURNTEXTPKT text='" + txt.substr(0, 60) + "'");
+                if (txt.empty()) {
+                    result = WExpr::mkSymbol("System`Null");
+                } else {
+                    // Try integer
+                    try {
+                        size_t pos = 0;
+                        long long iv = std::stoll(txt, &pos);
+                        if (pos == txt.size()) { result.kind = WExpr::Integer; result.intVal = iv; }
+                        else { throw std::exception(); }
+                    } catch (...) {
+                        // Try real
+                        try {
+                            size_t pos = 0;
+                            double rv = std::stod(txt, &pos);
+                            if (pos == txt.size()) { result.kind = WExpr::Real; result.realVal = rv; }
+                            else { throw std::exception(); }
+                        } catch (...) {
+                            result.kind = WExpr::String; result.strVal = txt;
+                        }
+                    }
+                }
+                break;
+            }
+            if (p2 == RETURNEXPRPKT) {
+                // EnterExpressionPacket path (menuDlgProto): collect structured result.
+                // The kernel will follow with INPUTNAMEPKT or MENUPKT (next prompt);
+                // we break after collecting and let the outer loop consume that.
+                result = ReadExprRaw(lp);
+                WSNewPacket(lp);
+                if (!menuDlgProto) break;  // BEGINDLGPKT: also terminates
+                // menuDlgProto: keep looping to consume OUTPUTNAMEPKT/INPUTNAMEPKT
+                // and the trailing MENUPKT (which triggers the outer break below)
+                continue;
             }
             if (p2 == ENDDLGPKT) {
                 // The expression exited the dialog (e.g. Return[]).
@@ -385,14 +447,91 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 const char* s = nullptr; WSGetString(lp, &s);
                 if (s) {
                     std::string line = rtrimNL(s); WSReleaseString(lp, s);
-                    if (opts->hasOnDialogPrint)
-                        opts->onDialogPrint.NonBlockingCall(
-                            [line](Napi::Env e, Napi::Function cb){
-                                cb.Call({Napi::String::New(e, line)}); });
+                    if (menuDlgProto && !req.useEnterText) {
+                        DiagLog("[SDR] TEXTPKT(menuDlg) text='" + line + "'");
+                        if (!line.empty()) {
+                            if (!lastDlgText.empty()) lastDlgText += "\n";
+                            lastDlgText += line;
+                        }
+                    } else {
+                        if (opts->hasOnDialogPrint)
+                            opts->onDialogPrint.NonBlockingCall(
+                                [line](Napi::Env e, Napi::Function cb){
+                                    cb.Call({Napi::String::New(e, line)}); });
+                    }
                 }
                 WSNewPacket(lp); continue;
             }
             if (p2 == INPUTNAMEPKT || p2 == OUTPUTNAMEPKT) { WSNewPacket(lp); continue; }
+            if (p2 == MENUPKT) {
+                // MENUPKT in dialog context:
+                //   * menuDlgProto && exitDialog: respond 'c' to resume main eval.
+                //   * menuDlgProto && dialogEval: result arrived via TEXTPKT; parse it.
+                //   * BEGINDLGPKT path: result via RETURNPKT (should already have it).
+                if (req.useEnterText) {
+                    // exitDialog: respond bare string 'c' (continue) per JLink MENUPKT protocol.
+                    wsint64 menuType2_ = 0; WSGetInteger64(lp, &menuType2_);
+                    const char* menuPrompt2_ = nullptr; WSGetString(lp, &menuPrompt2_);
+                    if (menuPrompt2_) WSReleaseString(lp, menuPrompt2_);
+                    WSNewPacket(lp);
+                    WSPutString(lp, "c");
+                    WSEndPacket(lp);
+                    WSFlush(lp);
+                    if (opts->dialogOpen) opts->dialogOpen->store(false);
+                    if (opts->hasOnDialogEnd)
+                        opts->onDialogEnd.NonBlockingCall(
+                            [](Napi::Env e, Napi::Function cb){
+                                cb.Call({Napi::Number::New(e, 0.0)}); });
+                    result.kind = WExpr::Symbol;
+                    result.strVal = "Null";
+                    dialogEndedHere = true;
+                } else if (menuDlgProto) {
+                    // dialogEval in text-mode dialog: result arrives as TEXTPKT before MENUPKT.
+                    // However: the kernel may send a "setup" MENUPKT immediately after we
+                    // send our expression (buffered from the dialog-open sequence), before
+                    // sending the TEXTPKT result.  Skip that one MENUPKT and keep waiting.
+                    WSNewPacket(lp);
+                    if (lastDlgText.empty() && !menuDlgFirstSkipped) {
+                        menuDlgFirstSkipped = true;
+                        DiagLog("[SDR] menuDlg: skipping pre-result MENUPKT, waiting for TEXTPKT");
+                        continue;  // keep waiting for TEXTPKT result
+                    }
+                    // Second MENUPKT (or first if we already have text): end of result.
+                    DiagLog("[SDR] menuDlg: end-of-result MENUPKT, lastDlgText='" + lastDlgText + "'");
+                    if (lastDlgText.empty()) {
+                        result = WExpr::mkSymbol("System`Null");
+                    } else {
+                        // Try integer
+                        try {
+                            size_t pos = 0;
+                            long long iv = std::stoll(lastDlgText, &pos);
+                            if (pos == lastDlgText.size()) {
+                                result.kind   = WExpr::Integer;
+                                result.intVal = iv;
+                            } else { throw std::exception(); }
+                        } catch (...) {
+                            // Try real
+                            try {
+                                size_t pos = 0;
+                                double rv = std::stod(lastDlgText, &pos);
+                                if (pos == lastDlgText.size()) {
+                                    result.kind    = WExpr::Real;
+                                    result.realVal = rv;
+                                } else { throw std::exception(); }
+                            } catch (...) {
+                                result.kind   = WExpr::String;
+                                result.strVal = lastDlgText;
+                            }
+                        }
+                    }
+                } else {
+                    // BEGINDLGPKT path: result should have arrived via RETURNPKT.
+                    WSNewPacket(lp);
+                    if (result.kind == WExpr::WError)
+                        result = WExpr::mkSymbol("System`Null");
+                }
+                break;
+            }
             if (p2 == 0 || p2 == ILLEGALPKT) {
                 const char* m = WSErrorMessage(lp); WSClearError(lp);
                 result = WExpr::mkError(m ? m : "WSTP error in dialogEval");
@@ -430,7 +569,25 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             // RETURNPKT:     response to EvaluatePacket — no In/Out populated.
             // RETURNEXPRPKT: response to EnterExpressionPacket — main loop ran,
             //                In[n] and Out[n] are populated by the kernel.
-            r.result = ReadExprRaw(lp);
+            //
+            // Safety for interactive RETURNEXPRPKT: peek at the token type before
+            // calling ReadExprRaw.  Atomic results (symbol, int, real, string) are
+            // safe to read — this covers $Aborted and simple values.
+            // Complex results (List, Graphics, …) are skipped with WSNewPacket to
+            // avoid a potential WSGetFunction crash on deep expression trees.
+            // Out[n] is already set inside the kernel; JS renders via VsCodeRenderNth
+            // which reads from $vsCodeLastResultList, not from the transferred result.
+            if (opts && opts->interactive && pkt == RETURNEXPRPKT) {
+                int tok = WSGetType(lp);
+                if (tok == WSTKSYM || tok == WSTKINT || tok == WSTKREAL || tok == WSTKSTR) {
+                    r.result = ReadExprRaw(lp);
+                } else {
+                    // Complex result — discard; Out[n] intact in kernel.
+                    r.result = WExpr::mkSymbol("System`__VsCodeHasResult__");
+                }
+            } else {
+                r.result = ReadExprRaw(lp);
+            }
             WSNewPacket(lp);
             if (r.result.kind == WExpr::Symbol && stripCtx(r.result.strVal) == "$Aborted")
                 r.aborted = true;
@@ -477,11 +634,11 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             gotOutputName = true;
         }
         else if (pkt == TEXTPKT) {
-            DiagLog("[Eval] TEXTPKT");
             const char* s = nullptr; WSGetString(lp, &s);
             if (s) {
                 std::string line = rtrimNL(s);
                 WSReleaseString(lp, s);
+                DiagLog("[Eval] TEXTPKT content='" + line.substr(0, 60) + "'");
                 r.print.emplace_back(line);
                 if (opts && opts->hasOnPrint) {
                     // Log C++ dispatch time so the JS handler timestamp gives latency.
@@ -628,6 +785,168 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             r.result = WExpr::mkError("unexpected ReturnTextPacket from kernel");
             break;
         }
+        else if (pkt == MENUPKT) {
+            // ----------------------------------------------------------------
+            // MENUPKT (6) — interrupt menu protocol per JLink source:
+            //
+            //   Protocol (from JLink InterruptDialog.java):
+            //     1. WSNextPacket(lp) → MENUPKT
+            //     2. WSGetInteger(lp, &type)   — menu type (1=interrupt, 3=LinkRead)
+            //     3. WSGetString(lp, &prompt)  — prompt string
+            //     4. WSNewPacket(lp)
+            //     5. WSPutString(lp, "i")       — respond with bare string
+            //        Options: a=abort, c=continue, i=inspect/dialog
+            //     6. WSEndPacket; WSFlush
+            //
+            //  After "i", the kernel enters interactive inspect mode and sends
+            //  MENUPKT(inspect) as the dialog prompt → handled in menuDlgDone.
+            // ----------------------------------------------------------------
+            {
+                wsint64 menuType_ = 0; WSGetInteger64(lp, &menuType_);
+                const char* menuPrompt_ = nullptr; WSGetString(lp, &menuPrompt_);
+                if (menuPrompt_) WSReleaseString(lp, menuPrompt_);
+                WSNewPacket(lp);
+                DiagLog("[Eval] MENUPKT type=" + std::to_string(menuType_) + " — responding 'i' (inspect)");
+
+                // Respond with bare string 'i' to enter inspect/dialog mode.
+                // Per JLink protocol: WSPutString(link, "i"). Not wrapped in any packet.
+                WSPutString(lp, "i");
+                WSEndPacket(lp);
+                WSFlush(lp);
+            }
+            // The kernel will now send an inspect-mode MENUPKT as the dialog prompt.
+            bool menuDlgDone = false;
+            while (!menuDlgDone) {
+                if (opts && opts->abortFlag && opts->abortFlag->load()) {
+                    if (opts->dialogOpen) opts->dialogOpen->store(false);
+                    r.result = WExpr::mkSymbol("System`$Aborted");
+                    r.aborted = true;
+                    return r;
+                }
+                if (opts && opts->dialogPending && opts->dialogPending->load()) {
+                    if (!serviceDialogRequest(/*menuDlgProto=*/true)) {
+                        menuDlgDone = true;
+                        continue;
+                    }
+                }
+                if (!WSReady(lp)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                int dpkt = WSNextPacket(lp);
+                DiagLog("[MenuDlg] dpkt=" + std::to_string(dpkt));
+                if (dpkt == ENDDLGPKT) {
+                    wsint64 el = 0;
+                    if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &el);
+                    WSNewPacket(lp);
+                    if (opts->dialogOpen) opts->dialogOpen->store(false);
+                    if (opts->hasOnDialogEnd)
+                        opts->onDialogEnd.NonBlockingCall(
+                            [el](Napi::Env e, Napi::Function cb){
+                                cb.Call({Napi::Number::New(e, static_cast<double>(el))}); });
+                    menuDlgDone = true;
+                } else if (dpkt == BEGINDLGPKT) {
+                    // BEGINDLGPKT: dialog subsession started.
+                    // This arrives after 'i' response to MENUPKT, before INPUTNAMEPKT.
+                    // The dialog level integer follows.
+                    wsint64 beginLevel = 0;
+                    if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &beginLevel);
+                    WSNewPacket(lp);
+                    DiagLog("[MenuDlg] BEGINDLGPKT level=" + std::to_string(beginLevel) + " — dialog is open");
+                    // isDialogOpen will be set when INPUTNAMEPKT arrives (see below).
+                    // Just consume and wait for INPUTNAMEPKT.
+                } else if (dpkt == RETURNPKT) {
+                    WExpr inner = ReadExprRaw(lp); WSNewPacket(lp);
+                    if (inner.kind == WExpr::Symbol &&
+                        stripCtx(inner.strVal) == "$Aborted") {
+                        if (opts->dialogOpen) opts->dialogOpen->store(false);
+                        r.result = inner; r.aborted = true; return r;
+                    }
+                } else if (dpkt == MENUPKT) {
+                    // In the menuDlgDone loop, MENUPKTs serve two purposes:
+                    // 1. FIRST MENUPKT (isDialogOpen still false):
+                    //    The dialog subsession has just opened.
+                    //    Set isDialogOpen = true, fire onDialogBegin, consume & wait.
+                    // 2. LATER MENUPKTs (isDialogOpen true):
+                    //    Either the interrupt menu again (if interrupt handler also opened
+                    //    Dialog[], these menus pile up) — respond "c" to dismiss it.
+                    //    Or if exitDialog sent 'c' and cleared dialogOpen → we're done.
+                    bool isOpen = opts->dialogOpen && opts->dialogOpen->load();
+                    if (!isOpen) {
+                        // First MENUPKT in menuDlgDone: the inspect/dialog-mode prompt.
+                        // The kernel has entered interactive inspection mode.
+                        // Read the type and prompt following JLink MENUPKT protocol.
+                        wsint64 menuTypeInsp = 0; WSGetInteger64(lp, &menuTypeInsp);
+                        const char* menuPromptInsp = nullptr; WSGetString(lp, &menuPromptInsp);
+                        if (menuPromptInsp) WSReleaseString(lp, menuPromptInsp);
+                        WSNewPacket(lp);
+                        DiagLog("[MenuDlg] inspect MENUPKT type=" + std::to_string(menuTypeInsp) + " — isDialogOpen=true");
+                        if (opts->dialogOpen) opts->dialogOpen->store(true);
+                        if (opts->hasOnDialogBegin)
+                            opts->onDialogBegin.NonBlockingCall(
+                                [](Napi::Env e, Napi::Function cb){
+                                    cb.Call({Napi::Number::New(e, 1.0)}); });
+                    } else if (opts->dialogOpen && !opts->dialogOpen->load()) {
+                        // exitDialog already closed the dialog (cleared by serviceDialogRequest)
+                        WSNewPacket(lp);
+                        menuDlgDone = true;
+                    } else {
+                        // Subsequent MENUPKT while dialog is open — this is likely the
+                        // interrupt-level menu that appeared AFTER the dialog-open MENUPKT.
+                        // Dismiss it with bare string 'c' (continue) per JLink MENUPKT protocol.
+                        DiagLog("[MenuDlg] subsequent MENUPKT while dialog open — responding 'c' (continue)");
+                        wsint64 menuTypeDis = 0; WSGetInteger64(lp, &menuTypeDis);
+                        const char* menuPromptDis = nullptr; WSGetString(lp, &menuPromptDis);
+                        if (menuPromptDis) WSReleaseString(lp, menuPromptDis);
+                        WSNewPacket(lp);
+                        WSPutString(lp, "c");
+                        WSEndPacket(lp);
+                        WSFlush(lp);
+                    }
+                } else if (dpkt == INPUTNAMEPKT || dpkt == OUTPUTNAMEPKT) {
+                    const char* nm = nullptr; WSGetString(lp, &nm);
+                    if (nm) {
+                        std::string nml = nm; WSReleaseString(lp, nm);
+                        DiagLog("[MenuDlg] pkt=" + std::to_string(dpkt) + " name='" + nml + "'");
+                        // INPUTNAMEPKT in menuDlgDone may mean the dialog/inspect
+                        // subsession is prompting for input (alternative to MENUPKT).
+                        if (dpkt == INPUTNAMEPKT && opts && opts->dialogOpen &&
+                            !opts->dialogOpen->load()) {
+                            DiagLog("[MenuDlg] INPUTNAMEPKT while !dialogOpen — dialog opened via INPUTNAMEPKT");
+                            opts->dialogOpen->store(true);
+                            if (opts->hasOnDialogBegin)
+                                opts->onDialogBegin.NonBlockingCall(
+                                    [](Napi::Env e, Napi::Function cb){
+                                        cb.Call({Napi::Number::New(e, 1.0)}); });
+                        }
+                    }
+                    WSNewPacket(lp);
+                } else if (dpkt == TEXTPKT) {
+                    const char* ts = nullptr; WSGetString(lp, &ts);
+                    if (ts) {
+                        std::string tl = rtrimNL(ts); WSReleaseString(lp, ts);
+                        DiagLog("[MenuDlg] TEXTPKT text='" + tl.substr(0, 80) + "'");
+                        // Filter out interrupt menu options text (informational only).
+                        bool isMenuOptions = (tl.find("Your options are") != std::string::npos);
+                        if (!isMenuOptions && opts && opts->hasOnDialogPrint)
+                            opts->onDialogPrint.NonBlockingCall(
+                                [tl](Napi::Env e, Napi::Function cb){
+                                    cb.Call({Napi::String::New(e, tl)}); });
+                    }
+                    WSNewPacket(lp);
+                } else if (dpkt == MESSAGEPKT) {
+                    handleMessage(true);
+                } else if (dpkt == 0 || dpkt == ILLEGALPKT) {
+                    const char* em = WSErrorMessage(lp); WSClearError(lp);
+                    if (opts->dialogOpen) opts->dialogOpen->store(false);
+                    r.result = WExpr::mkError(em ? em : "WSTP link error in dialog");
+                    return r;
+                } else {
+                    WSNewPacket(lp);
+                }
+            }
+            // Dialog closed — outer loop continues to collect main eval result.
+        }
         else {
             DiagLog("[Eval] unknown pkt=" + std::to_string(pkt) + ", discarding");
             WSNewPacket(lp);  // discard unknown packets
@@ -739,7 +1058,7 @@ public:
             // EvaluatePacket + ToExpression: non-interactive, does NOT populate In[n]/Out[n].
             sent = WSPutFunction(lp_, "EvaluatePacket", 1) &&
                    WSPutFunction(lp_, "ToExpression",   1) &&
-                   WSPutString  (lp_, expr_.c_str())       &&
+                   WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) &&
                    WSEndPacket  (lp_)                      &&
                    WSFlush      (lp_);
         } else {
@@ -748,7 +1067,7 @@ public:
             // as the real Mathematica frontend does.  Responds with RETURNEXPRPKT.
             sent = WSPutFunction(lp_, "EnterExpressionPacket", 1) &&
                    WSPutFunction(lp_, "ToExpression",          1) &&
-                   WSPutString  (lp_, expr_.c_str())              &&
+                   WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) &&
                    WSEndPacket  (lp_)                             &&
                    WSFlush      (lp_);
         }
@@ -989,8 +1308,10 @@ public:
         std::string expr = info[0].As<Napi::String>().Utf8Value();
 
         // Parse optional second argument: { onPrint?, onMessage?, onDialogBegin?,
-        //                                    onDialogPrint?, onDialogEnd? }
+        //                                    onDialogPrint?, onDialogEnd?,
+        //                                    interactive?: boolean (override session default) }
         EvalOptions opts;
+        int interactiveOverride = -1;  // -1 = use session default
         if (info.Length() >= 2 && info[1].IsObject()) {
             auto optsObj = info[1].As<Napi::Object>();
             bool wantPrint  = optsObj.Has("onPrint")        && optsObj.Get("onPrint").IsFunction();
@@ -998,6 +1319,9 @@ public:
             bool wantDBegin = optsObj.Has("onDialogBegin")  && optsObj.Get("onDialogBegin").IsFunction();
             bool wantDPrint = optsObj.Has("onDialogPrint")  && optsObj.Get("onDialogPrint").IsFunction();
             bool wantDEnd   = optsObj.Has("onDialogEnd")    && optsObj.Get("onDialogEnd").IsFunction();
+            // Per-call interactive override: opts.interactive = true/false
+            if (optsObj.Has("interactive") && optsObj.Get("interactive").IsBoolean())
+                interactiveOverride = optsObj.Get("interactive").As<Napi::Boolean>().Value() ? 1 : 0;
 
             // CompleteCtx: count = numTsfns + 1 (the extra slot is for OnOK/OnError).
             // This ensures the Promise resolves ONLY after every TSFN has been
@@ -1030,7 +1354,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(queueMutex_);
-            queue_.push(QueuedEval{ std::move(expr), std::move(opts), std::move(deferred) });
+            queue_.push(QueuedEval{ std::move(expr), std::move(opts), std::move(deferred), interactiveOverride });
         }
         MaybeStartNext();
         return promise;
@@ -1073,6 +1397,10 @@ public:
         queue_.pop();
         lk.unlock();
 
+        // Resolve interactive mode: per-call override takes precedence over session default.
+        bool evalInteractive = (item.interactiveOverride == -1)
+                                ? interactiveMode_
+                                : (item.interactiveOverride == 1);
         auto* worker = new EvaluateWorker(
             std::move(item.deferred),
             lp_,
@@ -1081,7 +1409,7 @@ public:
             abortFlag_,
             [this]() { busy_.store(false); MaybeStartNext(); },
             nextLine_.fetch_add(1),
-            interactiveMode_
+            evalInteractive
         );
         worker->Queue();
     }
@@ -1099,7 +1427,7 @@ public:
             void Execute() override {
                 if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
                     !WSPutFunction(lp_, "ToExpression",   1) ||
-                    !WSPutString(lp_, expr_.c_str())         ||
+                    !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
                     !WSEndPacket(lp_)                        ||
                     !WSFlush(lp_)) {
                     SetError("sub (idle): failed to send EvaluatePacket");
@@ -1364,10 +1692,12 @@ public:
 
 private:
     // Queue entry — one pending evaluate() call.
+    // interactiveOverride: -1 = use session default, 0 = force batch, 1 = force interactive
     struct QueuedEval {
         std::string             expr;
         EvalOptions             opts;
         Napi::Promise::Deferred deferred;
+        int                     interactiveOverride = -1;
     };
 
     void CleanUp() {

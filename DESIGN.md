@@ -158,11 +158,37 @@ Depth is capped at 512 to prevent stack overflow on pathological inputs.
 - `BEGINDLGPKT` → reads dialog level integer; sets `dialogOpen_ = true`; fires `onDialogBegin` TSFN.
   Then enters the **dialog inner loop** (see below) until `ENDDLGPKT` is received.
   After the inner loop exits, the outer drain loop resumes waiting for the original `RETURNPKT`.
+- `MENUPKT` (pkt=6) → the kernel interrupt-menu packet; sent when `WSInterruptMessage` is
+  received and a Wolfram interrupt handler has opened the interrupt menu.  Protocol (per
+  JLink `InterruptDialog.java`):
+  1. `WSGetInteger64(lp, &menuType)` — consume menu type integer
+  2. `WSGetString(lp, &menuPrompt)` — consume prompt string; release immediately
+  3. `WSNewPacket(lp)` — flush any remainder
+  4. `WSPutString(lp, "i")` + `WSEndPacket` + `WSFlush` — respond with bare string `"i"`
+     to choose **inspect / Dialog** mode
+  The kernel then sends: `TEXTPKT` (option list) → `BEGINDLGPKT` → `INPUTNAMEPKT`.
+  The C++ code then enters the **menuDlgDone loop** (see below) to await `INPUTNAMEPKT`
+  (which fires `isDialogOpen=true`) and to service `dialogQueue_` requests.
 - `RETURNPKT` → reads payload with `ReadExprRaw`; checks for `$Aborted` symbol
   (context-prefix stripped by `stripCtx`) to set `aborted = true`
-- `RETURNTEXTPKT` (pkt=4, rare) → safety exit: calls `WSNewPacket` and resolves with a
-  `WError` sentinel rather than spinning forever; guards against accidental `EnterTextPacket`
-  sends that would leave the drain loop blocked indefinitely
+- `RETURNTEXTPKT` (pkt=4) → dialog/inspect-mode result returned as OutputForm text.  In
+  the **SDR (serviceDialogRequest)** inner function: the text is read with `WSGetString`,
+  trimmed, parsed as integer / real / string, and resolved as the `dialogEval` promise value.
+  In the outer drain loop (cooperative `Dialog[]` path): treated as a safety exit — resolves
+  with a `WError` sentinel rather than spinning forever.
+
+**menuDlgDone loop** (entered after `MENUPKT` → `"i"` response; exits when dialog is
+fully started):
+- Polls `WSNextPacket` until `INPUTNAMEPKT` arrives (signalling the dialog is ready for input).
+- Handles intermediate packets:
+  - `TEXTPKT` with "Your options are" → filtered (not forwarded to `onDialogPrint`)
+  - `TEXTPKT` other → forwarded to `onDialogPrint` if set
+  - `BEGINDLGPKT` → reads level integer, discards; `isDialogOpen` will be set by next
+    `INPUTNAMEPKT`
+  - `INPUTNAMEPKT` → sets `dialogOpen_=true`, fires `onDialogBegin` TSFN; then immediately
+    falls through to service `dialogQueue_` (SDR), same as the inner loop
+  - `MENUPKT` (within dialog) → read type+prompt, respond `"c"` (continue) to dismiss the
+    menu; sets `dialogOpen_=false`, fires `onDialogEnd`
 
 **Dialog inner loop** (entered on `BEGINDLGPKT`, exits on `ENDDLGPKT`):
 - Uses `WSReady(lp)` polling (2 ms sleep when not ready) instead of blocking `WSNextPacket`
@@ -261,8 +287,21 @@ struct DialogRequest {
 > ```
 > Internal`AddHandler["Interrupt", Function[Null, Dialog[]]]
 > ```
-> Without such a handler the kernel ignores the message. For a reliable path to a dialog
-> subsession, call `Dialog[]` directly from Wolfram code instead.
+> Without such a handler the kernel sends `MENUPKT` (the interrupt menu) directly.  With
+> Wolfram 14 / Wolfram 3 the C++ outer drain loop handles `MENUPKT` automatically by
+> reading its type+prompt payload and responding with bare `WSPutString(lp, "i")` (inspect
+> mode), which causes the kernel to open `Dialog[]` inline.
+>
+> **MENUPKT response format** (`init.wl` interrupt handler path):
+> The correct response is a bare `WSPutString` — **not** `EnterTextPacket` and **not** an
+> integer.  The kernel WSTP protocol for `MENUPKT` requires reading the type integer
+> (`WSGetInteger64`) and the prompt string (`WSGetString`) from the packet before
+> responding; omitting these reads leaves the link in an inconsistent state.  This
+> protocol was confirmed from JLink source
+> (`com/wolfram/jlink/ui/InterruptDialog.java`).
+>
+> For a reliable path to a dialog subsession without an interrupt handler, call `Dialog[]`
+> directly from Wolfram code instead.
 
 ### Layer 3 — `WstpReader`: Side-channel link reader
 

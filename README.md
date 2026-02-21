@@ -383,16 +383,32 @@ const r = await p;  // r.result.value === 42
 session.interrupt(): boolean
 ```
 
-Send `WSInterruptMessage` to the kernel (best-effort).  Without a Wolfram-side interrupt
-handler this is a no-op.  To open an interactive dialog from JS, call `Dialog[]` directly:
+Send `WSInterruptMessage` to the kernel (best-effort).  The C++ backend handles the
+kernel's `MENUPKT` interrupt-menu response automatically by reading the type+prompt
+payload and replying with bare string `"i"` (inspect mode), causing the kernel to open a
+`Dialog[]` subsession.  `isDialogOpen` will flip to `true` when `BEGINDLGPKT` arrives.
+
+> The evaluated expression **must** have been started with `onDialogBegin` / `onDialogEnd`
+> callbacks for the dialog to be serviced correctly.
 
 ```js
-// Install a handler in Wolfram that opens a dialog on interrupt:
-await session.evaluate('Internal`AddHandler["Interrupt", Function[Null, Dialog[]]]');
-// Later, trigger it:
+// interrupt() — no Wolfram-side handler needed (C++ handles MENUPKT automatically)
+// The evaluate() call must include dialog callbacks:
+const mainEval = session.evaluate('Do[Pause[0.1], {1000}]', {
+    onDialogBegin: () => {},
+    onDialogEnd:   () => {},
+});
 session.interrupt();
 await pollUntil(() => session.isDialogOpen);
+const val = await session.dialogEval('$Line');
+await session.exitDialog();
+await mainEval;
 ```
+
+> Optionally, install a Wolfram-side handler to bypass `MENUPKT` entirely:
+> ```js
+> await session.evaluate('Internal`AddHandler["Interrupt", Function[Null, Dialog[]]]');
+> ```
 
 ---
 
@@ -760,28 +776,36 @@ briefly, peek, then resume — all transparent to the running evaluation.
 
 #### How it works
 
-1. A Wolfram interrupt handler is installed that opens `Dialog[]` when `WSInterruptMessage`
-   arrives: `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]`.
-2. The long computation runs via `evaluate()` (not `await`ed).
-3. A JS monitor loop fires every second:
-   - calls `session.interrupt()` → kernel suspends mid-loop, opens `Dialog[]`
-   - polls `session.isDialogOpen` (flips when `BEGINDLGPKT` arrives)
-   - calls `session.dialogEval('i')` → reads the current value of `i`
-   - calls `session.exitDialog()` → kernel resumes from where it was interrupted
-4. When the main eval resolves the monitor stops.
+1. `session.interrupt()` posts `WSInterruptMessage` to the kernel.
+2. The kernel suspends the running evaluation and sends `MENUPKT` (the interrupt menu).
+3. The C++ backend automatically handles `MENUPKT` by reading its type+prompt payload and
+   responding with the bare string `"i"` (inspect mode) — no Wolfram-side handler needed.
+4. The kernel opens `Dialog[]` inline: sends `TEXTPKT` (option list) → `BEGINDLGPKT` →
+   `INPUTNAMEPKT`.  `isDialogOpen` flips to `true` when `INPUTNAMEPKT` arrives.
+5. The JS monitor calls `session.dialogEval('i')` to read the current loop variable, then
+   `session.exitDialog()` to resume.
+6. When the main eval resolves the monitor stops.
+
+> **Wolfram-side interrupt handler (optional):**
+> If `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]` is installed in
+> `init.wl`, the Wolfram handler opens `Dialog[]` directly and the kernel sends
+> `BEGINDLGPKT` without going through `MENUPKT`.  Either path works — the C++ backend
+> handles both the `MENUPKT` (interrupt-menu) path and the direct `BEGINDLGPKT` path.
 
 #### Prerequisites
 
-The interrupt handler **must** be installed before the feature is used.  In the VS Code
-extension this belongs in `resources/init.wl` so it is always active:
+No special Wolfram-side configuration is required.  The C++ backend handles `MENUPKT`
+automatically.  The evaluated expression **must** be started with `onDialogBegin` /
+`onDialogEnd` callbacks so the drain loop is in dialog-aware mode:
 
-```wolfram
-(* Add to init.wl — install once at kernel startup *)
-Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]
+```js
+// The evaluate() call must include dialog callbacks so the drain loop
+// handles BEGINDLGPKT / ENDDLGPKT correctly.
+const mainEval = session.evaluate(expr, {
+    onDialogBegin: (_level) => {},
+    onDialogEnd:   (_level) => {},
+});
 ```
-
-If you skip this, `session.interrupt()` is a no-op (the kernel ignores the signal) and
-`isDialogOpen` will never become `true`.
 
 #### Full example
 
@@ -877,8 +901,10 @@ final: done
 
 For a VS Code notebook extension using this backend:
 
-- `init.wl` should call `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]` at
-  kernel startup.
+- **No Wolfram-side interrupt handler is required** — the C++ backend handles `MENUPKT`
+  automatically by responding with `"i"` (inspect mode).  Optionally, installing
+  `Internal\`AddHandler["Interrupt", Function[{}, Dialog[]]]` in `init.wl` bypasses
+  `MENUPKT` entirely and sends `BEGINDLGPKT` directly; both paths are supported.
 - The ⌥⇧↵ command flow is: `session.interrupt()` → poll `isDialogOpen` → `session
   .dialogEval(cellCode)` → render result as `"Dialog: Out"` in the cell → `session
   .exitDialog()`.
@@ -887,6 +913,8 @@ For a VS Code notebook extension using this backend:
   `ENDDLGPKT` handlers that drive `isDialogOpen` and the dialog inner loop.
 - `dialogEval()` and `exitDialog()` push to `dialogQueue_` in C++, which the drain loop
   on the thread-pool thread services between kernel packets — no second link/thread needed.
+- Dialog results from inspect mode are returned as `RETURNTEXTPKT` (OutputForm text) rather
+  than `RETURNPKT` (full WL expression); the C++ SDR layer parses these transparently.
 
 ---
 
