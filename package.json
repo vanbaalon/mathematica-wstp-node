@@ -1,14 +1,36 @@
 {
-  "name": "wstp-backend",
+  "name": "wstp-node",
   "version": "0.3.0",
-  "description": "Native Node.js addon wrapping WSTP — kernel sessions with evaluation queue, streaming Print/messages, and subsession support",
+  "description": "Native Node.js addon for Wolfram/Mathematica WSTP — kernel sessions with evaluation queue, streaming Print/messages, Dialog subsessions, and side-channel WstpReader",
   "main": "build/Release/wstp.node",
   "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vanbaalon/mathematica-wstp-node.git"
+  },
+  "keywords": [
+    "wolfram",
+    "mathematica",
+    "wstp",
+    "native-addon",
+    "kernel",
+    "wolframscript"
+  ],
+  "author": "vanbaalon",
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "prebuild": "",
+    "install": "bash build.sh",
     "build": "bash build.sh",
     "build:debug": "bash build.sh debug",
     "clean": "bash build.sh clean",
+    "test": "node test.js",
     "demo": "node examples/demo.js"
   },
   "dependencies": {

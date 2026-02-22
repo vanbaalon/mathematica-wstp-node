@@ -75,11 +75,20 @@ case "$ARCH" in
     *)        WSTP_SUBDIR="$ARCH"          ;;
 esac
 
-WSTP_SDK="${WSTP_DIR:-/Applications/Wolfram 3.app/Contents/SystemFiles/Links/WSTP/DeveloperKit/$WSTP_SUBDIR/CompilerAdditions}"
+# WSTP_DIR overrides everything; otherwise derive from WOLFRAM_APP (default: Wolfram 3.app)
+WOLFRAM_APP_DEFAULT="/Applications/Wolfram 3.app"
+if [[ -z "${WSTP_DIR:-}" ]]; then
+    WOLFRAM_APP="${WOLFRAM_APP:-$WOLFRAM_APP_DEFAULT}"
+    WSTP_SDK="$WOLFRAM_APP/Contents/SystemFiles/Links/WSTP/DeveloperKit/$WSTP_SUBDIR/CompilerAdditions"
+else
+    WSTP_SDK="$WSTP_DIR"
+fi
 
 if [[ ! -f "$WSTP_SDK/wstp.h" ]]; then
     echo "ERROR: WSTP SDK not found at: $WSTP_SDK" >&2
-    echo "  Set WSTP_DIR to the CompilerAdditions directory." >&2
+    echo "  Set WOLFRAM_APP to your Wolfram/Mathematica app bundle, e.g.:" >&2
+    echo "    WOLFRAM_APP=/Applications/Mathematica.app bash build.sh" >&2
+    echo "  Or set WSTP_DIR directly to the CompilerAdditions directory." >&2
     exit 1
 fi
 echo "WSTP SDK      : $WSTP_SDK"

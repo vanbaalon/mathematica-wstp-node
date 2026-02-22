@@ -1,0 +1,14 @@
+# Built binary — consumers build locally via `npm install` (postinstall runs build.sh)
+build/
+
+# Diagnostic / probe scripts (development only)
+diag*.txt
+probe_*.js
+run_probe.js
+
+# Backup / scratch files
+*_backup*
+TASK_*.md
+
+# Test output
+/tmp/
