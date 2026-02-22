@@ -25,6 +25,15 @@
   "engines": {
     "node": ">=18"
   },
+  "files": [
+    "src/addon.cc",
+    "build.sh",
+    "binding.gyp",
+    "index.d.ts",
+    "examples/",
+    "test.js",
+    "test_interrupt_dialog.js"
+  ],
   "scripts": {
     "install": "bash build.sh",
     "build": "bash build.sh",
