@@ -273,19 +273,32 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 WSReleaseString(lp, s);
                 static const std::string NL = "\\012";
                 std::string msg;
+                // Extract the message starting from the Symbol::tag position.
+                // Wolfram's TEXTPKT for MESSAGEPKT may contain multiple \012-separated
+                // sections (e.g. the tag on one line, the body on subsequent lines).
+                // Old code stopped at the first \012 after ::, which truncated long
+                // messages like NIntegrate::ncvb to just their tag.
+                // Fixed: take the whole text from the start of the Symbol name,
+                // stripping only leading/trailing \012 groups, and replacing
+                // internal \012 with spaces so the full message is one readable line.
                 auto dc = text.find("::");
+                size_t raw_start = 0;
                 if (dc != std::string::npos) {
                     auto nl_before = text.rfind(NL, dc);
-                    size_t start = (nl_before != std::string::npos) ? nl_before + 4 : 0;
-                    auto nl_after = text.find(NL, dc);
-                    size_t end = (nl_after != std::string::npos) ? nl_after : text.size();
-                    while (start < end && text[start] == ' ') ++start;
-                    msg = text.substr(start, end - start);
-                } else {
-                    for (size_t i = 0; i < text.size(); ) {
-                        if (text.compare(i, 4, NL) == 0) { msg += ' '; i += 4; }
-                        else { msg += text[i++]; }
-                    }
+                    raw_start = (nl_before != std::string::npos) ? nl_before + 4 : 0;
+                }
+                // Strip trailing \012 sequences from the raw text
+                std::string raw = text.substr(raw_start);
+                while (raw.size() >= 4 && raw.compare(raw.size() - 4, 4, NL) == 0)
+                    raw.resize(raw.size() - 4);
+                // Strip leading spaces
+                size_t sp = 0;
+                while (sp < raw.size() && raw[sp] == ' ') ++sp;
+                raw = raw.substr(sp);
+                // Replace all remaining \012 with a single space
+                for (size_t i = 0; i < raw.size(); ) {
+                    if (raw.compare(i, 4, NL) == 0) { msg += ' '; i += 4; }
+                    else { msg += raw[i++]; }
                 }
                 if (!forDialog) {
                     r.messages.push_back(msg);
@@ -1182,6 +1195,7 @@ public:
             InstanceMethod<&WstpSession::ExitDialog>      ("exitDialog"),
             InstanceMethod<&WstpSession::Interrupt>       ("interrupt"),
             InstanceMethod<&WstpSession::Abort>           ("abort"),
+            InstanceMethod<&WstpSession::CloseAllDialogs>  ("closeAllDialogs"),
             InstanceMethod<&WstpSession::CreateSubsession>("createSubsession"),
             InstanceMethod<&WstpSession::Close>           ("close"),
             InstanceAccessor<&WstpSession::IsOpen>        ("isOpen"),
@@ -1521,6 +1535,15 @@ public:
                 "no dialog subsession is open").Value());
             return promise;
         }
+        // Stale-state guard: dialogOpen_=true but the drain loop has already
+        // exited (busy_=false).  Nobody will service the queue, so resolve
+        // immediately and clean up rather than enqueuing a hanging request.
+        if (!busy_.load()) {
+            FlushDialogQueueWithError("dialog closed: session idle");
+            dialogOpen_.store(false);
+            deferred.Resolve(env.Null());
+            return promise;
+        }
         // Build "Return[]" or "Return[retVal]" as the exit expression.
         std::string exitExpr = "Return[]";
         if (info.Length() >= 1 && info[0].IsString())
@@ -1649,8 +1672,35 @@ public:
         // spurious RETURNPKT[$Aborted] that would corrupt the next evaluation.
         if (!busy_.load()) return Napi::Boolean::New(env, false);
         abortFlag_.store(true);
+        // Flush any queued dialogEval/exitDialog requests so their promises
+        // reject immediately instead of hanging forever.
+        FlushDialogQueueWithError("abort");
+        dialogOpen_.store(false);
         int ok = WSPutMessage(lp_, WSAbortMessage);
         return Napi::Boolean::New(env, ok != 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // closeAllDialogs() → boolean
+    //
+    // Unconditionally resets all dialog state on the JS side:
+    //   • Drains dialogQueue_, rejecting every pending dialogEval/exitDialog
+    //     promise with an error (so callers don't hang).
+    //   • Clears dialogOpen_ so isDialogOpen returns false.
+    //
+    // This does NOT send any packet to the kernel — it only fixes the Node
+    // side bookkeeping.  Use it in error-recovery paths (before abort() or
+    // after an unexpected kernel state change) to guarantee clean state.
+    //
+    // Returns true if dialogOpen_ was set before the call (i.e. something
+    // was actually cleaned up), false if it was already clear.
+    // -----------------------------------------------------------------------
+    Napi::Value CloseAllDialogs(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        bool wasOpen = dialogOpen_.load();
+        FlushDialogQueueWithError("dialog closed by closeAllDialogs");
+        dialogOpen_.store(false);
+        return Napi::Boolean::New(env, wasOpen);
     }
 
     // -----------------------------------------------------------------------
@@ -1699,6 +1749,31 @@ private:
         Napi::Promise::Deferred deferred;
         int                     interactiveOverride = -1;
     };
+
+    // -----------------------------------------------------------------------
+    // FlushDialogQueueWithError — drain dialogQueue_, rejecting every pending
+    // promise with errMsg.  Caller must hold no locks; this acquires
+    // dialogMutex_ internally.  Resets dialogPending_.
+    // -----------------------------------------------------------------------
+    void FlushDialogQueueWithError(const std::string& errMsg) {
+        std::queue<DialogRequest> toFlush;
+        {
+            std::lock_guard<std::mutex> lk(dialogMutex_);
+            std::swap(toFlush, dialogQueue_);
+            dialogPending_.store(false);
+        }
+        while (!toFlush.empty()) {
+            DialogRequest req = std::move(toFlush.front());
+            toFlush.pop();
+            std::string msg = errMsg;
+            req.resolve.NonBlockingCall([msg](Napi::Env e, Napi::Function cb) {
+                auto obj = Napi::Object::New(e);
+                obj.Set("error", Napi::String::New(e, msg));
+                cb.Call({obj});
+            });
+            req.resolve.Release();
+        }
+    }
 
     void CleanUp() {
         if (lp_)    { WSClose(lp_);           lp_    = nullptr; }
