@@ -130,7 +130,8 @@ Depth is capped at 512 to prevent stack overflow on pathological inputs.
 | `dialogEval(expr)` | `string → Promise<WExpr>` | Evaluate inside the currently-open `Dialog[]` subsession using `EvaluatePacket`; rejects if no dialog is open |
 | `exitDialog(retVal?)` | `string? → Promise<null>` | Close the open dialog by sending `EnterTextPacket["Return[]"]` (or `EnterTextPacket["Return[retVal]"]`); rejects if no dialog is open. **Required to exit a dialog** — `dialogEval('Return[]')` does NOT close the dialog (see note below) |
 | `interrupt()` | `boolean` | Post `WSInterruptMessage` (best-effort — requires a Wolfram-side interrupt handler) |
-| `abort()` | `boolean` | Thread-safe: calls `WSAbortMessage` + `WSPutMessage(WSABORTTAG)` |
+| `abort()` | `boolean` | Thread-safe: calls `WSAbortMessage` + `WSPutMessage(WSABORTTAG)`. Now also flushes `dialogQueue_` via `FlushDialogQueueWithError()` and clears `dialogOpen_` |
+| `closeAllDialogs()` | `boolean` | Drains `dialogQueue_` (rejecting all pending TSFN promises) and clears `dialogOpen_`. Node-side only — no WSTP packet sent. Returns `true` if `dialogOpen_` was set. Safe to call at any time |
 | `createSubsession()` | `→ WstpSession` | Launches a second independent kernel |
 | `close()` | `void` | Calls `CleanUp()`: `WSClose` → `WSDeinitialize` → `SIGTERM` on child PID |
 | `isOpen` | getter | Returns whether the session is still alive |

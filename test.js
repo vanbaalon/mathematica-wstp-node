@@ -616,6 +616,57 @@ async function main() {
         );
     });
 
+    // ── 28. closeAllDialogs() is a no-op when no dialog is open ───────────
+    await run('28. closeAllDialogs() no-op when idle', async () => {
+        assert(!session.isDialogOpen, 'precondition: no dialog open');
+        const closed = session.closeAllDialogs();
+        assert(closed === false,
+            `closeAllDialogs() should return false when idle, got: ${closed}`);
+        assert(!session.isDialogOpen, 'isDialogOpen should stay false');
+    });
+
+    // ── 29. closeAllDialogs() rejects all queued dialogEval promises ───────
+    // Uses a subsession so the main session stays intact for tests 25 and 18.
+    // Verifies: return value = true, isDialogOpen cleared, queued promises rejected.
+    await run('29. closeAllDialogs() rejects queued dialogEval promises', async () => {
+        const sub = session.createSubsession();
+        try {
+            // Open a Dialog[] on the subsession.
+            const pEval = sub.evaluate('Dialog[]');
+            await pollUntil(() => sub.isDialogOpen);
+            assert(sub.isDialogOpen, 'dialog should be open');
+
+            // Queue two dialogEval() calls — neither will be serviced before
+            // closeAllDialogs() runs (the JS event loop hasn't yielded yet).
+            const pe1 = sub.dialogEval('"expr-1"')
+                .then(() => 'resolved').catch(e => 'rejected:' + e.message);
+            const pe2 = sub.dialogEval('"expr-2"')
+                .then(() => 'resolved').catch(e => 'rejected:' + e.message);
+
+            // closeAllDialogs() should flush both and return true.
+            const closed = sub.closeAllDialogs();
+            assert(closed === true,
+                `closeAllDialogs() should return true when dialog was open, got: ${closed}`);
+            assert(!sub.isDialogOpen,
+                'isDialogOpen should be false after closeAllDialogs()');
+
+            // Both queued promises must reject immediately.
+            const [r1, r2] = await Promise.all([pe1, pe2]);
+            assert(r1.startsWith('rejected:'),
+                `pe1 should have rejected, got: ${r1}`);
+            assert(r2.startsWith('rejected:'),
+                `pe2 should have rejected, got: ${r2}`);
+
+            // Abort the subsession to unstick the kernel (still inside Dialog[]).
+            sub.abort();
+            const ra = await pEval;
+            assert(ra.aborted === true,
+                `subsession evaluate should resolve with aborted=true, got: ${JSON.stringify(ra.aborted)}`);
+        } finally {
+            sub.close();
+        }
+    });
+
     // ── 25. abort() while dialog is open ──────────────────────────────────
     // Must run AFTER all other dialog tests — abort() sends WSAbortMessage
     // which resets the WSTP link, leaving the session unusable for further
