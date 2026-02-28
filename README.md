@@ -23,6 +23,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
    - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
    - [`abort()`](#abort) — interrupt the currently running evaluation
+   - [`closeAllDialogs()`](#closealldialogs) — immediately reject all pending dialog promises and reset dialog state
    - [`dialogEval(expr)`](#dialogevalexpr) — evaluate inside an active `Dialog[]` subsession
    - [`exitDialog(retVal?)`](#exitdialogretval) — exit the current dialog and resume the main evaluation
    - [`interrupt()`](#interrupt) — send a low-level interrupt signal to the kernel
@@ -313,6 +314,43 @@ session.abort();       // cancels after ~500 ms
 const r = await p;
 // r.aborted === true
 // r.result  === { type: 'symbol', value: '$Aborted' }
+```
+
+---
+
+### `closeAllDialogs()`
+
+```ts
+session.closeAllDialogs(): boolean
+```
+
+Unconditionally reset all dialog state on the Node.js side.
+
+- Drains the internal dialog queue, immediately **rejecting** every pending `dialogEval()` and
+  `exitDialog()` promise with an error — no callers are left waiting forever.
+- Clears `isDialogOpen` to `false`.
+
+This does **not** send any packet to the kernel — it only fixes Node-side bookkeeping.  Use
+it in error-recovery paths, before `abort()`, or whenever you need to guarantee clean dialog
+state without knowing whether a dialog is actually still running.
+
+Returns `true` if `isDialogOpen` was `true` before the call (something was cleaned up),
+`false` if it was already clear.
+
+```js
+// Safe no-op when there is no open dialog:
+const cleaned = session.closeAllDialogs();  // false
+
+// Reliable recovery pattern before abort:
+session.closeAllDialogs();  // reject any hanging dialog promises immediately
+session.abort();
+
+// Queued dialogEval() promises reject with a descriptive error:
+const p = session.evaluate('Dialog[]');
+await pollUntil(() => session.isDialogOpen);
+const pe = session.dialogEval('1 + 1').catch(e => e.message);
+session.closeAllDialogs();  // pe rejects → "dialog closed by closeAllDialogs"
+session.abort();
 ```
 
 ---
@@ -990,6 +1028,8 @@ kb.close();
 | Abort | `evaluate()` **resolves** with `aborted: true`, `result.value === '$Aborted'` |
 | Kernel crashes | `evaluate()` rejects with a link error message — create a new `WstpSession` |
 | `dialogEval()` / `exitDialog()` when no dialog open | Rejects with `"no dialog subsession is open"` |
+| `dialogEval()` / `exitDialog()` when flushed by `closeAllDialogs()` | Rejects with `"dialog closed by closeAllDialogs"` |
+| `abort()` / `closeAllDialogs()` flushes dialog queue | Pending `dialogEval()`/`exitDialog()` promises reject immediately |
 | `evaluate()` after `close()` | Rejects with `"Session is closed"` |
 | `WstpReader.readNext()` after link closes | Rejects with a link-closed error |
 
