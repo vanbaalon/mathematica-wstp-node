@@ -223,6 +223,46 @@ static WExpr ReadExprRaw(WSLINK lp, int depth = 0) {
 static Napi::Value WExprToNapi(Napi::Env env, const WExpr& e);
 
 // ---------------------------------------------------------------------------
+// drainDialogAbortResponse — drain the WSTP link after aborting out of a
+// dialog inner loop.
+//
+// When abort() fires proactively (abortFlag_ is true before the kernel has
+// sent its response), WSAbortMessage has already been posted but the kernel's
+// abort response — RETURNPKT[$Aborted] or ILLEGALPKT — has not yet been read.
+// Leaving it on the link corrupts the next evaluation: it becomes the first
+// packet seen by the next DrainToEvalResult call, which resolves immediately
+// with $Aborted and leaves the real response on the link — permanently
+// degrading the session and disabling subsequent interrupts.
+//
+// Reads and discards packets until RETURNPKT, RETURNEXPRPKT, ILLEGALPKT, or a
+// 10-second wall-clock deadline.  Intermediate packets (ENDDLGPKT, TEXTPKT,
+// MESSAGEPKT, MENUPKT, etc.) are silently consumed.
+// ---------------------------------------------------------------------------
+static void drainDialogAbortResponse(WSLINK lp) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        // Poll until data is available or the deadline passes.
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (WSReady(lp)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!WSReady(lp)) return; // timed out — give up
+        int pkt = WSNextPacket(lp);
+        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT) {
+            WSNewPacket(lp);
+            return; // outer-eval abort response consumed — link is clean
+        }
+        if (pkt == ILLEGALPKT || pkt == 0) {
+            WSClearError(lp);
+            WSNewPacket(lp);
+            return; // link reset — clean
+        }
+        WSNewPacket(lp); // discard intermediate packet (ENDDLGPKT, MENUPKT, …)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DrainToEvalResult — consume all packets for one cell, capturing Print[]
 // output and messages.  Blocks until RETURNPKT.  Thread-pool thread only.
 // opts may be nullptr (no streaming callbacks).
@@ -693,10 +733,14 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 // The kernel may be slow to respond (or send RETURNPKT[$Aborted]
                 // without a preceding ENDDLGPKT); bail out proactively to avoid
                 // spinning forever.
+                // CRITICAL: always drain the link before returning.  If we exit
+                // here before the kernel sends its RETURNPKT[$Aborted], that
+                // response stays on the link and corrupts the next evaluation.
                 if (opts && opts->abortFlag && opts->abortFlag->load()) {
                     if (opts->dialogOpen) opts->dialogOpen->store(false);
                     r.result = WExpr::mkSymbol("System`$Aborted");
                     r.aborted = true;
+                    drainDialogAbortResponse(lp); // consume pending abort response
                     return r;
                 }
 
@@ -834,6 +878,7 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                     if (opts->dialogOpen) opts->dialogOpen->store(false);
                     r.result = WExpr::mkSymbol("System`$Aborted");
                     r.aborted = true;
+                    drainDialogAbortResponse(lp); // consume pending abort response
                     return r;
                 }
                 if (opts && opts->dialogPending && opts->dialogPending->load()) {
@@ -1050,6 +1095,7 @@ public:
                    std::string                   expr,
                    EvalOptions                   opts,
                    std::atomic<bool>&            abortFlag,
+                   std::atomic<bool>&            workerReadingLink,
                    std::function<void()>         completionCb,
                    int64_t                       cellIndex,
                    bool                          interactive = false)
@@ -1060,6 +1106,7 @@ public:
           interactive_(interactive),
           opts_(std::move(opts)),
           abortFlag_(abortFlag),
+          workerReadingLink_(workerReadingLink),
           completionCb_(std::move(completionCb)),
           cellIndex_(cellIndex)
     {}
@@ -1085,10 +1132,12 @@ public:
                    WSFlush      (lp_);
         }
         if (!sent) {
+            workerReadingLink_.store(false, std::memory_order_release);
             SetError("Failed to send packet to kernel");
         } else {
             opts_.interactive = interactive_;
             result_ = DrainToEvalResult(lp_, &opts_);
+            workerReadingLink_.store(false, std::memory_order_release); // lp_ no longer in use
             if (!interactive_) {
                 // EvaluatePacket mode: kernel never sends INPUTNAMEPKT/OUTPUTNAMEPKT,
                 // so stamp the pre-captured counter and derive outputName manually.
@@ -1173,6 +1222,7 @@ private:
     std::string              expr_;
     EvalOptions              opts_;
     std::atomic<bool>&       abortFlag_;
+    std::atomic<bool>&       workerReadingLink_;
     std::function<void()>    completionCb_;
     int64_t                  cellIndex_;
     bool                     interactive_;
@@ -1415,12 +1465,14 @@ public:
         bool evalInteractive = (item.interactiveOverride == -1)
                                 ? interactiveMode_
                                 : (item.interactiveOverride == 1);
+        workerReadingLink_.store(true, std::memory_order_release);
         auto* worker = new EvaluateWorker(
             std::move(item.deferred),
             lp_,
             std::move(item.expr),
             std::move(item.opts),
             abortFlag_,
+            workerReadingLink_,
             [this]() { busy_.store(false); MaybeStartNext(); },
             nextLine_.fetch_add(1),
             evalInteractive
@@ -1433,10 +1485,11 @@ public:
     void StartSubIdleWorker(QueuedSubIdle item) {
         struct SubIdleWorker : public Napi::AsyncWorker {
             SubIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
+                          std::atomic<bool>& workerReadingLink,
                           std::function<void()> done)
                 : Napi::AsyncWorker(d.Env()),
                   deferred_(std::move(d)), lp_(lp), expr_(std::move(expr)),
-                  done_(std::move(done)) {}
+                  workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
 
             void Execute() override {
                 if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
@@ -1444,10 +1497,12 @@ public:
                     !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
                     !WSEndPacket(lp_)                        ||
                     !WSFlush(lp_)) {
+                    workerReadingLink_.store(false, std::memory_order_release);
                     SetError("sub (idle): failed to send EvaluatePacket");
                     return;
                 }
                 result_ = DrainToEvalResult(lp_);
+                workerReadingLink_.store(false, std::memory_order_release); // lp_ no longer in use
             }
             void OnOK() override {
                 Napi::Env env = Env();
@@ -1470,11 +1525,14 @@ public:
             Napi::Promise::Deferred deferred_;
             WSLINK                  lp_;
             std::string             expr_;
+            std::atomic<bool>&      workerReadingLink_;
             std::function<void()>   done_;
             EvalResult              result_;
         };
 
+        workerReadingLink_.store(true, std::memory_order_release);
         (new SubIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
+                           workerReadingLink_,
                            [this]() { busy_.store(false); MaybeStartNext(); }))->Queue();
     }
 
@@ -1776,13 +1834,32 @@ private:
     }
 
     void CleanUp() {
+        // If a worker thread is currently reading from lp_, calling WSClose()
+        // on it from the JS main thread causes a concurrent-access crash
+        // (heap-use-after-free / SIGSEGV).
+        //
+        // We spin on workerReadingLink_ (set false by Execute() on the background
+        // thread) rather than busy_ (set false by OnOK/OnError on the main thread).
+        // Spinning on busy_ from the main thread would deadlock because the main
+        // thread's event loop is blocked — NAPI never gets to call OnOK.
+        open_ = false; // prevent new evals from queuing during shutdown
+        if (workerReadingLink_.load(std::memory_order_acquire) && lp_) {
+            abortFlag_.store(true);
+            FlushDialogQueueWithError("session closed");
+            dialogOpen_.store(false);
+            WSPutMessage(lp_, WSAbortMessage);
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (workerReadingLink_.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         if (lp_)    { WSClose(lp_);           lp_    = nullptr; }
         if (wsEnv_) { WSDeinitialize(wsEnv_); wsEnv_ = nullptr; }
         // Kill the child kernel process so it doesn't become a zombie.
         // WSClose() closes the link but does not terminate the WolframKernel
         // child process — without this, each session leaks a kernel.
         if (kernelPid_ > 0) { kill(kernelPid_, SIGTERM); kernelPid_ = 0; }
-        open_ = false;
     }
 
 
@@ -1880,6 +1957,11 @@ private:
     std::atomic<int64_t>        nextLine_{1};      // 1-based In[n] counter for EvalResult.cellIndex
     std::atomic<bool>           abortFlag_{false};
     std::atomic<bool>           busy_{false};
+    // Set true before queuing a worker, set false from within Execute() (background
+    // thread) right after DrainToEvalResult returns.  CleanUp() spins on this flag
+    // rather than busy_ (which is cleared on the main thread and cannot be polled
+    // from a main-thread spin loop).
+    std::atomic<bool>           workerReadingLink_{false};
     std::mutex                  queueMutex_;
     std::queue<QueuedEval>      queue_;
     std::queue<QueuedSubIdle>   subIdleQueue_;    // sub() — runs before queue_ items

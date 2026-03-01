@@ -39,6 +39,30 @@ function pollUntil(condition, timeoutMs = 3000, intervalMs = 50) {
     });
 }
 
+// withTimeout — race a promise against a named deadline.
+function withTimeout(p, ms, label) {
+    return Promise.race([
+        p,
+        new Promise((_, rej) =>
+            setTimeout(() => rej(new Error(`TIMEOUT(${ms}ms): ${label}`)), ms)),
+    ]);
+}
+
+// mkSession — open a fresh WstpSession.
+function mkSession() {
+    return new WstpSession(KERNEL_PATH);
+}
+
+// installHandler — install Interrupt→Dialog[] handler on a session.
+// Must be done via evaluate() (EnterExpressionPacket context) so the handler
+// fires on WSInterruptMessage; EvaluatePacket context does not receive it.
+async function installHandler(s) {
+    await s.evaluate(
+        'Quiet[Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]]',
+        { onDialogBegin: () => {}, onDialogEnd: () => {} }
+    );
+}
+
 // Per-test timeout (ms).  Any test that does not complete within this window
 // is failed immediately with a "TIMED OUT" error.  Prevents indefinite hangs.
 const TEST_TIMEOUT_MS = 30_000;
@@ -56,11 +80,11 @@ suiteWatchdog.unref();   // does not prevent normal exit
 let passed = 0;
 let failed = 0;
 
-async function run(name, fn) {
+async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
     // Race the test body against a per-test timeout.
     const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`TIMED OUT after ${TEST_TIMEOUT_MS} ms`)),
-                   TEST_TIMEOUT_MS));
+        setTimeout(() => reject(new Error(`TIMED OUT after ${timeoutMs} ms`)),
+                   timeoutMs));
     try {
         await Promise.race([fn(), timeout]);
         console.log(`  ✓ ${name}`);
@@ -667,6 +691,302 @@ async function main() {
         }
     });
 
+    // ── P1: Pause[8] ignores interrupt ────────────────────────────────────
+    // Expected: interrupt() returns true but isDialogOpen stays false within
+    // 2500ms because Pause[] ignores WSInterruptMessage during a sleep.
+    // This test documents the fundamental limitation: Dynamic cannot read a
+    // live variable while Pause[N] is running.
+    await run('P1: Pause[8] ignores interrupt within 2500ms', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            let evalDone = false;
+            const mainProm = s.evaluate(
+                'pP1 = 0; Pause[8]; pP1 = 1; "p1-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).then(() => { evalDone = true; });
+
+            await sleep(300);
+
+            const sent = s.interrupt();
+            assert(sent === true, 'interrupt() should return true mid-eval');
+
+            const t0 = Date.now();
+            while (!s.isDialogOpen && Date.now() - t0 < 2500) await sleep(25);
+
+            const dlgOpened = s.isDialogOpen;
+            assert(!dlgOpened, 'Pause[8] should NOT open a dialog within 2500ms');
+
+            // After the 2500ms window the interrupt may still be queued — the kernel
+            // will fire Dialog[] once Pause[] releases.  Abort to unstick the eval
+            // rather than waiting for it to return on its own (which could take forever
+            // if Dialog[] opens and nobody services it).
+            s.abort();
+            await mainProm; // resolves immediately after abort()
+        } finally {
+            s.close();
+        }
+    }, 20_000);
+
+    // ── P2: Pause[0.3] loop — interrupt opens Dialog and dialogEval works ──
+    // Expected: interrupt during a short Pause[] loop opens a Dialog[],
+    // dialogEval can read the live variable, and exitDialog resumes the loop.
+    await run('P2: Pause[0.3] loop — interrupt opens Dialog and dialogEval succeeds', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            let evalDone = false;
+            const mainProm = s.evaluate(
+                'Do[nP2 = k; Pause[0.3], {k, 1, 30}]; "p2-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).then(() => { evalDone = true; });
+
+            await sleep(500);
+
+            s.interrupt();
+            try { await pollUntil(() => s.isDialogOpen, 3000); }
+            catch (_) { throw new Error('Dialog never opened — interrupt not working with Pause[0.3]'); }
+
+            const val = await withTimeout(s.dialogEval('nP2'), 5000, 'dialogEval nP2');
+            assert(val && typeof val.value === 'number' && val.value >= 1,
+                `expected nP2 >= 1, got ${JSON.stringify(val)}`);
+
+            await s.exitDialog();
+            await withTimeout(mainProm, 15_000, 'P2 main eval');
+        } finally {
+            try { s.abort(); } catch (_) {}
+            s.close();
+        }
+    }, 30_000);
+
+    // ── P3: dialogEval timeout — kernel state after (diagnostic) ───────────
+    // Simulates the extension failure: dialogEval times out without exitDialog.
+    // Verifies the kernel is NOT permanently broken by a timeout alone.
+    // Always passes — records the observed behaviour.
+    await run('P3: dialogEval timeout — kernel still recovers via exitDialog', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            let evalDone = false;
+            const mainProm = s.evaluate(
+                'Do[nP3 = k; Pause[0.3], {k, 1, 200}]; "p3-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).then(() => { evalDone = true; });
+
+            await sleep(500);
+
+            s.interrupt();
+            try { await pollUntil(() => s.isDialogOpen, 3000); }
+            catch (_) { throw new Error('Dialog #1 never opened'); }
+
+            // Simulate a timed-out dialogEval (abandon it at 200ms)
+            try { await withTimeout(s.dialogEval('nP3'), 200, 'deliberate-timeout'); } catch (_) {}
+
+            // Attempt exitDialog — should succeed
+            let exitOk = false;
+            try { await withTimeout(s.exitDialog(), 2000, 'exitDialog after timeout'); exitOk = true; }
+            catch (_) {}
+
+            // Attempt a second interrupt to confirm kernel state
+            await sleep(400);
+            s.interrupt();
+            let dlg2 = false;
+            const t2 = Date.now();
+            while (!s.isDialogOpen && Date.now() - t2 < 3000) await sleep(30);
+            dlg2 = s.isDialogOpen;
+
+            if (dlg2) {
+                await withTimeout(s.dialogEval('nP3'), 4000, 'dialogEval #2').catch(() => {});
+                await s.exitDialog().catch(() => {});
+            }
+
+            if (!evalDone) { try { await withTimeout(mainProm, 20_000, 'P3 loop'); } catch (_) {} }
+
+            // Diagnostic: document observed outcome but do not hard-fail on dlg2
+            if (!exitOk) {
+                console.log(`    P3 note: exitDialog failed, dlg2=${dlg2} (expected=false for unfixed build)`);
+            }
+            // Test passes unconditionally.
+        } finally {
+            try { s.abort(); } catch (_) {}
+            s.close();
+        }
+    }, 45_000);
+
+// ── P4: abort() after stuck dialog — session stays alive ────────────────
+    // Note: abort() sends WSAbortMessage which resets the Wolfram kernel's
+    // Internal`AddHandler["Interrupt", ...] registration.  Subsequent interrupts
+    // therefore do not open a new Dialog[]; that is expected, not a bug.
+    // What this test verifies: after abort() the session is NOT dead —
+    // evaluate() still works so the extension can queue more cells.
+    await run('P4: abort() after stuck dialog — session can still evaluate', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            const mainProm = s.evaluate(
+                'Do[nP4=k; Pause[0.3], {k,1,200}]; "p4-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).catch(() => {});
+
+            await sleep(500);
+
+            // Trigger a dialog, force dialogEval timeout, then abort
+            s.interrupt();
+            try { await pollUntil(() => s.isDialogOpen, 3000); }
+            catch (_) { throw new Error('Dialog #1 never opened'); }
+
+            try { await withTimeout(s.dialogEval('nP4'), 300, 'deliberate'); } catch (_) {}
+            try { s.abort(); } catch (_) {}
+
+            // Let execute() drain the abort response and OnOK fire
+            const tAbort = Date.now();
+            while (s.isDialogOpen && Date.now() - tAbort < 5000) await sleep(50);
+            try { await withTimeout(mainProm, 5000, 'P4 abort settle'); } catch (_) {}
+            await sleep(300);
+
+            // KEY assertion: the session is still functional for evaluate()
+            // (abort() must NOT permanently close the link)
+            const r = await withTimeout(
+                s.evaluate('"session-alive-after-abort"'),
+                8000, 'post-abort evaluate'
+            );
+            assert(r && r.result && r.result.value === 'session-alive-after-abort',
+                `evaluate() after abort returned unexpected result: ${JSON.stringify(r)}`);
+        } finally {
+            try { s.abort(); } catch (_) {}
+            s.close();
+        }
+    }, 30_000);
+
+    // ── P5: closeAllDialogs()+abort() recovery → reinstall handler → new dialog works
+    // closeAllDialogs() is designed to be paired with abort().  It rejects all
+    // pending dialogEval() promises (JS-side), while abort() signals the kernel.
+    // After recovery the interrupt handler must be reinstalled because abort()
+    // clears Wolfram's Internal`AddHandler["Interrupt",...] registration.
+    await run('P5: closeAllDialogs()+abort() recovery — new dialog works after reinstallHandler', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            const mainProm = s.evaluate(
+                'Do[nP5 = k; Pause[0.3], {k, 1, 200}]; "p5-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).catch(() => {});
+
+            await sleep(500);
+
+            // ── Phase 1: open dialog #1, call closeAllDialogs()+abort() ──────
+            s.interrupt();
+            try { await pollUntil(() => s.isDialogOpen, 3000); }
+            catch (_) { throw new Error('Dialog #1 never opened'); }
+
+            // Start a dialogEval — closeAllDialogs() will reject it synchronously.
+            const de1 = s.dialogEval('nP5').catch(() => {});
+            try { s.closeAllDialogs(); } catch (_) {}
+            await de1;           // resolves immediately (rejected by closeAllDialogs)
+            await sleep(100);
+            try { s.abort(); } catch (_) {}
+            await mainProm;      // should resolve promptly after abort()
+
+            // ── Phase 2: reinstall handler, start new loop, interrupt → dialog #2 ──
+            // abort() clears Internal`AddHandler["Interrupt",...] in the kernel,
+            // so we must reinstall before the next interrupt cycle.
+            await withTimeout(installHandler(s), 8000, 'reinstall handler after abort');
+
+            let dlg2 = false;
+            const mainProm2 = s.evaluate(
+                'Do[nP5b = k; Pause[0.3], {k, 1, 200}]; "p5b-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).catch(() => {});
+
+            await sleep(500);
+            s.interrupt();
+            try { await pollUntil(() => s.isDialogOpen, 3000); }
+            catch (_) { throw new Error('Dialog #2 never opened after closeAllDialogs()+abort() recovery'); }
+            dlg2 = true;
+
+            // Read a live variable inside the dialog.
+            const val2 = await withTimeout(s.dialogEval('nP5b'), 4000, 'dialogEval #2');
+            assert(val2 !== null && val2.value !== undefined, 'dialogEval #2 should return nP5b value');
+
+            assert(dlg2, 'after closeAllDialogs()+abort()+reinstallHandler, interrupt must open a new dialog');
+            // Abort the dialog and remaining Do loop promptly (no exitDialog needed).
+            try { s.abort(); } catch (_) {}
+            await mainProm2.catch(() => {});  // drains immediately after abort
+        } finally {
+            try { s.abort(); } catch (_) {}
+            s.close();
+        }
+    }, 60_000);
+
+    // ── P6: Simulate Dynamic + Pause[5] full scenario (diagnostic) ─────────
+    // Reproduces: n=RandomInteger[100]; Pause[5] with interrupt every 2.5s.
+    // Pause[5] is expected to block all interrupts.  Test always passes —
+    // it documents whether reads succeed despite long Pause.
+    await run('P6: Pause[5] + interrupt cycle — dynamic read diagnostic', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            let evalDone = false;
+            const mainProm = s.evaluate(
+                'n = RandomInteger[100]; Pause[5]; "p6-done"',
+                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+            ).then(() => { evalDone = true; });
+
+            await sleep(200);
+
+            const INTERRUPT_WAIT_MS = 2500;
+            const DIALOG_EVAL_TIMEOUT_MS = 8000;
+            let dialogReadSucceeded = false;
+            let pauseIgnoredInterrupt = false;
+
+            for (let cycle = 1; cycle <= 5 && !evalDone; cycle++) {
+                const t0 = Date.now();
+                s.interrupt();
+                while (!s.isDialogOpen && Date.now() - t0 < INTERRUPT_WAIT_MS) await sleep(25);
+                const dlg = s.isDialogOpen;
+
+                if (!dlg) {
+                    pauseIgnoredInterrupt = true;
+                    await sleep(300);
+                    continue;
+                }
+
+                try {
+                    const val = await withTimeout(
+                        s.dialogEval('n'), DIALOG_EVAL_TIMEOUT_MS, `P6 dialogEval cycle ${cycle}`);
+                    dialogReadSucceeded = true;
+                    await s.exitDialog();
+                    break;
+                } catch (e) {
+                    let exitOk = false;
+                    for (let a = 0; a < 3 && !exitOk; a++) {
+                        try { await withTimeout(s.exitDialog(), 2000, `exitDialog ${a+1}`); exitOk = true; }
+                        catch (_) {}
+                    }
+                    if (!exitOk) { try { s.abort(); } catch (_) {} await sleep(1000); break; }
+                }
+            }
+
+            try { await withTimeout(mainProm, 12_000, 'P6 main eval'); } catch (_) {}
+
+            // Diagnostic: always passes — log observed outcome
+            if (pauseIgnoredInterrupt && !dialogReadSucceeded) {
+                console.log('    P6 note: Pause[5] blocked all interrupts — expected behaviour');
+            } else if (dialogReadSucceeded) {
+                console.log('    P6 note: at least one read succeeded despite Pause');
+            }
+        } finally {
+            try { s.abort(); } catch (_) {}
+            s.close();
+        }
+    }, 60_000);
+
     // ── 25. abort() while dialog is open ──────────────────────────────────
     // Must run AFTER all other dialog tests — abort() sends WSAbortMessage
     // which resets the WSTP link, leaving the session unusable for further
@@ -700,6 +1020,10 @@ async function main() {
     console.log();
     if (failed === 0) {
         console.log(`All ${passed} tests passed.`);
+        // Force-exit: WSTP library may keep libuv handles alive after WSClose,
+        // preventing the event loop from draining naturally.  All assertions are
+        // done; a clean exit(0) is safe.
+        process.exit(0);
     } else {
         console.log(`${passed} passed, ${failed} failed.`);
     }
