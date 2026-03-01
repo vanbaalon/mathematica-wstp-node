@@ -159,6 +159,19 @@ export class WstpSession {
     readonly isDialogOpen: boolean;
 
     /**
+     * True when the session is fully ready to accept a new evaluation:
+     * the kernel is running (`isOpen`), no evaluation is currently executing
+     * or queued, and no Dialog[] subsession is open.
+     *
+     * Equivalent to:
+     *   `isOpen && !busy && !isDialogOpen && queue.empty() && subQueue.empty()`
+     *
+     * This is a synchronous snapshot; the value may change on the next tick
+     * if an async operation starts or finishes concurrently.
+     */
+    readonly isReady: boolean;
+
+    /**
      * Interrupt the currently running evaluate() call.
      *
      * Posts WSAbortMessage to the kernel.  The kernel stops its current

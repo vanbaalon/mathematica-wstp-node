@@ -565,7 +565,7 @@ await session.dialogEval('DialogReturn[]');  // front-end-only; kernel ignores i
 
 ## Test Coverage
 
-All 28 tests in `test.js` pass (`node test.js`).  The table below lists each test,
+All 36 tests in `test.js` pass (`node test.js`).  The table below lists each test,
 the feature it exercises, and the key assertion(s).
 
 | # | Name | Feature | Key assertions |
@@ -597,7 +597,15 @@ the feature it exercises, and the key assertion(s).
 | 25 | abort while dialog is open | `abort()` during dialog inner loop | `r.aborted === true`; `isDialogOpen` false after abort |
 | 26 | exitDialog() rejects with no open dialog | `exitDialog()` guard (symmetric to test 16) | Rejects with message containing `'no dialog'` |
 | 27 | evaluate() queued during dialog runs after closes | Post-dialog queue drain | `evaluate()` queued while dialog open; resolves with correct value after `exitDialog()` |
-| S | streaming stress (10× Print callback) | TSFN delivery stability across repeated evaluations | 10 consecutive `Do[Print[...],{4}]` evals in same session; promise latch confirms all 4 callbacks each time |
+| 28 | closeAllDialogs() no-op when idle | `closeAllDialogs()` is a safe no-op | Fresh session; returns `false` |
+| 29 | closeAllDialogs() rejects queued dialogEval promises | Pending `dialogEval()` is rejected synchronously | Queue `dialogEval()` then call `closeAllDialogs()`; promise rejects with `'dialog closed by closeAllDialogs'` |
+| P1 | Pause[8] ignores interrupt within 2500ms | `Pause[N]` blocks all interrupts | `interrupt()` fired during `Pause[8]`; `isDialogOpen` remains false for 2500ms |
+| P2 | Pause[0.3] loop — interrupt opens Dialog | Interrupt handler + `Dialog[]` round-trip | Install `Internal\`AddHandler`; fire interrupt during `Do[Pause[0.3],...]`; dialog opens; `dialogEval` reads live variable; `exitDialog` resumes loop |
+| P3 | dialogEval timeout — kernel recovers via exitDialog | Session survives a timed-out `dialogEval()` | Timeout inside dialog; `exitDialog()` still closes cleanly; second interrupt opens a new dialog |
+| P4 | abort() after stuck dialog — session can evaluate | Session stays alive after abort with open dialog | Interrupt→dialog→abort→`evaluate('"session-alive-after-abort"')` succeeds |
+| P5 | closeAllDialogs()+abort() recovery — new dialog after reinstall | Full recovery flow | `closeAllDialogs()`+`abort()`→reinstall `Internal\`AddHandler`→new loop→interrupt→dialog #2 opens; `dialogEval` reads live variable |
+| P6 | Pause[5] + interrupt cycle — dynamic read diagnostic | `Pause[5]` blocks all interrupts (diagnostic) | Interrupt sent mid-`Pause[5]`; dialog never opens; always passes |
+| S | streaming stress (10× Print callback) | TSFN delivery stability across repeated evaluations | 10 consecutive `Do[Print[...],{4}]` evals; promise latch confirms all 4 callbacks each time |
 
 ### Dialog test detail (tests 15–27)
 
@@ -708,6 +716,72 @@ function pollUntil(condition, timeoutMs = 3000, intervalMs = 50) {
 
 Used by all dialog tests (15, 17, 19–27) to wait for `isDialogOpen` to become `true` without
 hard-coding fixed `sleep()` durations.
+
+---
+
+## Stability Findings (from P1–P6 regression tests)
+
+Key behaviours observed during the interrupt/dialog stability test campaign, recorded here
+as design ground-truth for future maintainers.
+
+### CleanUp() must spin on `workerReadingLink_`, not `busy_`
+
+`busy_` is cleared by `OnOK()` on the **main thread** (the NAPI callback delivery
+thread).  `CleanUp()` is also called on the main thread.  Spinning on `busy_` from
+`CleanUp()` is therefore a deadlock: the event loop is blocked by the spin, so `OnOK`
+is never delivered, so `busy_` never clears, so the spin runs to its 10-second timeout —
+at which point `WSClose(lp_)` is called while the background `Execute()` thread is still
+reading from the link → **SIGSEGV**.
+
+Fix: `workerReadingLink_` is an `atomic<bool>` cleared by `Execute()` directly on the
+background thread (not via NAPI/OnOK).  `CleanUp()` spins on this flag instead.
+
+### WolframKernel sends ONE `RETURNPKT[$Aborted]` per computation
+
+When `abort()` fires while the kernel is inside `Dialog[]`, the kernel sends a **single**
+`RETURNPKT[$Aborted]` that terminates both the dialog sub-eval and the outer computation.
+There is no separate abort packet for each level.  An extra `drainDialogAbortResponse()`
+call after the first was erroneously waiting 10 s for a packet that never arrived — it
+has been removed.
+
+### `abort()` clears `Internal\`AddHandler["Interrupt", ...]`
+
+After `abort()` the Wolfram kernel resets user-installed interrupt handlers.  Subsequent
+`interrupt()` calls no longer trigger `Dialog[]` unless the handler is reinstalled.  This
+is by design in Wolfram; callers that rely on the interrupt→dialog flow must call
+`evaluate('Internal\`AddHandler["Interrupt", ...]')` again after every `abort()`.
+
+### `closeAllDialogs()` is JS-side bookkeeping only
+
+`closeAllDialogs()` does not send any WSTP packet to the kernel.  It only:
+- Rejects all pending `dialogEval()`/`exitDialog()` promises immediately.
+- Clears `dialogOpen_` and `dialogPending_`.
+
+For full abort recovery the call sequence is:
+```js
+session.closeAllDialogs();  // reject hanging JS promises
+session.abort();            // signal the kernel
+await mainPromise;          // wait for kernel $Aborted response
+
+// reinstall handler — abort() clears Wolfram's Internal`AddHandler registration
+await session.evaluate('Internal\`AddHandler["Interrupt", Function[Null, Dialog[]]]');
+```
+
+### `Pause[N]` blocks all interrupts for its full duration
+
+`WSInterruptMessage` is buffered by the kernel but only processed at safe interrupt
+points.  `Pause[N]` does not yield to the interrupt check loop while sleeping; the
+interrupt fires only after `Pause` returns.  This means the interrupt→dialog flow cannot
+resume until the pause completes, even with sub-second `Pause` values.
+
+### Dialog nesting after non-clean-exit
+
+If `abort()` fires while the kernel is in `Dialog[]` (BEGINDLGPKT level 1, opened via
+inspect mode), the kernel exits the dialog via `RETURNPKT[$Aborted]` but the MENUPKT
+inspect session at level 1 may remain open internally.  A subsequent interrupt during a
+new computation then opens `Dialog[]` at **level 2** (nested inside the lingering inspect
+context).  Both `exitDialog()` and `abort()` handle level-2 dialogs correctly; the nesting
+is transparent to JS callers.
 
 ---
 

@@ -1250,6 +1250,7 @@ public:
             InstanceMethod<&WstpSession::Close>           ("close"),
             InstanceAccessor<&WstpSession::IsOpen>        ("isOpen"),
             InstanceAccessor<&WstpSession::IsDialogOpen>  ("isDialogOpen"),
+            InstanceAccessor<&WstpSession::IsReady>       ("isReady"),
         });
 
         Napi::FunctionReference* ctor = new Napi::FunctionReference();
@@ -1796,6 +1797,23 @@ public:
     // -----------------------------------------------------------------------
     Napi::Value IsDialogOpen(const Napi::CallbackInfo& info) {
         return Napi::Boolean::New(info.Env(), dialogOpen_.load());
+    }
+
+    // -----------------------------------------------------------------------
+    // isReady  (read-only accessor)
+    // true iff the session is open, the kernel has no active evaluation
+    // (busy_ is false), no dialog is open, and the eval + sub queues are
+    // both empty — i.e. the next evaluate() will start immediately.
+    // All reads are on the JS main thread (same thread that writes open_ and
+    // the queues), so no extra locking is needed.
+    // -----------------------------------------------------------------------
+    Napi::Value IsReady(const Napi::CallbackInfo& info) {
+        return Napi::Boolean::New(info.Env(),
+            open_
+            && !busy_.load(std::memory_order_relaxed)
+            && !dialogOpen_.load(std::memory_order_relaxed)
+            && queue_.empty()
+            && subIdleQueue_.empty());
     }
 
 private:

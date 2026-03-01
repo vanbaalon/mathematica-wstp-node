@@ -27,7 +27,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`interrupt()`](#interrupt) — send a low-level interrupt signal to the kernel
    - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
    - [`close()`](#close) — gracefully shut down the kernel and free resources
-   - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen) — read-only status flags
+   - [`isOpen` / `isDialogOpen` / `isReady`](#isopen--isdialogopen--isready) — read-only status flags
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
 6. [Usage examples](#usage-examples)
@@ -88,7 +88,7 @@ The script automatically locates the WSTP SDK inside the default Wolfram install
 node test.js
 ```
 
-Expected last line: `All 28 tests passed.`
+Expected last line: `All 36 tests passed.`
 
 ### 5. Quick smoke test
 
@@ -394,12 +394,43 @@ immediately with `"Session is closed"`.
 
 ---
 
-### `isOpen` / `isDialogOpen`
+### `isOpen` / `isDialogOpen` / `isReady`
 
 ```ts
 session.isOpen:       boolean  // true while the link is open and the kernel is running
 session.isDialogOpen: boolean  // true while inside a Dialog[] subsession
+session.isReady:      boolean  // true when open, idle (no active/queued evaluation), and no dialog open
 ```
+
+`isReady` is the quick "can I evaluate now?" check.  It is `true` if and only if all of the
+following hold simultaneously:
+
+| Condition | What it checks |
+|-----------|----------------|
+| `isOpen` | kernel process is alive |
+| `!busy` | no evaluation is currently executing on the background thread |
+| `!isDialogOpen` | no `Dialog[]` subsession is active |
+| empty queues | neither the `evaluate()` queue nor the `sub()` queue has pending items |
+
+```js
+// Poll until the session is idle before submitting a new batch:
+await pollUntil(() => session.isReady, 10_000);
+const r = await session.evaluate('heavyComputation[]');
+
+// Guard a one-shot fire:
+if (session.isReady) {
+    session.evaluate('updateDisplay[]').catch(() => {});
+}
+
+// Health-check before deciding to abort vs. wait:
+if (!session.isReady && !session.isDialogOpen) {
+    // kernel is busy — decide whether to abort or poll
+}
+```
+
+> **Note**: `isReady` is a snapshot; the kernel may start processing a previously-queued
+> `evaluate()` immediately after you read it.  Use it for UI state display or pre-condition
+> guards, not as a hard synchronisation barrier.
 
 ---
 
