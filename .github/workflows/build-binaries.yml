@@ -1,0 +1,106 @@
+# mathematica-wstp-node / .github/workflows/build-binaries.yml
+#
+# Builds platform-native wstp.node binaries on self-hosted runners
+# (your Mac ARM64 + Windows x64 machines, both with Wolfram Engine installed),
+# then publishes them as assets on a GitHub Release.
+#
+# The wolfbook extension repo downloads these assets to package VSIXs.
+#
+# Triggers:
+#   - Push of a version tag:  git tag v0.x.x && git push --tags
+#   - Manual:                 GitHub Actions → "Run workflow"
+
+name: Build binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (e.g. v0.4.1)'
+        required: true
+
+jobs:
+  # ── macOS ARM64 ──────────────────────────────────────────────────────────
+  build-darwin-arm64:
+    name: Build darwin-arm64
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build
+        run: npm ci && npm run build
+        env:
+          WSTP_DIR: /Applications/Wolfram 3.app/Contents/SystemFiles/Links/WSTP/DeveloperKit/MacOSX-ARM64/CompilerAdditions
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wstp-darwin-arm64
+          path: build/Release/wstp.node
+
+  # ── Windows x64 ─────────────────────────────────────────────────────────
+  build-win32-x64:
+    name: Build win32-x64
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build
+        shell: cmd
+        run: npm ci && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wstp-win32-x64
+          path: build/Release/wstp.node
+
+  # ── GitHub Release ───────────────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-darwin-arm64, build-win32-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wstp-darwin-arm64
+          path: artifacts/darwin-arm64/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wstp-win32-x64
+          path: artifacts/win32-x64/
+
+      - name: Rename artifacts
+        run: |
+          mv artifacts/darwin-arm64/wstp.node artifacts/wstp-darwin-arm64.node
+          mv artifacts/win32-x64/wstp.node    artifacts/wstp-win32-x64.node
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: wstp-node ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/wstp-darwin-arm64.node
+            artifacts/wstp-win32-x64.node
