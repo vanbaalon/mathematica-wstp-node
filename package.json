@@ -1,6 +1,6 @@
 {
   "name": "wstp-node",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Native Node.js addon for Wolfram/Mathematica WSTP — kernel sessions with evaluation queue, streaming Print/messages, Dialog subsessions, and side-channel WstpReader",
   "main": "build/Release/wstp.node",
   "types": "index.d.ts",
@@ -43,9 +43,9 @@
     "demo": "node examples/demo.js"
   },
   "dependencies": {
-    "node-addon-api": "^8.0.0"
+    "node-addon-api": "^8.6.0"
   },
   "devDependencies": {
-    "node-gyp": "^10.0.0"
+    "node-gyp": "^12.2.0"
   }
 }
