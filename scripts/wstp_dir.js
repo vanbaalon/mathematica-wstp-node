@@ -62,7 +62,11 @@ function resolve () {
       if (!fs.existsSync(path.join(wstp, 'wstp.h')) &&
           !fs.existsSync(path.join(wstp, 'wstp64i4s.lib'))) {
         process.stderr.write(
-          `wstp_dir: WSTP DeveloperKit not found at expected path:\n  ${wstp}\n`
+          `wstp_dir: found version "${versions[0]}" but WSTP DeveloperKit missing.\n` +
+          `  Expected these files inside:\n` +
+          `    ${wstp}\n` +
+          `      wstp.h          (C header)\n` +
+          `      wstp64i4s.lib   (static import library)\n`
         );
         continue;
       }
@@ -71,10 +75,15 @@ function resolve () {
 
     throw new Error(
       `WSTP DeveloperKit not found.\n` +
-      `Tried under "${base}" for: ${products.join(', ')}\n\n` +
-      `Set WSTP_DIR to your CompilerAdditions folder, e.g.:\n` +
+      `Searched under "${base}" for: ${products.join(', ')}\n\n` +
+      `The build needs these two files:\n` +
+      `  wstp.h          (C header)\n` +
+      `  wstp64i4s.lib   (static import library)\n\n` +
+      `Run the diagnostic script to find them:\n` +
+      `  powershell -ExecutionPolicy Bypass -File scripts\\diagnose-windows.ps1\n\n` +
+      `Then set WSTP_DIR to the folder containing both files and retry:\n` +
       `  set WSTP_DIR=C:\\Program Files\\Wolfram Research\\Wolfram Engine\\14.2\\SystemFiles\\Links\\WSTP\\DeveloperKit\\Windows-x86-64\\CompilerAdditions\n` +
-      `then run npm install again.`
+      `  npm install`
     );
   }
 
