@@ -27,9 +27,11 @@
   },
   "files": [
     "src/addon.cc",
+    "scripts/wstp_dir.js",
     "build.sh",
     "binding.gyp",
     "index.d.ts",
+    "InstallationWindows.md",
     "examples/",
     "test.js",
     "test_interrupt_dialog.js"

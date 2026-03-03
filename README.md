@@ -54,10 +54,15 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
 
 | Requirement | Notes |
 |-------------|-------|
-| macOS | Tested on macOS 13+; Linux should work with minor path changes |
+| macOS | Tested on macOS 13+ (ARM64 and x86-64) |
+| Windows 10/11 x64 | See [InstallationWindows.md](InstallationWindows.md) for the full Windows guide |
+| Linux x86-64 / ARM64 | Should work with standard `node-gyp` toolchain |
 | Node.js ≥ 18 | Earlier versions may work but are untested |
-| Clang / Xcode Command Line Tools | `xcode-select --install` |
+| Clang / Xcode Command Line Tools (macOS) | `xcode-select --install` |
+| MSVC Build Tools with C++ workload (Windows) | Visual Studio 2019+ or Build Tools |
 | Wolfram Mathematica or Wolfram Engine | Provides `WolframKernel` and the WSTP SDK headers/libraries |
+
+> **Windows users:** follow [InstallationWindows.md](InstallationWindows.md) instead of the steps below.
 
 ### 1. Clone
 
@@ -92,7 +97,7 @@ The script automatically locates the WSTP SDK inside the default Wolfram install
 node test.js
 ```
 
-Expected last line: `All 28 tests passed.`
+Expected last line: `All 36 tests passed.`
 
 A more comprehensive suite (both modes + In/Out + comparison) lives in `tmp/tests_all.js`:
 
