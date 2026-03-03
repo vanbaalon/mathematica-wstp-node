@@ -1,8 +1,9 @@
 {
   "variables": {
-    # Detect arch: arm64 → MacOSX-ARM64, x86_64 → MacOSX-x86-64
-    # Override the whole path by setting WSTP_DIR in the environment.
-    "wstp_dir%": "<!(echo \"${WSTP_DIR:-/Applications/Wolfram 3.app/Contents/SystemFiles/Links/WSTP/DeveloperKit/$(uname -m | sed 's/x86_64/MacOSX-x86-64/;s/arm64/MacOSX-ARM64/')/CompilerAdditions}\")"
+    # Cross-platform WSTP DeveloperKit path.
+    # Override by setting WSTP_DIR in the environment.
+    # See scripts/wstp_dir.js for auto-detection logic.
+    "wstp_dir%": "<!@(node scripts/wstp_dir.js)"
   },
   "targets": [
     {
@@ -16,13 +17,9 @@
 
       "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
 
-      "libraries": [
-        # The static library ships as libWSTPi4.a in the macOS DeveloperKit.
-        "<(wstp_dir)/libWSTPi4.a"
-      ],
-
       "conditions": [
         ["OS=='mac'", {
+          "libraries": ["<(wstp_dir)/libWSTPi4.a"],
           "xcode_settings": {
             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "MACOSX_DEPLOYMENT_TARGET": "11.0",
@@ -37,8 +34,9 @@
           }
         }],
         ["OS=='linux'", {
+          "libraries": ["<(wstp_dir)/libWSTPi4.a"],
           "cflags_cc": ["-std=c++17", "-Wall", "-Wextra"],
-          "libraries": ["-lrt", "-lpthread", "-ldl", "-lm"]
+          "link_settings": { "libraries": ["-lrt", "-lpthread", "-ldl", "-lm"] }
         }],
         ["OS=='win'", {
           "msvs_settings": {
