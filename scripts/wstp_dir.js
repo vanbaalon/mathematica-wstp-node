@@ -22,24 +22,59 @@ function resolve () {
 
   // ── 2. Windows ──────────────────────────────────────────────────────────
   if (process.platform === 'win32') {
-    const base = 'C:\\Program Files\\Wolfram Research\\Wolfram Engine';
-    let versions;
-    try {
-      versions = fs.readdirSync(base)
-        .filter(d => /^\d/.test(d))
+    const base = process.env.PROGRAMFILES || 'C:\\Program Files';
+
+    // Wolfram products to try, in priority order
+    const products = [
+      'Wolfram Research\\Wolfram Engine',
+      'Wolfram Research\\Mathematica',
+      'Wolfram Research\\WolframEngine',
+    ];
+
+    for (const product of products) {
+      const productDir = path.join(base, product);
+      let entries;
+      try { entries = fs.readdirSync(productDir); } catch (e) { continue; }
+
+      // Find version subfolders (e.g. "14.2", "13.1") — any dir starting with a digit
+      const versions = entries
+        .filter(d => {
+          if (!/^\d/.test(d)) return false;
+          try { return fs.statSync(path.join(productDir, d)).isDirectory(); } catch (e) { return false; }
+        })
         .sort()
         .reverse();
-    } catch (e) {
-      throw new Error(
-        `WSTP DeveloperKit not found at "${base}".\n` +
-        `Install Wolfram Engine or set WSTP_DIR to the CompilerAdditions folder.`
+
+      if (!versions.length) {
+        // Help diagnose: show what IS there
+        process.stderr.write(
+          `wstp_dir: found "${productDir}" but no version subfolder.\n` +
+          `  Contents: ${entries.join(', ') || '(empty)'}\n`
+        );
+        continue;
+      }
+
+      const wstp = path.join(
+        productDir, versions[0],
+        'SystemFiles', 'Links', 'WSTP', 'DeveloperKit',
+        'Windows-x86-64', 'CompilerAdditions'
       );
+      if (!fs.existsSync(path.join(wstp, 'wstp.h')) &&
+          !fs.existsSync(path.join(wstp, 'wstp64i4s.lib'))) {
+        process.stderr.write(
+          `wstp_dir: WSTP DeveloperKit not found at expected path:\n  ${wstp}\n`
+        );
+        continue;
+      }
+      return wstp;
     }
-    if (!versions.length) throw new Error(`No Wolfram Engine version found under "${base}"`);
-    return path.join(
-      base, versions[0],
-      'SystemFiles', 'Links', 'WSTP', 'DeveloperKit',
-      'Windows-x86-64', 'CompilerAdditions'
+
+    throw new Error(
+      `WSTP DeveloperKit not found.\n` +
+      `Tried under "${base}" for: ${products.join(', ')}\n\n` +
+      `Set WSTP_DIR to your CompilerAdditions folder, e.g.:\n` +
+      `  set WSTP_DIR=C:\\Program Files\\Wolfram Research\\Wolfram Engine\\14.2\\SystemFiles\\Links\\WSTP\\DeveloperKit\\Windows-x86-64\\CompilerAdditions\n` +
+      `then run npm install again.`
     );
   }
 
