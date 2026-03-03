@@ -13,8 +13,10 @@ $files = @("wstp.h", "wstp64i4s.lib")
 $searchRoots = @(
     "C:\Program Files\Wolfram Research",
     "C:\Program Files (x86)\Wolfram Research",
-    "$env:LOCALAPPDATA\Programs\Wolfram Research"
-)
+    "$env:LOCALAPPDATA\Programs\Wolfram Research",
+    "C:\Program Files\Wolfram Research\Mathematica",
+    "C:\Program Files\Wolfram Research\Wolfram Engine"
+) | Where-Object { (Test-Path $_) -and -not (Test-Path (Join-Path $_ "wsl.exe")) }
 
 $found = @{}
 

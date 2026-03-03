@@ -22,67 +22,89 @@ function resolve () {
 
   // ── 2. Windows ──────────────────────────────────────────────────────────
   if (process.platform === 'win32') {
-    const base = process.env.PROGRAMFILES || 'C:\\Program Files';
+    const pf   = process.env.PROGRAMFILES        || 'C:\\Program Files';
+    const pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+    const local = process.env.LOCALAPPDATA        || '';
 
-    // Wolfram products to try, in priority order
-    const products = [
-      'Wolfram Research\\Wolfram Engine',
-      'Wolfram Research\\Mathematica',
-      'Wolfram Research\\WolframEngine',
-    ];
+    // All candidate root directories to search under
+    const searchRoots = [
+      path.join(pf,   'Wolfram Research'),
+      path.join(pf86, 'Wolfram Research'),
+      local ? path.join(local, 'Programs', 'Wolfram Research') : null,
+    ].filter(Boolean);
 
-    for (const product of products) {
-      const productDir = path.join(base, product);
-      let entries;
-      try { entries = fs.readdirSync(productDir); } catch (e) { continue; }
+    // Product subfolder names to try
+    const productNames = ['Mathematica', 'Wolfram Engine', 'WolframEngine'];
 
-      // Find version subfolders (e.g. "14.2", "13.1") — any dir starting with a digit
-      const versions = entries
-        .filter(d => {
-          if (!/^\d/.test(d)) return false;
-          try { return fs.statSync(path.join(productDir, d)).isDirectory(); } catch (e) { return false; }
-        })
-        .sort()
-        .reverse();
+    for (const root of searchRoots) {
+      let rootEntries;
+      try { rootEntries = fs.readdirSync(root); } catch (e) { continue; }
 
-      if (!versions.length) {
-        // Help diagnose: show what IS there
-        process.stderr.write(
-          `wstp_dir: found "${productDir}" but no version subfolder.\n` +
-          `  Contents: ${entries.join(', ') || '(empty)'}\n`
+      for (const product of productNames) {
+        const productDir = path.join(root, product);
+        let entries;
+        try { entries = fs.readdirSync(productDir); } catch (e) { continue; }
+
+        // Skip if this looks like WSL rather than a Wolfram product
+        if (entries.includes('wsl.exe') || entries.includes('wslservice.exe')) {
+          process.stderr.write(
+            `wstp_dir: skipping "${productDir}" — looks like WSL, not Wolfram\n`
+          );
+          continue;
+        }
+
+        // Find version subfolders (e.g. "14.2", "13.1") — dirs starting with a digit
+        const versions = entries
+          .filter(d => {
+            if (!/^\d/.test(d)) return false;
+            try { return fs.statSync(path.join(productDir, d)).isDirectory(); } catch (e) { return false; }
+          })
+          .sort()
+          .reverse();
+
+        if (!versions.length) {
+          process.stderr.write(
+            `wstp_dir: "${productDir}" has no version subfolder — skipping\n` +
+            `  Contents: ${entries.join(', ')}\n`
+          );
+          continue;
+        }
+
+        const wstp = path.join(
+          productDir, versions[0],
+          'SystemFiles', 'Links', 'WSTP', 'DeveloperKit',
+          'Windows-x86-64', 'CompilerAdditions'
         );
-        continue;
-      }
 
-      const wstp = path.join(
-        productDir, versions[0],
-        'SystemFiles', 'Links', 'WSTP', 'DeveloperKit',
-        'Windows-x86-64', 'CompilerAdditions'
-      );
-      if (!fs.existsSync(path.join(wstp, 'wstp.h')) &&
-          !fs.existsSync(path.join(wstp, 'wstp64i4s.lib'))) {
-        process.stderr.write(
-          `wstp_dir: found version "${versions[0]}" but WSTP DeveloperKit missing.\n` +
-          `  Expected these files inside:\n` +
-          `    ${wstp}\n` +
-          `      wstp.h          (C header)\n` +
-          `      wstp64i4s.lib   (static import library)\n`
-        );
-        continue;
+        const hasHeader = fs.existsSync(path.join(wstp, 'wstp.h'));
+        const hasLib    = fs.existsSync(path.join(wstp, 'wstp64i4s.lib'));
+
+        if (!hasHeader || !hasLib) {
+          process.stderr.write(
+            `wstp_dir: found version "${versions[0]}" but WSTP DeveloperKit missing.\n` +
+            `  Expected both files inside:\n` +
+            `    ${wstp}\n` +
+            `      wstp.h          (C header)   — ${hasHeader ? 'FOUND' : 'MISSING'}\n` +
+            `      wstp64i4s.lib   (import lib)  — ${hasLib    ? 'FOUND' : 'MISSING'}\n`
+          );
+          continue;
+        }
+
+        return wstp;
       }
-      return wstp;
     }
 
     throw new Error(
-      `WSTP DeveloperKit not found.\n` +
-      `Searched under "${base}" for: ${products.join(', ')}\n\n` +
-      `The build needs these two files:\n` +
+      `WSTP DeveloperKit not found on Windows.\n\n` +
+      `The build requires two files from the Wolfram Engine / Mathematica installation:\n` +
       `  wstp.h          (C header)\n` +
       `  wstp64i4s.lib   (static import library)\n\n` +
-      `Run the diagnostic script to find them:\n` +
+      `These live inside:\n` +
+      `  <WolframEngine>\\<version>\\SystemFiles\\Links\\WSTP\\DeveloperKit\\Windows-x86-64\\CompilerAdditions\\\n\n` +
+      `Run the diagnostic to find them:\n` +
       `  powershell -ExecutionPolicy Bypass -File scripts\\diagnose-windows.ps1\n\n` +
-      `Then set WSTP_DIR to the folder containing both files and retry:\n` +
-      `  set WSTP_DIR=C:\\Program Files\\Wolfram Research\\Wolfram Engine\\14.2\\SystemFiles\\Links\\WSTP\\DeveloperKit\\Windows-x86-64\\CompilerAdditions\n` +
+      `Then set WSTP_DIR and retry:\n` +
+      `  set WSTP_DIR=<path shown above>\n` +
       `  npm install`
     );
   }
