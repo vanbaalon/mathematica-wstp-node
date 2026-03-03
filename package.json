@@ -1,6 +1,6 @@
 {
   "name": "wstp-node",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Native Node.js addon for Wolfram/Mathematica WSTP — kernel sessions with evaluation queue, streaming Print/messages, Dialog subsessions, and side-channel WstpReader",
   "main": "build/Release/wstp.node",
   "types": "index.d.ts",
@@ -29,6 +29,7 @@
   "files": [
     "src/addon.cc",
     "scripts/wstp_dir.js",
+    "scripts/install.js",
     "build.sh",
     "binding.gyp",
     "index.d.ts",
@@ -38,10 +39,10 @@
     "test_interrupt_dialog.js"
   ],
   "scripts": {
-    "install": "bash build.sh",
-    "build": "bash build.sh",
-    "build:debug": "bash build.sh debug",
-    "clean": "bash build.sh clean",
+    "install": "node scripts/install.js",
+    "build": "node scripts/install.js",
+    "build:debug": "node scripts/install.js debug",
+    "clean": "node scripts/install.js clean",
     "test": "node test.js",
     "demo": "node examples/demo.js"
   },
