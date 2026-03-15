@@ -91,6 +91,21 @@ struct DialogRequest {
     Napi::ThreadSafeFunction resolve;  // NonBlockingCall'd with the WExpr result
 };
 
+// ---------------------------------------------------------------------------
+// Dynamic evaluation registration and result types.  Defined at file scope so
+// both EvalOptions and WstpSession can use them without circular dependencies.
+// ---------------------------------------------------------------------------
+struct DynRegistration {
+    std::string id;
+    std::string expr;
+};
+struct DynResult {
+    std::string id;
+    std::string value;
+    double      timestamp = 0.0;   // ms since epoch (set when stored)
+    std::string error;             // non-empty if evaluation failed
+};
+
 struct EvalOptions {
     Napi::ThreadSafeFunction onPrint;         // fires once per Print[] line
     Napi::ThreadSafeFunction onMessage;       // fires once per kernel message
@@ -105,6 +120,21 @@ struct EvalOptions {
     // When true, DrainToEvalResult expects EnterExpressionPacket protocol:
     // INPUTNAMEPKT → OUTPUTNAMEPKT → RETURNEXPRPKT (or INPUTNAMEPKT for Null).
     bool         interactive       = false;
+    // When true, any BEGINDLGPKT received during the drain is immediately
+    // auto-closed (Return[$Failed] sent) without informing the JS layer.
+    // Use for non-interactive VsCodeRender/handler-install evals to prevent
+    // a concurrent interrupt from hanging the evaluation forever (Pattern C).
+    bool         rejectDialog      = false;
+    // Phase 2 Dynamic eval: pointers wired up by Evaluate() so DrainToEvalResult
+    // can inline-evaluate registered Dynamic expressions inside BEGINDLGPKT.
+    // When dynAutoMode is false, legacy JS-callback dialog path is used instead.
+    std::mutex*                       dynMutex       = nullptr;
+    std::vector<DynRegistration>*     dynRegistry    = nullptr;  // non-owning
+    std::vector<DynResult>*           dynResults     = nullptr;  // non-owning
+    std::chrono::steady_clock::time_point* dynLastEval = nullptr;
+    bool         dynAutoMode       = true;   // mirrors dynAutoMode_ at time of queue dispatch
+    int          dynIntervalMs     = 0;      // mirrors dynIntervalMs_ at time of queue dispatch
+    int*         dynTaskInstalledInterval = nullptr; // non-owning; tracks installed ScheduledTask interval
     CompleteCtx* ctx               = nullptr;  // non-owning; set when TSFNs are in use
 
     // Pointers to session's dialog queue — set by WstpSession::Evaluate() so the
@@ -260,6 +290,210 @@ static void drainDialogAbortResponse(WSLINK lp) {
         }
         WSNewPacket(lp); // discard intermediate packet (ENDDLGPKT, MENUPKT, …)
     }
+}
+
+// ---------------------------------------------------------------------------
+// drainStalePackets — after RETURNPKT, check for stale packets that arrived
+// in the 50ms window after the kernel sent the main result.
+//
+// Scenario: an interrupt was sent just as the cell completed; the kernel may
+// have queued a BEGINDLGPKT that arrives after RETURNPKT.  If left unread it
+// corrupts the NEXT evaluation (Pattern D).
+//
+// If opts->rejectDialog is true the dialog is also closed via our inline
+// path (same as the main BEGINDLGPKT handler).  If false, we still close
+// stale dialogs silently to keep the link clean — the JS side never knew
+// about this dialog so there's nobody to call exitDialog().
+// ---------------------------------------------------------------------------
+static void drainStalePackets(WSLINK lp, EvalOptions* opts) {
+    // When dynAutoMode is active, use a short timeout (50ms) so we do NOT
+    // accidentally consume a ScheduledTask Dialog[] that the main eval's
+    // dynAutoMode handler should handle.  The stale packets we are looking
+    // for (from PREVIOUS evals) are already sitting on the link and arrive
+    // instantly, so 50ms is plenty.  The longer 200ms timeout is only needed
+    // for non-dynAutoMode scenarios.
+    int timeoutMs = (opts && opts->dynAutoMode) ? 50 : 200;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!WSReady(lp)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        int pkt = WSNextPacket(lp);
+        if (pkt == BEGINDLGPKT) {
+            // Stale dialog — consume level int then auto-close.
+            wsint64 lvl = 0;
+            if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &lvl);
+            WSNewPacket(lp);
+            DiagLog("[Eval] drainStalePackets: stale BEGINDLGPKT level=" + std::to_string(lvl) + " — auto-closing");
+            // Pre-drain INPUTNAMEPKT — Dialog[] sends INPUTNAMEPKT before
+            // accepting EnterTextPacket.
+            {
+                auto preDl = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(500);
+                while (std::chrono::steady_clock::now() < preDl) {
+                    if (!WSReady(lp)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        continue;
+                    }
+                    int ipkt = WSNextPacket(lp);
+                    DiagLog("[Eval] drainStale: pre-drain pkt=" + std::to_string(ipkt));
+                    WSNewPacket(lp);
+                    if (ipkt == INPUTNAMEPKT) break;
+                    if (ipkt == 0 || ipkt == ILLEGALPKT) { WSClearError(lp); break; }
+                }
+            }
+            const char* closeExpr = "Return[$Failed]";
+            WSPutFunction(lp, "EnterTextPacket", 1);
+            WSPutUTF8String(lp,
+                reinterpret_cast<const unsigned char*>(closeExpr),
+                static_cast<int>(std::strlen(closeExpr)));
+            WSEndPacket(lp);
+            WSFlush(lp);
+            DiagLog("[Eval] drainStale: sent Return[$Failed], draining...");
+            // Drain until ENDDLGPKT.
+            auto dlgDeadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(2000);
+            while (std::chrono::steady_clock::now() < dlgDeadline) {
+                if (!WSReady(lp)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                int rp = WSNextPacket(lp);
+                DiagLog("[Eval] drainStale: drain pkt=" + std::to_string(rp));
+                WSNewPacket(lp);
+                if (rp == ENDDLGPKT) break;
+                if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
+            }
+        } else if (pkt == MENUPKT) {
+            // Stale interrupt menu — dismiss with empty response.
+            wsint64 menuType = 0; WSGetInteger64(lp, &menuType);
+            const char* menuPrompt = nullptr; WSGetString(lp, &menuPrompt);
+            if (menuPrompt) WSReleaseString(lp, menuPrompt);
+            WSNewPacket(lp);
+            DiagLog("[Eval] drainStalePackets: stale MENUPKT type=" + std::to_string(menuType) + " — dismissing");
+            WSPutString(lp, "");
+            WSEndPacket(lp); WSFlush(lp);
+        } else {
+            WSNewPacket(lp);  // discard any other stale packet
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drainUntilEndDialog — reads packets until ENDDLGPKT (dialog closed).
+// Used by the C++-internal Dynamic eval path to finish a dialog level cleanly.
+// Returns true on success, false on timeout or link error.
+//
+// If capturedOuterResult is non-null and a RETURNPKT/RETURNEXPRPKT arrives
+// that looks like the outer eval's result (rather than Return[$Failed]'s
+// response), it is saved there for the caller to use.
+// ---------------------------------------------------------------------------
+static bool drainUntilEndDialog(WSLINK lp, int timeoutMs,
+                                WExpr* capturedOuterResult = nullptr) {
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!WSReady(lp)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        int pkt = WSNextPacket(lp);
+        DiagLog("[drainEndDlg] pkt=" + std::to_string(pkt));
+        if (pkt == ENDDLGPKT) {
+            WSNewPacket(lp);
+            return true;
+        }
+        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT) {
+            // Capture the outer eval's RETURNPKT if requested and not yet set.
+            if (capturedOuterResult &&
+                capturedOuterResult->kind == WExpr::WError &&
+                capturedOuterResult->strVal.empty()) {
+                *capturedOuterResult = ReadExprRaw(lp);
+                DiagLog("[drainEndDlg] captured outer result (pkt=" +
+                        std::to_string(pkt) + ")");
+            }
+            WSNewPacket(lp);
+            continue;
+        }
+        if (pkt == 0 || pkt == ILLEGALPKT) {
+            WSClearError(lp);
+            return false;
+        }
+        WSNewPacket(lp);  // discard TEXTPKT, MESSAGEPKT, INPUTNAMEPKT, etc.
+    }
+    return false;  // timeout
+}
+
+// ---------------------------------------------------------------------------
+// readDynResultWithTimeout — reads one result from an open Dialog level after
+// the caller has already sent the expression (EnterTextPacket).
+// On success sets dr.value (string form) and returns true.
+// On failure sets dr.error and returns false.
+//
+// If capturedOuterResult is non-null and a RETURNPKT/RETURNEXPRPKT arrives
+// (which is the outer eval's result that got evaluated inside the Dialog[]
+// context), the value is saved there and the function continues waiting for
+// the RETURNTEXTPKT that EnterTextPacket produces.
+// ---------------------------------------------------------------------------
+static bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
+                                     WExpr* capturedOuterResult = nullptr) {
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!WSReady(lp)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        int pkt = WSNextPacket(lp);
+        DiagLog("[DynRead] pkt=" + std::to_string(pkt));
+        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT || pkt == RETURNTEXTPKT) {
+            WExpr val = ReadExprRaw(lp);
+            WSNewPacket(lp);
+            DiagLog("[DynRead] accepted pkt=" + std::to_string(pkt) +
+                    " kind=" + std::to_string(val.kind) +
+                    " val=" + (val.kind == WExpr::String ? val.strVal :
+                               val.kind == WExpr::Integer ? std::to_string(val.intVal) :
+                               val.kind == WExpr::Symbol ? val.strVal :
+                               val.kind == WExpr::Real ? std::to_string(val.realVal) :
+                               val.head.empty() ? "?" : val.head));
+            // RETURNPKT/RETURNEXPRPKT inside a dialog means the outer eval's
+            // EvaluatePacket was processed inside this Dialog[] context (race
+            // condition when ScheduledTask fires between evals).  Save the
+            // value for the caller and keep waiting for our RETURNTEXTPKT.
+            if (pkt != RETURNTEXTPKT && capturedOuterResult) {
+                DiagLog("[DynRead] captured outer result (pkt=" + std::to_string(pkt) + "), continuing");
+                *capturedOuterResult = std::move(val);
+                continue;
+            }
+            if (val.kind == WExpr::WError) {
+                dr.error = val.strVal;
+                return false;
+            }
+            switch (val.kind) {
+                case WExpr::String:  dr.value = val.strVal;                        break;
+                case WExpr::Integer: dr.value = std::to_string(val.intVal);        break;
+                case WExpr::Real:    dr.value = std::to_string(val.realVal);       break;
+                case WExpr::Symbol:  dr.value = val.strVal;                        break;
+                default:             dr.value = val.head.empty() ? "?" : val.head; break;
+            }
+            return true;
+        }
+        if (pkt == TEXTPKT || pkt == MESSAGEPKT ||
+            pkt == OUTPUTNAMEPKT || pkt == INPUTNAMEPKT) {
+            WSNewPacket(lp);
+            continue;
+        }
+        if (pkt == 0 || pkt == ILLEGALPKT) {
+            WSClearError(lp);
+            dr.error = "WSTP link error during Dynamic eval";
+            return false;
+        }
+        WSNewPacket(lp);
+    }
+    dr.error = "timeout";
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +879,10 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             if (r.result.kind == WExpr::Symbol && stripCtx(r.result.strVal) == "$Aborted")
                 r.aborted = true;
             gotResult = true;
+            // Drain any stale packets (e.g. late BEGINDLGPKT from a concurrent
+            // interrupt that arrived just as this cell's RETURNPKT was sent).
+            // This prevents Pattern D: stale BEGINDLGPKT corrupting next eval.
+            if (!r.aborted) drainStalePackets(lp, opts);
             // In interactive mode the kernel always follows RETURNEXPRPKT with a
             // trailing INPUTNAMEPKT (the next "In[n+1]:=" prompt).  We must consume
             // that packet before returning so the wire is clean for the next eval.
@@ -710,11 +948,216 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
         else if (pkt == BEGINDLGPKT) {
             // ----------------------------------------------------------------
             // Dialog subsession opened by the kernel.
-            // Read the dialog level integer, set dialogOpen_ flag, fire callback.
             // ----------------------------------------------------------------
             wsint64 level = 0;
             if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &level);
             WSNewPacket(lp);
+
+            // ---- rejectDialog: auto-close without informing JS layer --------
+            // Non-interactive evals (VsCodeRender, handler install, sub() exprs)
+            // must never block waiting for JS dialogEval() that never comes.
+            // Send Return[$Failed] immediately and continue waiting for RETURNPKT.
+            if (opts && opts->rejectDialog) {
+                DiagLog("[Eval] rejectDialog: auto-closing BEGINDLGPKT level=" + std::to_string(level));
+                // Pre-drain INPUTNAMEPKT — Dialog[] from ScheduledTask sends
+                // INPUTNAMEPKT before accepting EnterTextPacket.
+                {
+                    auto preDl = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(500);
+                    while (std::chrono::steady_clock::now() < preDl) {
+                        if (!WSReady(lp)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int ipkt = WSNextPacket(lp);
+                        DiagLog("[Eval] rejectDialog: pre-drain pkt=" + std::to_string(ipkt));
+                        WSNewPacket(lp);
+                        if (ipkt == INPUTNAMEPKT) break;
+                        if (ipkt == 0 || ipkt == ILLEGALPKT) { WSClearError(lp); break; }
+                    }
+                }
+                const char* closeExpr = "Return[$Failed]";
+                WSPutFunction(lp, "EnterTextPacket", 1);
+                WSPutUTF8String(lp,
+                    reinterpret_cast<const unsigned char*>(closeExpr),
+                    static_cast<int>(std::strlen(closeExpr)));
+                WSEndPacket(lp);
+                WSFlush(lp);
+                DiagLog("[Eval] rejectDialog: sent Return[$Failed], draining until ENDDLGPKT");
+                // Drain until ENDDLGPKT — kernel will close the dialog level.
+                {
+                    auto dlgDeadline = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(2000);
+                    while (std::chrono::steady_clock::now() < dlgDeadline) {
+                        if (!WSReady(lp)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int rp = WSNextPacket(lp);
+                        DiagLog("[Eval] rejectDialog: drain pkt=" + std::to_string(rp));
+                        WSNewPacket(lp);
+                        if (rp == ENDDLGPKT) break;
+                        if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
+                    }
+                }
+                // Continue outer drain loop — the original RETURNPKT is still coming.
+                continue;
+            }
+
+            // ---- dynAutoMode: C++-internal Dynamic evaluation ---------------
+            // When dynAutoMode is true, all registered Dynamic expressions are
+            // evaluated inline inside the dialog — no JS roundtrip needed.
+            // The dialog is then closed unconditionally with Return[$Failed].
+            if (!opts || opts->dynAutoMode) {
+                // Check if aborted before entering evaluation.
+                if (opts && opts->abortFlag && opts->abortFlag->load()) {
+                    if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
+                    r.result = WExpr::mkSymbol("System`$Aborted");
+                    r.aborted = true;
+                    drainDialogAbortResponse(lp);
+                    return r;
+                }
+
+                // If the outer eval's EvaluatePacket was processed inside
+                // this Dialog[] context (between-eval ScheduledTask fire),
+                // its RETURNPKT will appear before our RETURNTEXTPKT.
+                // capturedOuterResult captures that value so we can return
+                // it as the cell result.
+                WExpr capturedOuterResult;
+
+                if (opts && opts->dynMutex && opts->dynRegistry && opts->dynResults) {
+                    std::lock_guard<std::mutex> lk(*opts->dynMutex);
+
+                    // Drain any initial packets (INPUTNAMEPKT, etc.) before
+                    // sending expressions. Dialog[] from ScheduledTask may
+                    // send INPUTNAMEPKT or TEXTPKT before accepting input.
+                    {
+                        auto drainDl = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(500);
+                        while (std::chrono::steady_clock::now() < drainDl) {
+                            if (!WSReady(lp)) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                continue;
+                            }
+                            int ipkt = WSNextPacket(lp);
+                            DiagLog("[Eval] dynAutoMode(BEGINDLG): pre-drain pkt=" + std::to_string(ipkt));
+                            if (ipkt == INPUTNAMEPKT) {
+                                WSNewPacket(lp);
+                                break; // ready for input
+                            }
+                            if (ipkt == 0 || ipkt == ILLEGALPKT) {
+                                WSClearError(lp);
+                                break;
+                            }
+                            WSNewPacket(lp); // consume TEXTPKT, MESSAGEPKT, etc.
+                        }
+                    }
+
+                    // Current time in ms since epoch for timestamps.
+                    auto nowMs = static_cast<double>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+
+                    for (const auto& reg : *opts->dynRegistry) {
+                        // Send expression via EnterTextPacket so the kernel
+                        // evaluates it in OutputForm text mode (string result).
+                        DiagLog("[Eval] dynAutoMode(BEGINDLG): sending expr id=" + reg.id + " expr='" + reg.expr + "'");
+                        bool sentDyn =
+                            WSPutFunction(lp, "EnterTextPacket", 1) &&
+                            WSPutUTF8String(lp,
+                                reinterpret_cast<const unsigned char*>(reg.expr.c_str()),
+                                static_cast<int>(reg.expr.size())) &&
+                            WSEndPacket(lp) &&
+                            WSFlush(lp);
+
+                        DynResult dr;
+                        dr.id        = reg.id;
+                        dr.timestamp = nowMs;
+                        if (!sentDyn) {
+                            dr.error = "failed to send Dynamic expression";
+                        } else {
+                            readDynResultWithTimeout(lp, dr, 2000, &capturedOuterResult);
+                        }
+                        opts->dynResults->push_back(std::move(dr));
+
+                        // If the outer result was captured, stop processing
+                        // further dynamic expressions — the eval is done.
+                        if (capturedOuterResult.kind != WExpr::WError ||
+                            !capturedOuterResult.strVal.empty()) break;
+
+                        // Abort check between expressions.
+                        if (opts->abortFlag && opts->abortFlag->load()) break;
+                    }
+
+                    if (opts->dynLastEval)
+                        *opts->dynLastEval = std::chrono::steady_clock::now();
+
+                    // Check if the outer eval's RETURNPKT was captured inside
+                    // this dialog.  If so, close the dialog and return the
+                    // captured result directly — the outer eval is already done.
+                    bool outerCaptured = capturedOuterResult.kind != WExpr::WError ||
+                                         !capturedOuterResult.strVal.empty();
+                    if (outerCaptured) {
+                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured inside dialog — returning directly");
+                        // Close the dialog.
+                        {
+                            const char* closeExpr = "Return[$Failed]";
+                            WSPutFunction(lp, "EnterTextPacket", 1);
+                            WSPutUTF8String(lp,
+                                reinterpret_cast<const unsigned char*>(closeExpr),
+                                static_cast<int>(std::strlen(closeExpr)));
+                            WSEndPacket(lp);
+                            WSFlush(lp);
+                        }
+                        drainUntilEndDialog(lp, 3000);
+                        r.result = std::move(capturedOuterResult);
+                        if (r.result.kind == WExpr::Symbol &&
+                            stripCtx(r.result.strVal) == "$Aborted")
+                            r.aborted = true;
+                        // Drain any remaining stale packets.
+                        drainStalePackets(lp, opts);
+                        return r;
+                    }
+                }
+
+                // Close the dialog: send Return[$Failed] then drain ENDDLGPKT.
+                {
+                    const char* closeExpr = "Return[$Failed]";
+                    WSPutFunction(lp, "EnterTextPacket", 1);
+                    WSPutUTF8String(lp,
+                        reinterpret_cast<const unsigned char*>(closeExpr),
+                        static_cast<int>(std::strlen(closeExpr)));
+                    WSEndPacket(lp);
+                    WSFlush(lp);
+                }
+                bool exitOk = drainUntilEndDialog(lp, 3000, &capturedOuterResult);
+                if (!exitOk) {
+                    DiagLog("[Eval] dynAutoMode: drainUntilEndDialog timed out; aborting");
+                    r.aborted = true;
+                    r.result = WExpr::mkSymbol("System`$Aborted");
+                    drainDialogAbortResponse(lp);
+                    return r;
+                }
+                // Check if the outer eval's RETURNPKT was captured during the
+                // drain (e.g. empty registry but between-eval Dialog[] race).
+                {
+                    bool outerCapturedInDrain =
+                        capturedOuterResult.kind != WExpr::WError ||
+                        !capturedOuterResult.strVal.empty();
+                    if (outerCapturedInDrain) {
+                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured during drain — returning directly");
+                        r.result = std::move(capturedOuterResult);
+                        if (r.result.kind == WExpr::Symbol &&
+                            stripCtx(r.result.strVal) == "$Aborted")
+                            r.aborted = true;
+                        drainStalePackets(lp, opts);
+                        return r;
+                    }
+                }
+                // Dialog closed — continue outer loop waiting for the original RETURNPKT.
+                continue;
+            }
 
             if (opts && opts->dialogOpen)
                 opts->dialogOpen->store(true);
@@ -844,166 +1287,23 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
         }
         else if (pkt == MENUPKT) {
             // ----------------------------------------------------------------
-            // MENUPKT (6) — interrupt menu protocol per JLink source:
-            //
-            //   Protocol (from JLink InterruptDialog.java):
-            //     1. WSNextPacket(lp) → MENUPKT
-            //     2. WSGetInteger(lp, &type)   — menu type (1=interrupt, 3=LinkRead)
-            //     3. WSGetString(lp, &prompt)  — prompt string
-            //     4. WSNewPacket(lp)
-            //     5. WSPutString(lp, "i")       — respond with bare string
-            //        Options: a=abort, c=continue, i=inspect/dialog
-            //     6. WSEndPacket; WSFlush
-            //
-            //  After "i", the kernel enters interactive inspect mode and sends
-            //  MENUPKT(inspect) as the dialog prompt → handled in menuDlgDone.
+            // MENUPKT (6) — interrupt menu
             // ----------------------------------------------------------------
-            {
-                wsint64 menuType_ = 0; WSGetInteger64(lp, &menuType_);
-                const char* menuPrompt_ = nullptr; WSGetString(lp, &menuPrompt_);
-                if (menuPrompt_) WSReleaseString(lp, menuPrompt_);
-                WSNewPacket(lp);
-                DiagLog("[Eval] MENUPKT type=" + std::to_string(menuType_) + " — responding 'i' (inspect)");
+            wsint64 menuType_ = 0; WSGetInteger64(lp, &menuType_);
+            const char* menuPrompt_ = nullptr; WSGetString(lp, &menuPrompt_);
+            if (menuPrompt_) WSReleaseString(lp, menuPrompt_);
+            WSNewPacket(lp);
 
-                // Respond with bare string 'i' to enter inspect/dialog mode.
-                // Per JLink protocol: WSPutString(link, "i"). Not wrapped in any packet.
-                WSPutString(lp, "i");
-                WSEndPacket(lp);
-                WSFlush(lp);
-            }
-            // The kernel will now send an inspect-mode MENUPKT as the dialog prompt.
-            bool menuDlgDone = false;
-            while (!menuDlgDone) {
-                if (opts && opts->abortFlag && opts->abortFlag->load()) {
-                    if (opts->dialogOpen) opts->dialogOpen->store(false);
-                    r.result = WExpr::mkSymbol("System`$Aborted");
-                    r.aborted = true;
-                    drainDialogAbortResponse(lp); // consume pending abort response
-                    return r;
-                }
-                if (opts && opts->dialogPending && opts->dialogPending->load()) {
-                    if (!serviceDialogRequest(/*menuDlgProto=*/true)) {
-                        menuDlgDone = true;
-                        continue;
-                    }
-                }
-                if (!WSReady(lp)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    continue;
-                }
-                int dpkt = WSNextPacket(lp);
-                DiagLog("[MenuDlg] dpkt=" + std::to_string(dpkt));
-                if (dpkt == ENDDLGPKT) {
-                    wsint64 el = 0;
-                    if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &el);
-                    WSNewPacket(lp);
-                    if (opts->dialogOpen) opts->dialogOpen->store(false);
-                    if (opts->hasOnDialogEnd)
-                        opts->onDialogEnd.NonBlockingCall(
-                            [el](Napi::Env e, Napi::Function cb){
-                                cb.Call({Napi::Number::New(e, static_cast<double>(el))}); });
-                    menuDlgDone = true;
-                } else if (dpkt == BEGINDLGPKT) {
-                    // BEGINDLGPKT: dialog subsession started.
-                    // This arrives after 'i' response to MENUPKT, before INPUTNAMEPKT.
-                    // The dialog level integer follows.
-                    wsint64 beginLevel = 0;
-                    if (WSGetType(lp) == WSTKINT) WSGetInteger64(lp, &beginLevel);
-                    WSNewPacket(lp);
-                    DiagLog("[MenuDlg] BEGINDLGPKT level=" + std::to_string(beginLevel) + " — dialog is open");
-                    // isDialogOpen will be set when INPUTNAMEPKT arrives (see below).
-                    // Just consume and wait for INPUTNAMEPKT.
-                } else if (dpkt == RETURNPKT) {
-                    WExpr inner = ReadExprRaw(lp); WSNewPacket(lp);
-                    if (inner.kind == WExpr::Symbol &&
-                        stripCtx(inner.strVal) == "$Aborted") {
-                        if (opts->dialogOpen) opts->dialogOpen->store(false);
-                        r.result = inner; r.aborted = true; return r;
-                    }
-                } else if (dpkt == MENUPKT) {
-                    // In the menuDlgDone loop, MENUPKTs serve two purposes:
-                    // 1. FIRST MENUPKT (isDialogOpen still false):
-                    //    The dialog subsession has just opened.
-                    //    Set isDialogOpen = true, fire onDialogBegin, consume & wait.
-                    // 2. LATER MENUPKTs (isDialogOpen true):
-                    //    Either the interrupt menu again (if interrupt handler also opened
-                    //    Dialog[], these menus pile up) — respond "c" to dismiss it.
-                    //    Or if exitDialog sent 'c' and cleared dialogOpen → we're done.
-                    bool isOpen = opts->dialogOpen && opts->dialogOpen->load();
-                    if (!isOpen) {
-                        // First MENUPKT in menuDlgDone: the inspect/dialog-mode prompt.
-                        // The kernel has entered interactive inspection mode.
-                        // Read the type and prompt following JLink MENUPKT protocol.
-                        wsint64 menuTypeInsp = 0; WSGetInteger64(lp, &menuTypeInsp);
-                        const char* menuPromptInsp = nullptr; WSGetString(lp, &menuPromptInsp);
-                        if (menuPromptInsp) WSReleaseString(lp, menuPromptInsp);
-                        WSNewPacket(lp);
-                        DiagLog("[MenuDlg] inspect MENUPKT type=" + std::to_string(menuTypeInsp) + " — isDialogOpen=true");
-                        if (opts->dialogOpen) opts->dialogOpen->store(true);
-                        if (opts->hasOnDialogBegin)
-                            opts->onDialogBegin.NonBlockingCall(
-                                [](Napi::Env e, Napi::Function cb){
-                                    cb.Call({Napi::Number::New(e, 1.0)}); });
-                    } else if (opts->dialogOpen && !opts->dialogOpen->load()) {
-                        // exitDialog already closed the dialog (cleared by serviceDialogRequest)
-                        WSNewPacket(lp);
-                        menuDlgDone = true;
-                    } else {
-                        // Subsequent MENUPKT while dialog is open — this is likely the
-                        // interrupt-level menu that appeared AFTER the dialog-open MENUPKT.
-                        // Dismiss it with bare string 'c' (continue) per JLink MENUPKT protocol.
-                        DiagLog("[MenuDlg] subsequent MENUPKT while dialog open — responding 'c' (continue)");
-                        wsint64 menuTypeDis = 0; WSGetInteger64(lp, &menuTypeDis);
-                        const char* menuPromptDis = nullptr; WSGetString(lp, &menuPromptDis);
-                        if (menuPromptDis) WSReleaseString(lp, menuPromptDis);
-                        WSNewPacket(lp);
-                        WSPutString(lp, "c");
-                        WSEndPacket(lp);
-                        WSFlush(lp);
-                    }
-                } else if (dpkt == INPUTNAMEPKT || dpkt == OUTPUTNAMEPKT) {
-                    const char* nm = nullptr; WSGetString(lp, &nm);
-                    if (nm) {
-                        std::string nml = nm; WSReleaseString(lp, nm);
-                        DiagLog("[MenuDlg] pkt=" + std::to_string(dpkt) + " name='" + nml + "'");
-                        // INPUTNAMEPKT in menuDlgDone may mean the dialog/inspect
-                        // subsession is prompting for input (alternative to MENUPKT).
-                        if (dpkt == INPUTNAMEPKT && opts && opts->dialogOpen &&
-                            !opts->dialogOpen->load()) {
-                            DiagLog("[MenuDlg] INPUTNAMEPKT while !dialogOpen — dialog opened via INPUTNAMEPKT");
-                            opts->dialogOpen->store(true);
-                            if (opts->hasOnDialogBegin)
-                                opts->onDialogBegin.NonBlockingCall(
-                                    [](Napi::Env e, Napi::Function cb){
-                                        cb.Call({Napi::Number::New(e, 1.0)}); });
-                        }
-                    }
-                    WSNewPacket(lp);
-                } else if (dpkt == TEXTPKT) {
-                    const char* ts = nullptr; WSGetString(lp, &ts);
-                    if (ts) {
-                        std::string tl = rtrimNL(ts); WSReleaseString(lp, ts);
-                        DiagLog("[MenuDlg] TEXTPKT text='" + tl.substr(0, 80) + "'");
-                        // Filter out interrupt menu options text (informational only).
-                        bool isMenuOptions = (tl.find("Your options are") != std::string::npos);
-                        if (!isMenuOptions && opts && opts->hasOnDialogPrint)
-                            opts->onDialogPrint.NonBlockingCall(
-                                [tl](Napi::Env e, Napi::Function cb){
-                                    cb.Call({Napi::String::New(e, tl)}); });
-                    }
-                    WSNewPacket(lp);
-                } else if (dpkt == MESSAGEPKT) {
-                    handleMessage(true);
-                } else if (dpkt == 0 || dpkt == ILLEGALPKT) {
-                    const char* em = WSErrorMessage(lp); WSClearError(lp);
-                    if (opts->dialogOpen) opts->dialogOpen->store(false);
-                    r.result = WExpr::mkError(em ? em : "WSTP link error in dialog");
-                    return r;
-                } else {
-                    WSNewPacket(lp);
-                }
-            }
-            // Dialog closed — outer loop continues to collect main eval result.
+            // Legacy dialog path: when dynAutoMode is false and the eval has
+            // dialog callbacks, respond 'i' (inspect) so the kernel enters
+            // inspect mode and the Internal`AddHandler fires Dialog[].
+            // Otherwise respond 'c' (continue) to dismiss the menu.
+            bool wantInspect = opts && !opts->dynAutoMode && opts->hasOnDialogBegin;
+            const char* resp = wantInspect ? "i" : "c";
+            DiagLog("[Eval] MENUPKT type=" + std::to_string(menuType_) + " — responding '" + resp + "'");
+            WSPutString(lp, resp);
+            WSEndPacket(lp);
+            WSFlush(lp);
         }
         else {
             DiagLog("[Eval] unknown pkt=" + std::to_string(pkt) + ", discarding");
@@ -1113,6 +1413,61 @@ public:
 
     // ---- thread-pool thread: send packet; block until response ----
     void Execute() override {
+        // ---- Phase 2: ScheduledTask[Dialog[], interval] management ----
+        // Install a kernel-side ScheduledTask that calls Dialog[] periodically.
+        // Only install when:
+        //   (a) dynAutoMode is active
+        //   (b) there are registered Dynamic expressions
+        //   (c) interval > 0
+        //   (d) the currently installed task has a DIFFERENT interval (or none)
+        //
+        // The task expression includes a stop-flag check so the old task can
+        // be suppressed during the install eval (which uses rejectDialog=true).
+        //
+        // When there are no registrations (or interval=0), we do NOT send any
+        // stop/remove eval. The old task keeps running but the dynAutoMode
+        // handler handles empty-registry Dialog[]s by simply closing them.
+        if (opts_.dynAutoMode && opts_.dynIntervalMs > 0) {
+            bool hasRegs = false;
+            if (opts_.dynMutex && opts_.dynRegistry) {
+                std::lock_guard<std::mutex> lk(*opts_.dynMutex);
+                hasRegs = !opts_.dynRegistry->empty();
+            }
+
+            int installedInterval = opts_.dynTaskInstalledInterval
+                                  ? *opts_.dynTaskInstalledInterval : 0;
+            bool needInstall = hasRegs && (installedInterval != opts_.dynIntervalMs);
+
+            if (needInstall) {
+                double intervalSec = opts_.dynIntervalMs / 1000.0;
+                std::string taskExpr =
+                    "Quiet[$wstpDynTaskStop = True;"
+                    " If[ValueQ[$wstpDynTask], RemoveScheduledTask[$wstpDynTask]];"
+                    " $wstpDynTaskStop =.;"
+                    " $wstpDynTask = RunScheduledTask["
+                    "If[!TrueQ[$wstpDynTaskStop], Dialog[]], " +
+                    std::to_string(intervalSec) + "]]";
+                DiagLog("[Eval] dynAutoMode: installing ScheduledTask interval=" +
+                        std::to_string(intervalSec) + "s");
+                EvalOptions taskOpts;
+                taskOpts.rejectDialog = true;
+                bool sentT =
+                    WSPutFunction(lp_, "EvaluatePacket", 1) &&
+                    WSPutFunction(lp_, "ToExpression",   1) &&
+                    WSPutUTF8String(lp_,
+                        reinterpret_cast<const unsigned char*>(taskExpr.c_str()),
+                        static_cast<int>(taskExpr.size())) &&
+                    WSEndPacket(lp_) &&
+                    WSFlush(lp_);
+                if (sentT) {
+                    DrainToEvalResult(lp_, &taskOpts);
+                    // Track the installed interval so we don't reinstall next time.
+                    if (opts_.dynTaskInstalledInterval)
+                        *opts_.dynTaskInstalledInterval = opts_.dynIntervalMs;
+                }
+            }
+        }
+
         bool sent;
         if (!interactive_) {
             // EvaluatePacket + ToExpression: non-interactive, does NOT populate In[n]/Out[n].
@@ -1137,6 +1492,24 @@ public:
         } else {
             opts_.interactive = interactive_;
             result_ = DrainToEvalResult(lp_, &opts_);
+            // DrainToEvalResult may leave dialogOpen_=true (dynAutoMode suppresses
+            // the timer during the exit protocol).  Clear it now that we're done.
+            if (opts_.dialogOpen) opts_.dialogOpen->store(false);
+
+            // ---- Cleanup: ScheduledTask that fires Dialog[] ----
+            // The task is left running after the main eval completes.
+            // Between evaluations, Dialog[]s from the task accumulate on the
+            // link as stale BEGINDLGPKT packets. These are drained at the
+            // start of the next eval by drainStalePackets(). The install
+            // code at the top of Execute() also removes any old task before
+            // installing a new one. On session close(), the kernel is
+            // killed, which stops the task automatically.
+            //
+            // We CANNOT send a cleanup EvaluatePacket here because the
+            // ScheduledTask fires Dialog[] preemptively during the cleanup
+            // eval, and the RETURNPKT from the cleanup can get interleaved
+            // with dialog packets, causing the drain to hang.
+
             workerReadingLink_.store(false, std::memory_order_release); // lp_ no longer in use
             if (!interactive_) {
                 // EvaluatePacket mode: kernel never sends INPUTNAMEPKT/OUTPUTNAMEPKT,
@@ -1249,10 +1622,18 @@ public:
             InstanceMethod<&WstpSession::CloseAllDialogs>  ("closeAllDialogs"),
             InstanceMethod<&WstpSession::CreateSubsession>("createSubsession"),
             InstanceMethod<&WstpSession::Close>           ("close"),
+            // Dynamic evaluation API (Phase 2)
+            InstanceMethod<&WstpSession::RegisterDynamic>     ("registerDynamic"),
+            InstanceMethod<&WstpSession::UnregisterDynamic>   ("unregisterDynamic"),
+            InstanceMethod<&WstpSession::ClearDynamicRegistry>("clearDynamicRegistry"),
+            InstanceMethod<&WstpSession::GetDynamicResults>   ("getDynamicResults"),
+            InstanceMethod<&WstpSession::SetDynamicInterval>  ("setDynamicInterval"),
+            InstanceMethod<&WstpSession::SetDynAutoMode>      ("setDynAutoMode"),
             InstanceAccessor<&WstpSession::IsOpen>        ("isOpen"),
             InstanceAccessor<&WstpSession::IsDialogOpen>  ("isDialogOpen"),
             InstanceAccessor<&WstpSession::IsReady>       ("isReady"),
             InstanceAccessor<&WstpSession::KernelPid>     ("kernelPid"),
+            InstanceAccessor<&WstpSession::DynamicActive> ("dynamicActive"),
         });
 
         Napi::FunctionReference* ctor = new Napi::FunctionReference();
@@ -1392,6 +1773,10 @@ public:
             // Per-call interactive override: opts.interactive = true/false
             if (optsObj.Has("interactive") && optsObj.Get("interactive").IsBoolean())
                 interactiveOverride = optsObj.Get("interactive").As<Napi::Boolean>().Value() ? 1 : 0;
+            // Per-call rejectDialog: auto-close any BEGINDLGPKT without JS roundtrip.
+            if (optsObj.Has("rejectDialog") && optsObj.Get("rejectDialog").IsBoolean() &&
+                optsObj.Get("rejectDialog").As<Napi::Boolean>().Value())
+                opts.rejectDialog = true;
 
             // CompleteCtx: count = numTsfns + 1 (the extra slot is for OnOK/OnError).
             // This ensures the Promise resolves ONLY after every TSFN has been
@@ -1421,6 +1806,15 @@ public:
         opts.dialogPending = &dialogPending_;
         opts.dialogOpen    = &dialogOpen_;
         opts.abortFlag     = &abortFlag_;
+        // Wire up Dynamic eval pointers so DrainToEvalResult can evaluate
+        // registered Dynamic expressions inline when BEGINDLGPKT arrives.
+        opts.dynMutex      = &dynMutex_;
+        opts.dynRegistry   = &dynRegistry_;
+        opts.dynResults    = &dynResults_;
+        opts.dynLastEval   = &dynLastEval_;
+        opts.dynAutoMode   = dynAutoMode_.load();
+        opts.dynIntervalMs = dynIntervalMs_.load();
+        opts.dynTaskInstalledInterval = &dynTaskInstalledInterval_;
 
         {
             std::lock_guard<std::mutex> lk(queueMutex_);
@@ -1852,16 +2246,132 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // abort() — interrupt the currently running evaluation.
-    //
-    // Sends WSAbortMessage on the link.  Per the WSTP spec WSPutMessage() is
-    // thread-safe and will cause WSNextPacket() on the thread-pool thread to
-    // return ILLEGALPKT (link reset).  The promise then rejects; a fresh
-    // session must be created for further work after the kernel crashes/exits.
-    //
-    // For a softer (recoverable) interrupt use  evaluate("Interrupt[]")
-    // before the long computation, or wrap the computation in TimeConstrained.
+    // registerDynamic(id, expr) → void
+    // Register or replace a Dynamic expression for periodic evaluation.
     // -----------------------------------------------------------------------
+    Napi::Value RegisterDynamic(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString()) {
+            Napi::TypeError::New(env, "registerDynamic(id: string, expr: string)")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string id   = info[0].As<Napi::String>().Utf8Value();
+        std::string expr = info[1].As<Napi::String>().Utf8Value();
+        {
+            std::lock_guard<std::mutex> lk(dynMutex_);
+            for (auto& reg : dynRegistry_) {
+                if (reg.id == id) { reg.expr = expr; return env.Undefined(); }
+            }
+            dynRegistry_.push_back({id, expr});
+        }
+        return env.Undefined();
+    }
+
+    // -----------------------------------------------------------------------
+    // unregisterDynamic(id) → void
+    // -----------------------------------------------------------------------
+    Napi::Value UnregisterDynamic(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsString()) {
+            Napi::TypeError::New(env, "unregisterDynamic(id: string)")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string id = info[0].As<Napi::String>().Utf8Value();
+        {
+            std::lock_guard<std::mutex> lk(dynMutex_);
+            dynRegistry_.erase(
+                std::remove_if(dynRegistry_.begin(), dynRegistry_.end(),
+                    [&id](const DynRegistration& r){ return r.id == id; }),
+                dynRegistry_.end());
+        }
+        return env.Undefined();
+    }
+
+    // -----------------------------------------------------------------------
+    // clearDynamicRegistry() → void
+    // -----------------------------------------------------------------------
+    Napi::Value ClearDynamicRegistry(const Napi::CallbackInfo& info) {
+        std::lock_guard<std::mutex> lk(dynMutex_);
+        dynRegistry_.clear();
+        dynResults_.clear();
+        return info.Env().Undefined();
+    }
+
+    // -----------------------------------------------------------------------
+    // getDynamicResults() → Record<string, DynResult>
+    // Swaps and returns accumulated results; clears the internal buffer.
+    // -----------------------------------------------------------------------
+    Napi::Value GetDynamicResults(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        std::vector<DynResult> snap;
+        {
+            std::lock_guard<std::mutex> lk(dynMutex_);
+            snap.swap(dynResults_);
+        }
+        auto obj = Napi::Object::New(env);
+        for (const auto& dr : snap) {
+            auto entry = Napi::Object::New(env);
+            entry.Set("value",     Napi::String::New(env, dr.value));
+            entry.Set("timestamp", Napi::Number::New(env, dr.timestamp));
+            if (!dr.error.empty())
+                entry.Set("error", Napi::String::New(env, dr.error));
+            obj.Set(dr.id, entry);
+        }
+        return obj;
+    }
+
+    // -----------------------------------------------------------------------
+    // setDynamicInterval(ms) → void
+    // Set the auto-interrupt interval.  0 = disabled.
+    // Starting/stopping the timer thread is handled here.
+    // -----------------------------------------------------------------------
+    Napi::Value SetDynamicInterval(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsNumber()) {
+            Napi::TypeError::New(env, "setDynamicInterval(ms: number)")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        int ms = static_cast<int>(info[0].As<Napi::Number>().Int32Value());
+        if (ms < 0) ms = 0;
+        int prev = dynIntervalMs_.exchange(ms);
+        // Start timer thread if transitioning from 0 to non-zero.
+        if (prev == 0 && ms > 0 && !dynTimerRunning_.load()) {
+            StartDynTimer();
+        }
+        return env.Undefined();
+    }
+
+    // -----------------------------------------------------------------------
+    // setDynAutoMode(auto) → void
+    // true  = C++-internal inline dialog path (default)
+    // false = legacy JS dialogEval/exitDialog path (for debugger)
+    // -----------------------------------------------------------------------
+    Napi::Value SetDynAutoMode(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsBoolean()) {
+            Napi::TypeError::New(env, "setDynAutoMode(auto: boolean)")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        dynAutoMode_.store(info[0].As<Napi::Boolean>().Value());
+        return env.Undefined();
+    }
+
+    // -----------------------------------------------------------------------
+    // dynamicActive (accessor) → boolean
+    // True if registry non-empty and interval > 0.
+    // -----------------------------------------------------------------------
+    Napi::Value DynamicActive(const Napi::CallbackInfo& info) {
+        std::lock_guard<std::mutex> lk(dynMutex_);
+        bool active = !dynRegistry_.empty() && dynIntervalMs_.load() > 0;
+        return Napi::Boolean::New(info.Env(), active);
+    }
+
+    // -----------------------------------------------------------------------
+    // abort() — interrupt the currently running evaluation.
     Napi::Value Abort(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
         if (!open_) return Napi::Boolean::New(env, false);
@@ -1869,7 +2379,12 @@ public:
         // Sending WSAbortMessage to an idle kernel causes it to emit a
         // spurious RETURNPKT[$Aborted] that would corrupt the next evaluation.
         if (!busy_.load()) return Napi::Boolean::New(env, false);
-        abortFlag_.store(true);
+        // Deduplication: if abortFlag_ is already true, another abort() is already
+        // in flight — sending a second WSAbortMessage causes stale response packets
+        // that corrupt the next evaluation.  Just return true (already aborting).
+        bool expected = false;
+        if (!abortFlag_.compare_exchange_strong(expected, true))
+            return Napi::Boolean::New(env, true);  // already aborting — no-op
         // Flush any queued dialogEval/exitDialog requests so their promises
         // reject immediately instead of hanging forever.
         FlushDialogQueueWithError("abort");
@@ -2001,7 +2516,45 @@ private:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // StartDynTimer — launches the background timer thread that sends
+    // WSInterruptMessage at the configured interval when the kernel is busy
+    // and Dynamic expressions are registered.
+    // Called on the JS main thread; harmless to call if already running.
+    // -----------------------------------------------------------------------
+    void StartDynTimer() {
+        if (dynTimerRunning_.exchange(true)) return;  // already running
+        if (dynTimerThread_.joinable()) dynTimerThread_.join();
+        dynTimerThread_ = std::thread([this]() {
+            while (open_ && dynIntervalMs_.load() > 0) {
+                int ms = dynIntervalMs_.load();
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms > 0 ? ms : 100));
+                if (!open_) break;
+                if (!busy_.load()) continue;                      // kernel idle
+                {
+                    std::lock_guard<std::mutex> lk(dynMutex_);
+                    if (dynRegistry_.empty()) continue;           // nothing registered
+                }
+                if (dynIntervalMs_.load() == 0) break;
+                // Check enough time has elapsed since last eval.
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - dynLastEval_).count();
+                if (elapsed < dynIntervalMs_.load()) continue;
+
+                if (workerReadingLink_.load() && !dialogOpen_.load() && !dynAutoMode_.load()) {
+                    WSPutMessage(lp_, WSInterruptMessage);
+                }
+            }
+            dynTimerRunning_.store(false);
+        });
+        dynTimerThread_.detach();
+    }
+
     void CleanUp() {
+        // Stop the Dynamic timer thread.
+        dynIntervalMs_.store(0);
+        dynTimerRunning_.store(false);
+
         // Immediately reject all queued subWhenIdle() requests before the link
         // is torn down.  These items have never been dispatched to a worker so
         // they won't receive an OnError callback — we must reject them here.
@@ -2156,6 +2709,19 @@ private:
     std::queue<DialogRequest>   dialogQueue_;     // dialogEval() requests
     std::atomic<bool>           dialogPending_{false};
     std::atomic<bool>           dialogOpen_{false};
+
+    // -----------------------------------------------------------------------
+    // Dynamic evaluation state (Phase 2 — C++-internal Dynamic eval)
+    // -----------------------------------------------------------------------
+    std::mutex                            dynMutex_;
+    std::vector<DynRegistration>          dynRegistry_;        // registered exprs
+    std::vector<DynResult>                dynResults_;         // accumulated results (swapped on getDynamicResults)
+    std::atomic<int>                      dynIntervalMs_{0};   // 0 = disabled
+    std::atomic<bool>                     dynAutoMode_{true};  // true = inline C++ path; false = legacy JS path
+    int                                   dynTaskInstalledInterval_{0}; // interval of currently installed ScheduledTask (0 = none)
+    std::chrono::steady_clock::time_point dynLastEval_{};      // time of last successful dialog eval
+    std::thread                           dynTimerThread_;
+    std::atomic<bool>                     dynTimerRunning_{false};
 };
 
 // ===========================================================================

@@ -30,6 +30,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
    - [`close()`](#close) — gracefully shut down the kernel and free resources
    - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen) — read-only status flags
+   - [Dynamic eval API](#dynamic-eval-api) — register expressions for automatic periodic evaluation
 5. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 6. [`setDiagHandler(fn)`](#setdiaghandlerfn)
 5. [Usage examples](#usage-examples)
@@ -97,7 +98,7 @@ The script automatically locates the WSTP SDK inside the default Wolfram install
 node test.js
 ```
 
-Expected last line: `All 36 tests passed.`
+Expected last line: `All 52 tests passed.`
 
 A more comprehensive suite (both modes + In/Out + comparison) lives in `tmp/tests_all.js`:
 
@@ -105,7 +106,7 @@ A more comprehensive suite (both modes + In/Out + comparison) lives in `tmp/test
 node tmp/tests_all.js
 ```
 
-Expected last line: `All 56 tests passed.`
+Expected last line: `All 41 tests passed.`
 
 ### 5. Quick smoke test
 
@@ -484,6 +485,35 @@ immediately with `"Session is closed"`.
 session.isOpen:       boolean  // true while the link is open and the kernel is running
 session.isDialogOpen: boolean  // true while inside a Dialog[] subsession
 ```
+
+---
+
+### Dynamic eval API
+
+Register Wolfram Language expressions for automatic periodic evaluation during
+cell computations.  A `RunScheduledTask` in the kernel periodically calls
+`Dialog[]`; the C++ layer intercepts each `BEGINDLGPKT`, evaluates all
+registered expressions inline, stores the results, and closes the dialog.
+
+| Method | Description |
+|--------|-------------|
+| `registerDynamic(id, expr)` | Register (or upsert) an expression for periodic evaluation |
+| `unregisterDynamic(id)` | Remove one registration by id |
+| `clearDynamicRegistry()` | Remove all registrations and clear results buffer |
+| `getDynamicResults()` | Return `Record<string, DynResult>` and clear buffer |
+| `setDynamicInterval(ms)` | Set the ScheduledTask period (0 = off) |
+| `setDynAutoMode(auto)` | `true` (default) = C++ handles dialogs; `false` = legacy JS path |
+| `dynamicActive` | Read-only: `true` when registry is non-empty and interval > 0 |
+
+```ts
+interface DynResult {
+    value:      string;  // string-form result
+    timestamp:  number;  // Unix timestamp (ms)
+    error?:     string;  // set if evaluation failed
+}
+```
+
+See [API.md](API.md#dynamic-eval-api) for full documentation.
 
 ---
 

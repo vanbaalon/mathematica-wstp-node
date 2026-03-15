@@ -30,6 +30,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`close()`](#close) — gracefully shut down the kernel and free resources
    - [`isOpen` / `isDialogOpen` / `isReady`](#isopen--isdialogopen--isready) — read-only status flags
    - [`kernelPid`](#kernelpid) — OS process ID of the WolframKernel child process
+   - [Dynamic eval API](#dynamic-eval-api) — register expressions for automatic periodic evaluation
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
 6. [Usage examples](#usage-examples)
@@ -42,6 +43,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Dialog subsessions](#dialog-subsessions)
    - [Real-time side channel (`WstpReader`)](#real-time-side-channel-wstpreader)
    - [Parallel independent kernels](#parallel-independent-kernels)
+   - [Dynamic periodic evaluation](#dynamic-periodic-evaluation)
 7. [Error handling](#error-handling)
 8. [Diagnostic logging](#diagnostic-logging)
 
@@ -91,7 +93,7 @@ The script automatically locates the WSTP SDK inside the default Wolfram install
 node test.js
 ```
 
-Expected last line: `All 36 tests passed.`
+Expected last line: `All 52 tests passed.`
 
 ### 5. Quick smoke test
 
@@ -521,6 +523,99 @@ try { execSync(`kill -9 ${session.kernelPid}`); } catch (_) {}
 
 ---
 
+### Dynamic eval API
+
+Register Wolfram Language expressions for automatic periodic evaluation during
+cell computations.  Results are collected in the background and polled from JS
+via `getDynamicResults()` — no JS round-trip per evaluation.
+
+Under the hood, `dynAutoMode` installs a `RunScheduledTask` in the kernel that
+periodically calls `Dialog[]`.  Each time the C++ layer intercepts a
+`BEGINDLGPKT`, it evaluates all registered expressions inside the dialog,
+stores the results, and closes the dialog with `Return[$Failed]`.
+
+#### `DynResult`
+
+```ts
+interface DynResult {
+    value:      string;  // string-form result
+    timestamp:  number;  // Unix timestamp (ms) when evaluated
+    error?:     string;  // set if evaluation failed
+}
+```
+
+#### `registerDynamic(id, expr)`
+
+```ts
+session.registerDynamic(id: string, expr: string): void
+```
+
+Register (or update) a Wolfram Language expression for periodic evaluation.
+The expression must return a string-coercible result (typically via `ToString[...]`).
+
+If `id` already exists, the expression is replaced (upsert semantics).
+
+#### `unregisterDynamic(id)`
+
+```ts
+session.unregisterDynamic(id: string): void
+```
+
+Remove a single registration by id.  No-op if the id was never registered.
+
+#### `clearDynamicRegistry()`
+
+```ts
+session.clearDynamicRegistry(): void
+```
+
+Remove all registered expressions.  Also clears the internal results buffer.
+
+#### `getDynamicResults()`
+
+```ts
+session.getDynamicResults(): Record<string, DynResult>
+```
+
+Return all results accumulated since the last call, then clear the buffer.
+Each key is a registration id; each value is the most recent `DynResult`.
+
+#### `setDynamicInterval(ms)`
+
+```ts
+session.setDynamicInterval(ms: number): void
+```
+
+Set the period (in milliseconds) for the background `ScheduledTask` that
+triggers `Dialog[]`.  When both the registry is non-empty and the interval
+is > 0, a `RunScheduledTask[Dialog[], intervalSec]` is installed in the kernel
+at the start of the next `evaluate()` call.
+
+Set to `0` to disable periodic evaluation.
+
+#### `setDynAutoMode(auto)`
+
+```ts
+session.setDynAutoMode(auto: boolean): void
+```
+
+Switch the `Dialog[]` handling mode:
+
+- `true` (default): C++ intercepts every `BEGINDLGPKT` and evaluates all
+  registered expressions inline — no JS round-trip required.
+- `false`: Falls back to the legacy JS callback path
+  (`onDialogBegin` / `dialogEval` / `exitDialog`).
+
+#### `dynamicActive`
+
+```ts
+session.dynamicActive: boolean  // read-only
+```
+
+`true` when the Dynamic registry is non-empty **and** the interval > 0.
+
+---
+
 ## `WstpReader`
 
 A reader that **connects to** a named WSTP link created by the kernel (via `LinkCreate`)
@@ -892,6 +987,42 @@ console.log(rb.result);  // Apéry's constant approximation
 
 ka.close();
 kb.close();
+```
+
+---
+
+### Dynamic periodic evaluation
+
+Register expressions for automatic background evaluation during cell computations.
+
+```js
+const session = new WstpSession();
+
+// Register expressions to evaluate periodically
+session.registerDynamic('x', 'ToString[x]');
+session.registerDynamic('line', 'ToString[$Line]');
+session.setDynamicInterval(150);  // evaluate every 150ms
+
+// Run a long computation — Dynamic expressions are evaluated in the background
+const r = await session.evaluate('Do[Pause[0.1], {50}]; x = 42; "done"');
+
+// Poll results (clears buffer on each call)
+const results = session.getDynamicResults();
+if ('x' in results) {
+    console.log(results.x.value);      // e.g. "42"
+    console.log(results.x.timestamp);  // Unix ms
+}
+
+// Update a registration (upsert)
+session.registerDynamic('x', 'ToString[x * 2]');
+
+// Remove one registration
+session.unregisterDynamic('line');
+
+// Clear everything
+session.clearDynamicRegistry();
+
+session.close();
 ```
 
 ---

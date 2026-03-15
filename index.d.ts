@@ -77,6 +77,25 @@ export interface EvalOptions {
      * @param level  The nesting depth that just closed.
      */
     onDialogEnd?: (level: number) => void;
+    /**
+     * When `true`, any `BEGINDLGPKT` received during a non-interactive
+     * evaluation is automatically closed in C++ without informing the JS
+     * layer.  Use for `VsCodeRender`, handler-install, and `sub()` calls
+     * that must never block on a Dialog[] (prevents Pattern C deadlocks).
+     */
+    rejectDialog?: boolean;
+}
+
+/**
+ * One captured Dynamic[] result returned by `getDynamicResults()`.
+ */
+export interface DynResult {
+    /** String-form result returned by the kernel for this expression. */
+    value:      string;
+    /** Unix timestamp (ms) when this result was evaluated. */
+    timestamp:  number;
+    /** Set if evaluation failed (e.g. timeout, `$Failed`). */
+    error?:     string;
 }
 
 /**
@@ -275,6 +294,66 @@ export class WstpSession {
      * it in cleanup paths.
      */
     readonly kernelPid: number;
+
+    // ── Dynamic eval API ────────────────────────────────────────────────────
+
+    /**
+     * Register (or update) a Wolfram Language expression to be evaluated
+     * automatically every time the kernel enters a Dialog[] interrupt.
+     *
+     * @param id    Unique identifier for this registration (e.g. `"x"`).
+     * @param expr  Wolfram Language expression string (e.g. `"ToString[x]"`).
+     */
+    registerDynamic(id: string, expr: string): void;
+
+    /**
+     * Remove a previously registered Dynamic expression by id.
+     * Has no effect if the id was never registered.
+     */
+    unregisterDynamic(id: string): void;
+
+    /** Remove all registered Dynamic expressions. */
+    clearDynamicRegistry(): void;
+
+    /**
+     * Consume and return all results accumulated since the last call.
+     *
+     * Each key is a registration `id`; each value is the most recent
+     * `DynResult` for that expression.  Calling this clears the internal
+     * buffer so subsequent calls return only new results.
+     *
+     * @returns  A plain object mapping id → DynResult.
+     */
+    getDynamicResults(): Record<string, DynResult>;
+
+    /**
+     * Set the auto-interrupt period (in ms) for the Dynamic timer thread.
+     *
+     * The background thread sends `WSInterruptMessage` to the kernel every
+     * `ms` milliseconds while an evaluation is in progress and the registry
+     * is non-empty.  Set to `0` to disable.
+     *
+     * @param ms  Interval in milliseconds (0 = off).
+     */
+    setDynamicInterval(ms: number): void;
+
+    /**
+     * Switch the Dialog[] handling mode.
+     *
+     * - `true` (default): C++ intercepts every `BEGINDLGPKT` and evaluates
+     *   all registered expressions inline — no JS round-trip required.
+     * - `false`: Falls back to the legacy JS callback path
+     *   (`onDialogBegin` / `dialogEval` / `exitDialog`).
+     *
+     * @param auto  `true` to enable automatic C++ handling, `false` for legacy.
+     */
+    setDynAutoMode(auto: boolean): void;
+
+    /**
+     * `true` when the Dynamic registry is non-empty **and** the timer
+     * interval is greater than zero (i.e. auto-interrupts are active).
+     */
+    readonly dynamicActive: boolean;
 }
 
 /**

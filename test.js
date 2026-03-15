@@ -1,10 +1,12 @@
 'use strict';
 
-// ── Test suite for wstp-backend v7 ─────────────────────────────────────────
+// ── Test suite for wstp-backend v0.6.0 ────────────────────────────────────
 // Covers: evaluation queue, streaming callbacks, sub() priority, abort
 //         behaviour, WstpReader side-channel, edge cases, Dialog[] subsession
 //         (dialogEval, exitDialog, isDialogOpen, onDialogBegin/End/Print),
-//         subWhenIdle() (background queue, timeout, close rejection), kernelPid.
+//         subWhenIdle() (background queue, timeout, close rejection), kernelPid,
+//         Dynamic eval API (registerDynamic, getDynamicResults, setDynamicInterval,
+//         setDynAutoMode, dynamicActive, rejectDialog, abort deduplication).
 
 const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wstp.node');
 
@@ -77,10 +79,40 @@ const suiteWatchdog = setTimeout(() => {
 }, SUITE_TIMEOUT_MS);
 suiteWatchdog.unref();   // does not prevent normal exit
 
+// ── Test filtering ─────────────────────────────────────────────────────────
+// Usage:  node test.js --only 38,39,40   or  --only 38-52
+// Omit flag to run all tests.
+const ONLY_TESTS = (() => {
+    const idx = process.argv.indexOf('--only');
+    if (idx === -1) return null;
+    const spec = process.argv[idx + 1] || '';
+    const nums = new Set();
+    for (const part of spec.split(',')) {
+        const range = part.split('-');
+        if (range.length === 2) {
+            for (let i = parseInt(range[0]); i <= parseInt(range[1]); i++) nums.add(i);
+        } else {
+            nums.add(parseInt(part));
+        }
+    }
+    return nums;
+})();
+
+// Extract leading integer from a test name like "38. foo bar" → 38.
+function testNum(name) {
+    const m = name.match(/^(\d+)/);
+    return m ? parseInt(m[1]) : NaN;
+}
+
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
+    if (ONLY_TESTS !== null && !ONLY_TESTS.has(testNum(name))) {
+        skipped++;
+        return;
+    }
     // Race the test body against a per-test timeout.
     const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error(`TIMED OUT after ${timeoutMs} ms`)),
@@ -1147,19 +1179,315 @@ async function main() {
         }
     });
 
+    // ══════════════════════════════════════════════════════════════════════
+    // Dynamic eval API tests (v0.6.0)
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 38. registerDynamic + getDynamicResults basic ─────────────────────
+    await run('38. registerDynamic / getDynamicResults basic', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('sum', 'ToString[1+1]');
+            s.setDynamicInterval(150);
+            assert(s.dynamicActive, 'dynamicActive should be true after registration + interval');
+            // Run a long-ish eval so the timer fires at least once
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 38 eval');
+            const results = s.getDynamicResults();
+            assert(typeof results === 'object', 'getDynamicResults must return object');
+            assert('sum' in results, 'result must have key "sum"');
+            assert(results.sum.value === '2', `expected "2", got "${results.sum.value}"`);
+            assert(typeof results.sum.timestamp === 'number' && results.sum.timestamp > 0,
+                'timestamp must be positive number');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 39. multiple registered expressions ───────────────────────────────
+    await run('39. multiple Dynamic registrations', async () => {
+        const s = mkSession();
+        try {
+            await s.evaluate('a = 10; b = 20; c = 30;');
+            s.registerDynamic('a', 'ToString[a]');
+            s.registerDynamic('b', 'ToString[b]');
+            s.registerDynamic('c', 'ToString[c]');
+            s.setDynamicInterval(150);
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 39 eval');
+            const res = s.getDynamicResults();
+            assert(res.a && res.a.value === '10', `a: expected "10", got "${res.a && res.a.value}"`);
+            assert(res.b && res.b.value === '20', `b: expected "20", got "${res.b && res.b.value}"`);
+            assert(res.c && res.c.value === '30', `c: expected "30", got "${res.c && res.c.value}"`);
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 40. getDynamicResults clears on each call ─────────────────────────
+    await run('40. getDynamicResults clears buffer on each call', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('x', 'ToString[2+2]');
+            s.setDynamicInterval(150);
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 40 eval');
+            const first = s.getDynamicResults();
+            const second = s.getDynamicResults();
+            assert('x' in first, 'first call should contain results');
+            assert(Object.keys(second).length === 0, 'second call must return empty object (buffer cleared)');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 41. rejectDialog:true prevents deadlock ───────────────────────────
+    await run('41. rejectDialog:true option', async () => {
+        const s = mkSession();
+        try {
+            // Install a handler so interrupt → Dialog[]
+            await s.evaluate(
+                'Quiet[Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]]',
+                { rejectDialog: true }
+            );
+            // Evaluate with rejectDialog; any dialog gets silently closed
+            const r = await withTimeout(
+                s.evaluate('Pause[0.3]; "ok"', { rejectDialog: true }),
+                5000, 'test 41 eval'
+            );
+            assert(r.result.value === 'ok', `expected "ok", got "${r.result.value}"`);
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 42. abort deduplication — multiple abort() calls don't corrupt ────
+    await run('42. abort deduplication', async () => {
+        const s = mkSession();
+        try {
+            const p = s.evaluate('Pause[5]; 42');
+            await sleep(100);
+            // Fire three rapid aborts — only first should take effect
+            s.abort();
+            s.abort();
+            s.abort();
+            const r = await withTimeout(p, 6000, 'test 42 abort settle');
+            assert(r.aborted, 'evaluation should be aborted');
+            // Kernel must still be usable
+            const r2 = await withTimeout(s.evaluate('"alive"'), 5000, 'test 42 post-abort');
+            assert(r2.result.value === 'alive', 'kernel must still work after multi-abort');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 43. dynamicActive accessor ────────────────────────────────────────
+    await run('43. dynamicActive accessor reflects state', async () => {
+        const s = mkSession();
+        try {
+            assert(!s.dynamicActive, 'dynamicActive must be false initially');
+            s.registerDynamic('v', 'ToString[1]');
+            assert(!s.dynamicActive, 'dynamicActive must remain false until interval set');
+            s.setDynamicInterval(200);
+            assert(s.dynamicActive, 'dynamicActive must be true after registration + interval');
+            s.clearDynamicRegistry();
+            assert(!s.dynamicActive, 'dynamicActive must be false after clear');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 44. clearDynamicRegistry empties getDynamicResults ────────────────
+    await run('44. clearDynamicRegistry', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('p', 'ToString[Pi, 5]');
+            s.setDynamicInterval(150);
+            await withTimeout(s.evaluate('Pause[0.5]; "done"'), 6000, 'test 44 eval');
+            s.clearDynamicRegistry();
+            // After clearing, a new eval should produce no dyn results
+            await withTimeout(s.evaluate('"x"'), 5000, 'test 44 second eval');
+            const res = s.getDynamicResults();
+            assert(Object.keys(res).length === 0, 'no results expected after clearDynamicRegistry');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 45. unregisterDynamic removes one entry ───────────────────────────
+    await run('45. unregisterDynamic removes one entry', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('keep', 'ToString[3+3]');
+            s.registerDynamic('drop', 'ToString[4+4]');
+            s.unregisterDynamic('drop');
+            s.setDynamicInterval(150);
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 45 eval');
+            const res = s.getDynamicResults();
+            assert('keep' in res, 'key "keep" must still be present');
+            assert(!('drop' in res), 'key "drop" must be absent after unregister');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 46. setDynamicInterval(0) stops timer ────────────────────────────
+    await run('46. setDynamicInterval(0) disables timer', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('z', 'ToString[7+7]');
+            s.setDynamicInterval(100);
+            assert(s.dynamicActive, 'dynamicActive should be true');
+            s.setDynamicInterval(0);
+            assert(!s.dynamicActive, 'dynamicActive must be false after interval set to 0');
+            // Even with a long eval, no dynamic results should accumulate
+            await withTimeout(s.evaluate('Pause[0.5]; "ok"'), 6000, 'test 46 eval');
+            const res = s.getDynamicResults();
+            assert(Object.keys(res).length === 0, 'no Dynamic results expected when timer is disabled');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 47. setDynAutoMode(false) falls back to legacy JS dialog path ─────
+    await run('47. setDynAutoMode(false) — legacy JS dialog path works', async () => {
+        const s = mkSession();
+        try {
+            s.setDynAutoMode(false);
+            let dialogOpened = false;
+            // Install interrupt handler manually (required for legacy path)
+            await installHandler(s);
+            // Use a loop with short Pause so the interrupt fires between iterations
+            // (single Pause[] absorbs interrupts until it completes).
+            const p = s.evaluate('Do[Pause[0.15], {20}]; "done"', {
+                onDialogBegin: async () => {
+                    dialogOpened = true;
+                    await s.exitDialog();
+                },
+            });
+            await sleep(400);
+            s.interrupt();
+            const r = await withTimeout(p, 10000, 'test 47 legacy dialog eval');
+            assert(dialogOpened, 'onDialogBegin should have fired in legacy mode');
+            assert(!r.aborted, 'should not be aborted');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 48. Dynamic: abort followed by new dynAutoMode eval works ─────────
+    await run('48. abort then Dynamic eval recovers', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('n', 'ToString[42]');
+            s.setDynamicInterval(200);
+            // Start a long eval, abort it
+            const p = s.evaluate('Pause[10]; 0');
+            await sleep(150);
+            s.abort();
+            const r = await withTimeout(p, 5000, 'test 48 abort wait');
+            assert(r.aborted, 'first eval should be aborted');
+            // Now a new eval must work normally with dyn interrupts
+            const r2 = await withTimeout(s.evaluate('Pause[0.8]; "alive"'), 8000, 'test 48 second eval');
+            assert(r2.result.value === 'alive', 'kernel alive after abort');
+            // Dynamic results should be populated
+            const res = s.getDynamicResults();
+            assert('n' in res, 'dynamic result "n" expected after abort recovery');
+            assert(res.n.value === '42', `expected "42", got "${res.n.value}"`);
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 49. Rapid cell transitions with Dynamic — no deadlock ─────────────
+    // Tests rapid cell transitions with Dialog[] firing frequently. The C++
+    // layer handles the case where EvaluatePacket gets processed inside a
+    // Dialog[] context (between-eval ScheduledTask fire) by capturing the
+    // outer RETURNPKT and returning it directly.
+    await run('49. rapid cell transitions with Dynamic active', async () => {
+        const s = mkSession();
+        try {
+            s.registerDynamic('tick', 'ToString[$Line]');
+            s.setDynamicInterval(80);
+            for (let i = 0; i < 8; i++) {
+                const r = await withTimeout(
+                    s.evaluate(`Pause[0.15]; ${i}`),
+                    6000, `test 49 cell ${i}`
+                );
+                assert(!r.aborted, `cell ${i} must not be aborted`);
+                assert(String(r.result.value) === String(i),
+                    `cell ${i}: expected "${i}", got "${r.result.value}"`);
+            }
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 50. registerDynamic upsert — updates existing entry ───────────────
+    await run('50. registerDynamic upsert updates existing entry', async () => {
+        const s = mkSession();
+        try {
+            await s.evaluate('q = 5;');
+            s.registerDynamic('q', 'ToString[q]');   // initial registration
+            s.registerDynamic('q', 'ToString[q*2]'); // upsert — should override
+            s.setDynamicInterval(150);
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 50 eval');
+            const res = s.getDynamicResults();
+            assert('q' in res, 'key "q" must be present');
+            assert(res.q.value === '10', `expected "10" (q*2), got "${res.q.value}"`);
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 51. empty registry + interval — eval completes normally ──────────
+    await run('51. empty registry with interval set — eval completes', async () => {
+        const s = mkSession();
+        try {
+            s.setDynamicInterval(100);
+            // No registrations — dynamicActive must be false
+            assert(!s.dynamicActive, 'dynamicActive must be false with empty registry');
+            const r = await withTimeout(s.evaluate('"noblock"'), 5000, 'test 51 eval');
+            assert(r.result.value === 'noblock', 'eval should complete normally');
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 52. drainStalePackets — eval after stale BEGINDLGPKT survives ─────
+    await run('52. evaluate survives stale BEGINDLGPKT (Pattern D)', async () => {
+        const s = mkSession();
+        try {
+            // Install handler so any interrupt produces Dialog[], then evalute with
+            // rejectDialog so the stale packet is auto-drained in C++
+            await s.evaluate(
+                'Quiet[Internal`AddHandler["Interrupt", Function[{}, Dialog[]]]]',
+                { rejectDialog: true }
+            );
+            for (let i = 0; i < 5; i++) {
+                const r = await withTimeout(
+                    s.evaluate(`Pause[0.2]; ${i}`, { rejectDialog: true }),
+                    6000, `test 52 iteration ${i}`
+                );
+                assert(!r.aborted, `iteration ${i} must not be aborted`);
+                assert(String(r.result.value) === String(i),
+                    `iteration ${i}: expected "${i}", got "${r.result.value}"`);
+            }
+        } finally {
+            s.close();
+        }
+    });
+
     // ── Teardown ──────────────────────────────────────────────────────────
     session.close();
     assert(!session.isOpen, 'main session not closed');
 
     console.log();
     if (failed === 0) {
-        console.log(`All ${passed} tests passed.`);
+        console.log(`All ${passed} tests passed${skipped ? ` (${skipped} skipped)` : ''}.`);
         // Force-exit: WSTP library may keep libuv handles alive after WSClose,
         // preventing the event loop from draining naturally.  All assertions are
         // done; a clean exit(0) is safe.
         process.exit(0);
     } else {
-        console.log(`${passed} passed, ${failed} failed.`);
+        console.log(`${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}.`);
     }
 }
 
