@@ -20,6 +20,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Constructor](#constructor) — launch a kernel and open a session
    - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
    - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
+   - [`subWhenIdle(expr, opts?)`](#subwhenidleexpr-opts) — background evaluation that runs only when the kernel is fully idle
    - [`abort()`](#abort) — interrupt the currently running evaluation
    - [`closeAllDialogs()`](#closealldialogs) — immediately reject all pending dialog promises and reset dialog state
    - [`dialogEval(expr)`](#dialogevalexpr) — evaluate inside an active `Dialog[]` subsession
@@ -28,6 +29,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
    - [`close()`](#close) — gracefully shut down the kernel and free resources
    - [`isOpen` / `isDialogOpen` / `isReady`](#isopen--isdialogopen--isready) — read-only status flags
+   - [`kernelPid`](#kernelpid) — OS process ID of the WolframKernel child process
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
 6. [Usage examples](#usage-examples)
@@ -35,6 +37,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Streaming output](#streaming-output)
    - [Concurrent evaluations](#concurrent-evaluations)
    - [Priority `sub()` calls](#priority-sub-calls)
+   - [Background queries with `subWhenIdle()`](#background-queries-with-subwhenidle)
    - [Abort a long computation](#abort-a-long-computation)
    - [Dialog subsessions](#dialog-subsessions)
    - [Real-time side channel (`WstpReader`)](#real-time-side-channel-wstpreader)
@@ -223,6 +226,50 @@ queued `evaluate()` calls.  Multiple `sub()` calls are ordered FIFO among themse
 ```js
 const pid  = await session.sub('$ProcessID');   // { type: 'integer', value: 12345 }
 const info = await session.sub('$Version');     // { type: 'string', value: '14.1 ...' }
+```
+
+---
+
+### `subWhenIdle(expr, opts?)`
+
+```ts
+session.subWhenIdle(expr: string, opts?: { timeout?: number }): Promise<WExpr>
+```
+
+Background evaluation that runs only when the kernel is **truly idle** — i.e. after all
+pending `evaluate()` and `sub()` calls have completed.
+
+| Priority | Method | Runs before… |
+|----------|--------|-------------|
+| High | `sub()` | all queued `evaluate()` calls |
+| Normal | `evaluate()` | other `evaluate()` calls in FIFO order |
+| **Low** | **`subWhenIdle()`** | nothing — waits until both queues above are empty |
+
+Use this for background queries (global-symbol coloring, auto-complete lookups, etc.) that
+must not race with or interrupt active cell evaluations.
+
+- If the kernel is **idle** at call time, the query starts immediately.
+- If the kernel is **busy**, the query is queued and executes as soon as the kernel becomes
+  fully idle (both the `evaluate()` queue and the `sub()` queue are empty).
+- Multiple `subWhenIdle()` calls are served **FIFO** among themselves.
+- If `close()` is called while the query is still in the queue, the Promise rejects with
+  `"Session is closed"`.
+
+**`opts.timeout`** — optional maximum milliseconds to wait in the queue.  If the kernel has
+not become idle within `timeout` ms, the Promise rejects with `"subWhenIdle: timeout"`.
+Omit or set to `0` for no timeout.
+
+```js
+// Safe background query — never races with evaluate():
+const names = await session.subWhenIdle('Names["Global`*"]');
+
+// With a 5-second timeout (gives up if kernel stays busy):
+const result = await session.subWhenIdle('SomeHeavyQuery[]', { timeout: 5000 });
+
+// Fire-and-forget pattern for coloring updates:
+session.subWhenIdle('Names["Global`*"]').then(names => {
+    updateSymbolColors(names);
+}).catch(() => { /* session closed or timed out */ });
 ```
 
 ---
@@ -434,6 +481,46 @@ if (!session.isReady && !session.isDialogOpen) {
 
 ---
 
+### `kernelPid`
+
+```ts
+session.kernelPid: number
+```
+
+The OS process ID of the `WolframKernel` child process.  Captured once during
+`new WstpSession()` via a synchronous `$ProcessID` query and does not change.
+
+Returns `0` if the PID could not be determined at construction time (non-fatal fallback).
+
+**Use cases:**
+- Monitor the kernel externally (e.g. `ps`, `/proc/<pid>/status`).
+- Force-terminate a stale kernel after a crash or restart without waiting for the normal
+  `close()` path.
+- Correlate log entries from multiple parallel subsessions.
+
+The PID remains readable even after `close()` so cleanup code can reference it:
+
+```js
+const session = new WstpSession();
+console.log(session.kernelPid);   // e.g. 12345
+
+// Each subsession has its own independent kernel PID:
+const child1 = session.createSubsession();
+const child2 = session.createSubsession();
+console.log(child1.kernelPid);   // e.g. 12346
+console.log(child2.kernelPid);   // e.g. 12347
+
+// Still accessible after close for post-mortem / logging:
+session.close();
+console.log(session.kernelPid);  // still 12345
+
+// Force-kill a running kernel if needed (macOS/Linux):
+const { execSync } = require('child_process');
+try { execSync(`kill -9 ${session.kernelPid}`); } catch (_) {}
+```
+
+---
+
 ## `WstpReader`
 
 A reader that **connects to** a named WSTP link created by the kernel (via `LinkCreate`)
@@ -641,6 +728,40 @@ const val = await session.sub('$Version');         // runs next
 const pid  = await session.sub('$ProcessID');      // runs after val
 
 await batch;
+```
+
+---
+
+### Background queries with `subWhenIdle()`
+
+`subWhenIdle()` is the safe choice for background queries that must not race with active
+cell evaluations.
+
+```js
+// subWhenIdle fires only after ALL pending evaluate() and sub() calls finish:
+session.evaluate('Pause[3]; x = 42');        // long cell
+session.evaluate('Pause[3]; y = x + 1');     // queued cell
+
+// This does NOT interrupt the evaluations above.
+// It runs after both finish, when the kernel is truly idle:
+session.subWhenIdle('Names["Global`*"]').then(names => {
+    // safe to use — no race condition possible
+    updateSymbolColoring(names);
+});
+
+// Error handling + optional timeout:
+const symbols = await session.subWhenIdle('Names["Global`*"]', { timeout: 10_000 })
+    .catch(err => {
+        if (err.message === 'subWhenIdle: timeout')
+            console.warn('kernel stayed busy for 10 s, skipping coloring update');
+        return null;
+    });
+
+// Priority summary:
+//   sub():         runs before queued evaluate() — good for urgent UI queries
+//   subWhenIdle(): runs after  queued evaluate() — good for background indexing
+const urgent     = session.sub('$ProcessID');          // next in line
+const background = session.subWhenIdle('Names["Global`*"]');  // after idle
 ```
 
 ---

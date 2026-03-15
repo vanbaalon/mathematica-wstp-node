@@ -1241,6 +1241,7 @@ public:
         Napi::Function func = DefineClass(env, "WstpSession", {
             InstanceMethod<&WstpSession::Evaluate>        ("evaluate"),
             InstanceMethod<&WstpSession::Sub>             ("sub"),
+            InstanceMethod<&WstpSession::SubWhenIdle>     ("subWhenIdle"),
             InstanceMethod<&WstpSession::DialogEval>      ("dialogEval"),
             InstanceMethod<&WstpSession::ExitDialog>      ("exitDialog"),
             InstanceMethod<&WstpSession::Interrupt>       ("interrupt"),
@@ -1251,6 +1252,7 @@ public:
             InstanceAccessor<&WstpSession::IsOpen>        ("isOpen"),
             InstanceAccessor<&WstpSession::IsDialogOpen>  ("isDialogOpen"),
             InstanceAccessor<&WstpSession::IsReady>       ("isReady"),
+            InstanceAccessor<&WstpSession::KernelPid>     ("kernelPid"),
         });
 
         Napi::FunctionReference* ctor = new Napi::FunctionReference();
@@ -1308,7 +1310,10 @@ public:
                 DiagLog("[Session] restart attempt " + std::to_string(attempt) +
                         " — $Output routing broken on previous kernel");
                 WSClose(lp_);           lp_       = nullptr;
-                if (kernelPid_ > 0) { kill(kernelPid_, SIGTERM); kernelPid_ = 0; }
+                // Kill the stale kernel before relaunching; use the same guard
+                // as CleanUp() to avoid double-kill on already-dead process.
+                if (kernelPid_ > 0 && !kernelKilled_) { kernelKilled_ = true; kill(kernelPid_, SIGTERM); }
+                kernelKilled_ = false;  // reset for the fresh kernel about to launch
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
 
@@ -1435,6 +1440,16 @@ public:
         Napi::Promise::Deferred deferred;
     };
 
+    // Queue entry — one pending subWhenIdle() call (lowest priority).
+    // Executed only when both subIdleQueue_ and queue_ are empty.
+    struct QueuedWhenIdle {
+        std::string              expr;
+        Napi::Promise::Deferred  deferred;
+        // Absolute deadline; time_point::max() = no timeout.
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
+    };
+
     // Sub-idle evals are preferred over normal evals so sub()-when-idle gets
     // a quick result without waiting for a queued evaluate().
     // -----------------------------------------------------------------------
@@ -1455,6 +1470,26 @@ public:
         }
 
         if (queue_.empty()) {
+            // No normal evaluate() items — check lowest-priority when-idle queue.
+            // Drain any timeout-expired entries first, then run the next live one.
+            while (!whenIdleQueue_.empty()) {
+                auto& front = whenIdleQueue_.front();
+                bool expired =
+                    (front.deadline != std::chrono::steady_clock::time_point::max() &&
+                     std::chrono::steady_clock::now() >= front.deadline);
+                if (expired) {
+                    Napi::Env wenv = front.deferred.Env();
+                    front.deferred.Reject(
+                        Napi::Error::New(wenv, "subWhenIdle: timeout").Value());
+                    whenIdleQueue_.pop();
+                    continue;
+                }
+                auto wiItem = std::move(whenIdleQueue_.front());
+                whenIdleQueue_.pop();
+                lk.unlock();
+                StartWhenIdleWorker(std::move(wiItem));
+                return;
+            }
             busy_.store(false);
             return;
         }
@@ -1537,6 +1572,63 @@ public:
                            [this]() { busy_.store(false); MaybeStartNext(); }))->Queue();
     }
 
+    // Launch a lightweight EvaluateWorker for one subWhenIdle() entry.
+    // Identical to StartSubIdleWorker — reuses the same SubIdleWorker inner
+    // class pattern; separated here so it can receive QueuedWhenIdle.
+    void StartWhenIdleWorker(QueuedWhenIdle item) {
+        struct WhenIdleWorker : public Napi::AsyncWorker {
+            WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
+                           std::atomic<bool>& workerReadingLink,
+                           std::function<void()> done)
+                : Napi::AsyncWorker(d.Env()),
+                  deferred_(std::move(d)), lp_(lp), expr_(std::move(expr)),
+                  workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
+
+            void Execute() override {
+                if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
+                    !WSPutFunction(lp_, "ToExpression",   1) ||
+                    !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
+                    !WSEndPacket(lp_)                        ||
+                    !WSFlush(lp_)) {
+                    workerReadingLink_.store(false, std::memory_order_release);
+                    SetError("subWhenIdle: failed to send EvaluatePacket");
+                    return;
+                }
+                result_ = DrainToEvalResult(lp_);
+                workerReadingLink_.store(false, std::memory_order_release);
+            }
+            void OnOK() override {
+                Napi::Env env = Env();
+                if (result_.result.kind == WExpr::WError) {
+                    deferred_.Reject(Napi::Error::New(env, result_.result.strVal).Value());
+                } else {
+                    Napi::Value v = WExprToNapi(env, result_.result);
+                    if (env.IsExceptionPending())
+                        deferred_.Reject(env.GetAndClearPendingException().Value());
+                    else
+                        deferred_.Resolve(v);
+                }
+                done_();
+            }
+            void OnError(const Napi::Error& e) override {
+                deferred_.Reject(e.Value());
+                done_();
+            }
+        private:
+            Napi::Promise::Deferred deferred_;
+            WSLINK                  lp_;
+            std::string             expr_;
+            std::atomic<bool>&      workerReadingLink_;
+            std::function<void()>   done_;
+            EvalResult              result_;
+        };
+
+        workerReadingLink_.store(true, std::memory_order_release);
+        (new WhenIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
+                            workerReadingLink_,
+                            [this]() { busy_.store(false); MaybeStartNext(); }))->Queue();
+    }
+
     // -----------------------------------------------------------------------
     // sub(expr) → Promise<WExpr>
     //
@@ -1563,6 +1655,53 @@ public:
         {
             std::lock_guard<std::mutex> lk(queueMutex_);
             subIdleQueue_.push(QueuedSubIdle{ std::move(expr), std::move(deferred) });
+        }
+        MaybeStartNext();
+        return promise;
+    }
+
+    // -----------------------------------------------------------------------
+    // subWhenIdle(expr, opts?) → Promise<WExpr>
+    //
+    // Queues a lightweight evaluation at the LOWEST priority: it runs only
+    // when both subIdleQueue_ and queue_ are empty (kernel truly idle).
+    // Ideal for background queries that must not compete with cell evaluations.
+    //
+    // opts may contain:
+    //   timeout?: number  — milliseconds to wait before the Promise rejects
+    // -----------------------------------------------------------------------
+    Napi::Value SubWhenIdle(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        auto deferred = Napi::Promise::Deferred::New(env);
+        auto promise  = deferred.Promise();
+
+        if (!open_) {
+            deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
+            return promise;
+        }
+        if (info.Length() < 1 || !info[0].IsString()) {
+            deferred.Reject(Napi::TypeError::New(env,
+                "subWhenIdle(expr: string, opts?: {timeout?: number})").Value());
+            return promise;
+        }
+        std::string expr = info[0].As<Napi::String>().Utf8Value();
+
+        // Parse optional timeout from opts object.
+        auto deadline = std::chrono::steady_clock::time_point::max();
+        if (info.Length() >= 2 && info[1].IsObject()) {
+            auto optsObj = info[1].As<Napi::Object>();
+            if (optsObj.Has("timeout") && optsObj.Get("timeout").IsNumber()) {
+                double ms = optsObj.Get("timeout").As<Napi::Number>().DoubleValue();
+                if (ms > 0)
+                    deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(static_cast<int64_t>(ms));
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(queueMutex_);
+            whenIdleQueue_.push(QueuedWhenIdle{
+                std::move(expr), std::move(deferred), deadline });
         }
         MaybeStartNext();
         return promise;
@@ -1816,6 +1955,17 @@ public:
             && subIdleQueue_.empty());
     }
 
+    // -----------------------------------------------------------------------
+    // kernelPid  (read-only accessor)
+    // Returns the OS process ID of the WolframKernel child process.
+    // Returns 0 if the PID could not be fetched (non-fatal, rare fallback).
+    // The PID can be used by the caller to monitor or force-terminate the
+    // kernel process independently of the WSTP link (e.g. after a restart).
+    // -----------------------------------------------------------------------
+    Napi::Value KernelPid(const Napi::CallbackInfo& info) {
+        return Napi::Number::New(info.Env(), static_cast<double>(kernelPid_));
+    }
+
 private:
     // Queue entry — one pending evaluate() call.
     // interactiveOverride: -1 = use session default, 0 = force batch, 1 = force interactive
@@ -1852,6 +2002,18 @@ private:
     }
 
     void CleanUp() {
+        // Immediately reject all queued subWhenIdle() requests before the link
+        // is torn down.  These items have never been dispatched to a worker so
+        // they won't receive an OnError callback — we must reject them here.
+        {
+            std::lock_guard<std::mutex> lk(queueMutex_);
+            while (!whenIdleQueue_.empty()) {
+                auto& wi = whenIdleQueue_.front();
+                wi.deferred.Reject(
+                    Napi::Error::New(wi.deferred.Env(), "Session is closed").Value());
+                whenIdleQueue_.pop();
+            }
+        }
         // If a worker thread is currently reading from lp_, calling WSClose()
         // on it from the JS main thread causes a concurrent-access crash
         // (heap-use-after-free / SIGSEGV).
@@ -1877,7 +2039,11 @@ private:
         // Kill the child kernel process so it doesn't become a zombie.
         // WSClose() closes the link but does not terminate the WolframKernel
         // child process — without this, each session leaks a kernel.
-        if (kernelPid_ > 0) { kill(kernelPid_, SIGTERM); kernelPid_ = 0; }
+        // kernelPid_ is intentionally NOT zeroed here so .kernelPid remains
+        // readable after close() (useful for post-mortem logging / force-kill).
+        // kernelKilled_ prevents a double-kill when the destructor later calls
+        // CleanUp() a second time.
+        if (kernelPid_ > 0 && !kernelKilled_) { kernelKilled_ = true; kill(kernelPid_, SIGTERM); }
     }
 
 
@@ -1971,7 +2137,8 @@ private:
     WSLINK                      lp_;
     bool                        open_;
     bool                        interactiveMode_ = false;  // true → EnterTextPacket, populates In/Out
-    pid_t                       kernelPid_  = 0;  // child process — killed on CleanUp
+    pid_t                       kernelPid_  = 0;  // child process PID — preserved after close() for .kernelPid accessor
+    bool                        kernelKilled_ = false; // guards against double-kill across close() + destructor
     std::atomic<int64_t>        nextLine_{1};      // 1-based In[n] counter for EvalResult.cellIndex
     std::atomic<bool>           abortFlag_{false};
     std::atomic<bool>           busy_{false};
@@ -1983,6 +2150,7 @@ private:
     std::mutex                  queueMutex_;
     std::queue<QueuedEval>      queue_;
     std::queue<QueuedSubIdle>   subIdleQueue_;    // sub() — runs before queue_ items
+    std::queue<QueuedWhenIdle>  whenIdleQueue_;   // subWhenIdle() — lowest priority, runs when truly idle
     // Dialog subsession state — written on main thread, consumed on thread pool
     std::mutex                  dialogMutex_;
     std::queue<DialogRequest>   dialogQueue_;     // dialogEval() requests

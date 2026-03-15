@@ -80,6 +80,18 @@ export interface EvalOptions {
 }
 
 /**
+ * Optional options for subWhenIdle().
+ */
+export interface SubWhenIdleOptions {
+    /**
+     * Maximum number of milliseconds to wait in the queue before the
+     * returned Promise rejects with a timeout error.
+     * Omit or set to 0 for no timeout (wait indefinitely).
+     */
+    timeout?: number;
+}
+
+/**
  * A session wrapping one WolframKernel process connected over WSTP.
  *
  * Multiple evaluate() calls are automatically serialised through an
@@ -203,6 +215,36 @@ export class WstpSession {
     sub(expr: string): Promise<WExpr>;
 
     /**
+     * Queue a background evaluation that runs only when the kernel is truly idle.
+     *
+     * Unlike `sub()`, which runs *before* any queued `evaluate()` calls,
+     * `subWhenIdle()` runs only *after* ALL pending `evaluate()` and `sub()`
+     * calls have completed.  This makes it safe for background queries
+     * (e.g. global-symbol coloring, auto-complete) that must not compete with
+     * active cell evaluations.
+     *
+     * If the kernel is idle at call time the query starts immediately;
+     * otherwise it is queued and executes as soon as the kernel becomes
+     * fully idle again.  Multiple `subWhenIdle()` calls are executed FIFO.
+     *
+     * If the session is closed while the request is still queued the Promise
+     * rejects with `"Session is closed"`.
+     *
+     * @param expr  Wolfram Language expression string to evaluate.
+     * @param opts  Optional: `{ timeout?: number }` — ms before the Promise
+     *              rejects with `"subWhenIdle: timeout"` if the kernel has
+     *              not become idle within that window.
+     * @returns     Promise that resolves with the WExpr result,
+     *              identical in shape to the value returned by `sub()`.
+     *
+     * @example
+     * session.subWhenIdle('Names["Global`*"]').then(result => {
+     *     // safe background query — never races with evaluate()
+     * });
+     */
+    subWhenIdle(expr: string, opts?: SubWhenIdleOptions): Promise<WExpr>;
+
+    /**
      * Launch an independent child kernel as a new WstpSession.
      *
      * The child has completely isolated state (variables, definitions, memory).
@@ -220,6 +262,19 @@ export class WstpSession {
 
     /** True while the link is open and the kernel is running. */
     readonly isOpen: boolean;
+
+    /**
+     * The OS process ID of the WolframKernel child process.
+     *
+     * Useful for external monitoring or force-terminating a stale kernel
+     * after a restart.  Returns `0` if the PID could not be determined
+     * at session-construction time (rare, non-fatal fallback).
+     *
+     * The PID is captured once during `new WstpSession()` and does not
+     * change; it remains set even after `close()` so callers can reference
+     * it in cleanup paths.
+     */
+    readonly kernelPid: number;
 }
 
 /**

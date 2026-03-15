@@ -1,0 +1,16 @@
+[diag 20:14:19.336] [WarmUp] $Output routing verified on attempt 1
+[diag 20:14:20.094] [Eval] pkt=5
+[diag 20:14:20.094] [Eval] pkt=9
+[diag 20:14:20.094] [Eval] pkt=16
+[diag 20:14:20.094] [Eval] pkt=8
+[diag 20:14:20.747] [Eval] pkt=6
+[diag 20:14:20.760] [Eval] MENUPKT: interrupt handler opened Dialog[] — entering dialog loop
+[diag 20:14:20.834] [MenuDlg] dpkt=2
+[diag 20:14:21.202] [MenuDlg] dpkt=0
+node:internal/process/promises:289
+            triggerUncaughtException(err, true /* fromPromise */);
+            ^
+
+[Error: WSTP connection was lost.]
+
+Node.js v20.12.2

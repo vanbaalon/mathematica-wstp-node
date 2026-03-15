@@ -1,0 +1,24 @@
+[wstp +1137ms] [WarmUp] $Output routing verified on attempt 1
+[diag 19:35:27.420] [WarmUp] $Output routing verified on attempt 1
+[wstp +1163ms] [Eval] pkt=5
+[wstp +1163ms] [Eval] pkt=9
+[wstp +1163ms] [Eval] pkt=16
+[wstp +1163ms] [Eval] pkt=8
+[diag 19:35:27.445] [Eval] pkt=5
+[diag 19:35:27.445] [Eval] pkt=9
+[diag 19:35:27.445] [Eval] pkt=16
+[diag 19:35:27.445] [Eval] pkt=8
+[wstp +1765ms] [Eval] pkt=6
+[wstp +1765ms] [Eval] unknown pkt=6, discarding
+[diag 19:35:28.047] [Eval] pkt=6
+[diag 19:35:28.047] [Eval] unknown pkt=6, discarding
+[wstp +6901ms] [WarmUp] $Output routing verified on attempt 1
+[diag 19:35:33.183] [WarmUp] $Output routing verified on attempt 1
+[wstp +6926ms] [Eval] pkt=5
+[wstp +6926ms] [Eval] pkt=3
+[diag 19:35:33.208] [Eval] pkt=5
+[diag 19:35:33.208] [Eval] pkt=3
+[wstp +7528ms] [Eval] pkt=6
+[wstp +7528ms] [Eval] unknown pkt=6, discarding
+[diag 19:35:33.810] [Eval] pkt=6
+[diag 19:35:33.810] [Eval] unknown pkt=6, discarding

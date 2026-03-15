@@ -1,0 +1,106 @@
+════════════════════════════════════════════════════════════════════════
+Pause + Interrupt WSTP Regression Tests
+Date: 2026-03-01T15:57:17.176Z
+Kernel: /Applications/Wolfram 3.app/Contents/MacOS/WolframKernel
+Report: /Users/k0959535/Dropbox/MY/Programming/VSCodeWolframExtension/WSTP Backend/test_pause_interrupt_2026-03-01_15-57-17.txt
+════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────
+TEST  P1: Pause[8] ignores interrupt → no dialog within 2500ms
+  [setup] interrupt→Dialog handler installed
+  [P1] sending interrupt during Pause[8]...
+  [P1] interrupt() = true
+  [P1] isDialogOpen after 2514ms = false
+  [P1] waiting for Pause[8] to finish...
+  [FAIL]  (15991 ms): TIMEOUT(12000ms): P1 main eval
+
+────────────────────────────────────────────────────────────────────────
+TEST  P2: Pause[0.3] loop — interrupt opens Dialog and dialogEval succeeds
+  [setup] interrupt→Dialog handler installed
+  [P2] sending interrupt...
+  [P2] dialog opened in 154ms
+  [P2] dialogEval("nP2") = {"type":"integer","value":2}
+  [P2] exitDialog done, waiting for loop to finish...
+  [P2] loop done
+  [PASS]  (10338 ms)
+
+────────────────────────────────────────────────────────────────────────
+TEST  P3: dialogEval timeout → kernel state after (CORE BUG ISOLATION)
+  [setup] interrupt→Dialog handler installed
+  [P3] interrupt #1 — opening dialog...
+  [P3] dialog #1 open
+  [P3] starting dialogEval with deliberate 200ms timeout (simulating stuck eval)...
+  [P3] dialogEval returned unexpectedly fast — retrying with guaranteed timeout
+  [P3] isDialogOpen after dialogEval timeout = true
+  [P3] attempting exitDialog...
+  [P3] exitDialog succeeded
+  [P3] interrupt #2 — can we open a new dialog?
+  [P3] isDialogOpen (post-timeout cycle) = false after 3003ms
+
+  [P3] SUMMARY:
+    dlgOpen after timeout   = true  (true = dialog stuck open)
+    exitDialog after timeout = OK
+    dialog #2 opened        = false  (false = kernel degraded → THE BUG)
+  [P3] exitDialog succeeded — kernel NOT degraded by timeout alone
+  [PASS]  (29312 ms)
+
+────────────────────────────────────────────────────────────────────────
+TEST  P4: abort() after stuck dialog → subsequent interrupt works
+  [setup] interrupt→Dialog handler installed
+  [P4] interrupt #1...
+  [P4] dialog #1 open — forcing dialogEval timeout then abort
+  [P4] calling session.abort()...
+  [P4] isDialogOpen after abort = false (waited 0ms)
+  [P4] starting fresh eval after abort + recovery...
+  [P4] interrupt #2 on fresh eval...
+  [P4] isDialogOpen after abort+recovery = false after 3022ms
+
+  [P4] SUMMARY:
+    dialog opened after abort+recovery = false
+  [P4] FAIL: abort() does NOT restore interrupt capability — kernel permanently degraded
+  [FAIL]  (5992 ms): abort() did not restore interrupt capability
+
+────────────────────────────────────────────────────────────────────────
+TEST  P5: closeAllDialogs() after stuck dialog → subsequent interrupt works
+  [setup] interrupt→Dialog handler installed
+  [P5] interrupt #1...
+  [P5] dialog #1 open — forcing timeout + closeAllDialogs
+  [P5] calling session.closeAllDialogs()...
+  [P5] isDialogOpen after closeAllDialogs = false
+  [P5] interrupt #2...
+  [P5] isDialogOpen after closeAllDialogs+recovery = true after 2812ms
+  [FAIL]  (9564 ms): TIMEOUT(4000ms): dialogEval post-close
+
+────────────────────────────────────────────────────────────────────────
+TEST  P6: Simulate Dynamic + n=RandomInteger[100]; Pause[5] — full scenario
+  [setup] interrupt→Dialog handler installed
+  [P6] starting n=RandomInteger[100]; Pause[5] ...
+  [P6] cycle 1: busy=true, sending interrupt...
+  [P6] cycle 1: dlgOpen=false after 2507ms
+  [P6] cycle 1: Pause[] ignored interrupt (no dialog in 2500ms)
+  [P6] cycle 2: busy=true, sending interrupt...
+  [P6] cycle 2: dlgOpen=true after 26ms
+  [P6] cycle 2: dialogEval error: TIMEOUT(8000ms): P6 dialogEval cycle 2
+  [P6] exitDialog attempt 1 failed: TIMEOUT(2000ms): exitDialog attempt 1
+  [P6] exitDialog attempt 2 failed: TIMEOUT(2000ms): exitDialog attempt 2
+  [P6] exitDialog attempt 3 failed: TIMEOUT(2000ms): exitDialog attempt 3
+  [P6] all exitDialog failed — aborting
+
+  [P6] waiting for Pause[5] to finish naturally...
+
+  [P6] SUMMARY:
+    Pause ignored interrupt    = true
+    Dialog read succeeded      = false
+    n value read               = null
+    CONCLUSION: Pause[5] completely blocks Dynamic updates — this is the observed bug
+  [PASS]  (31335 ms)
+
+════════════════════════════════════════════════════════════════════════
+RESULTS: 3 passed, 3 failed
+  ✗  P1: Pause[8] ignores interrupt → no dialog within 2500ms (15991ms)  → TIMEOUT(12000ms): P1 main eval
+  ✓  P2: Pause[0.3] loop — interrupt opens Dialog and dialogEval succeeds (10338ms)
+  ✓  P3: dialogEval timeout → kernel state after (CORE BUG ISOLATION) (29312ms)
+  ✗  P4: abort() after stuck dialog → subsequent interrupt works (5992ms)  → abort() did not restore interrupt capability
+  ✗  P5: closeAllDialogs() after stuck dialog → subsequent interrupt works (9564ms)  → TIMEOUT(4000ms): dialogEval post-close
+  ✓  P6: Simulate Dynamic + n=RandomInteger[100]; Pause[5] — full scenario (31335ms)
+════════════════════════════════════════════════════════════════════════
