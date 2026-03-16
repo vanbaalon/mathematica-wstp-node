@@ -1,5 +1,5 @@
 // =============================================================================
-// wstp-backend/src/addon.cc   (v0.6.6 — timer-never-exit, no dynAutoMode leak, rejectDialog MENUPKT)
+// wstp-backend/src/addon.cc   (v0.6.8 — subAuto routes via evalActive, not busy)
 //
 // Architecture:
 //   Execute()  runs on the libuv thread pool → does ALL blocking WSTP I/O,
@@ -313,7 +313,18 @@ static void drainDialogAbortResponse(WSLINK lp) {
             WSNewPacket(lp);
             return; // link reset — clean
         }
-        WSNewPacket(lp); // discard intermediate packet (ENDDLGPKT, MENUPKT, …)
+        // MENUPKT requires a response — the kernel waits for a string.
+        // Discarding it via WSNewPacket without responding would hang
+        // the kernel and corrupt the WSTP protocol for all future calls.
+        if (pkt == MENUPKT) {
+            WSNewPacket(lp);  // consume menu contents
+            WSPutString(lp, "a");  // abort
+            WSEndPacket(lp);
+            WSFlush(lp);
+            DiagLog("[drainAbort] MENUPKT — responded 'a'");
+            continue;
+        }
+        WSNewPacket(lp); // discard intermediate packet (ENDDLGPKT, TEXTPKT, …)
     }
 }
 
@@ -402,8 +413,8 @@ static void drainStalePackets(WSLINK lp, EvalOptions* opts) {
             const char* menuPrompt = nullptr; WSGetString(lp, &menuPrompt);
             if (menuPrompt) WSReleaseString(lp, menuPrompt);
             WSNewPacket(lp);
-            DiagLog("[Eval] drainStalePackets: stale MENUPKT type=" + std::to_string(menuType) + " — dismissing");
-            WSPutString(lp, "");
+            DiagLog("[Eval] drainStalePackets: stale MENUPKT type=" + std::to_string(menuType) + " — aborting");
+            WSPutString(lp, "a");  // abort — clean response to stale interrupt
             WSEndPacket(lp); WSFlush(lp);
         } else {
             WSNewPacket(lp);  // discard any other stale packet
@@ -450,6 +461,16 @@ static bool drainUntilEndDialog(WSLINK lp, int timeoutMs,
         if (pkt == 0 || pkt == ILLEGALPKT) {
             WSClearError(lp);
             return false;
+        }
+        // MENUPKT requires a response string; discarding without responding
+        // hangs the kernel and corrupts the WSTP link.
+        if (pkt == MENUPKT) {
+            WSNewPacket(lp);
+            WSPutString(lp, "a");  // abort — clean exit from dialog
+            WSEndPacket(lp);
+            WSFlush(lp);
+            DiagLog("[drainEndDlg] MENUPKT — responded 'a'");
+            continue;
         }
         WSNewPacket(lp);  // discard TEXTPKT, MESSAGEPKT, INPUTNAMEPKT, etc.
     }
@@ -2167,6 +2188,7 @@ public:
         bool evalInteractive = (item.interactiveOverride == -1)
                                 ? interactiveMode_
                                 : (item.interactiveOverride == 1);
+        evalActive_.store(true);
         workerReadingLink_.store(true, std::memory_order_release);
         auto* worker = new EvaluateWorker(
             std::move(item.deferred),
@@ -2175,7 +2197,7 @@ public:
             std::move(item.opts),
             abortFlag_,
             workerReadingLink_,
-            [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
+            [this]() { evalActive_.store(false); PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
             nextLine_.fetch_add(1),
             evalInteractive
         );
@@ -2185,6 +2207,16 @@ public:
     // Launch a lightweight EvaluateWorker that resolves with just the WExpr
     // (not a full EvalResult) — used by sub() when the session is idle.
     void StartSubIdleWorker(QueuedSubIdle item) {
+        // Stop ScheduledTask if still running from a previous dynAutoMode
+        // eval — its Dialog[] fires cause stale BEGINDLGPKTs that interfere
+        // with idle evals and strand autoExprQueue_ entries permanently.
+        if (dynTaskInstalledInterval_ > 0) {
+            item.expr = "Quiet[$wstpDynTaskStop=True;"
+                        "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
+                        "$wstpDynTaskStop=.;$wstpDynTask=.];" + item.expr;
+            dynTaskInstalledInterval_ = 0;
+            DiagLog("[sub-idle] prepending ScheduledTask stop");
+        }
         struct SubIdleWorker : public Napi::AsyncWorker {
             SubIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
                           std::atomic<bool>& workerReadingLink,
@@ -2242,13 +2274,23 @@ public:
         workerReadingLink_.store(true, std::memory_order_release);
         (new SubIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
                            workerReadingLink_,
-                           [this]() { busy_.store(false); MaybeStartNext(); }))->Queue();
+                           [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); }))->Queue();
     }
 
     // Launch a lightweight EvaluateWorker for one subWhenIdle() entry.
     // Identical to StartSubIdleWorker — reuses the same SubIdleWorker inner
     // class pattern; separated here so it can receive QueuedWhenIdle.
     void StartWhenIdleWorker(QueuedWhenIdle item) {
+        // Stop ScheduledTask if still running from a previous dynAutoMode
+        // eval — its Dialog[] fires cause stale BEGINDLGPKTs that interfere
+        // with idle evals and strand autoExprQueue_ entries permanently.
+        if (dynTaskInstalledInterval_ > 0) {
+            item.expr = "Quiet[$wstpDynTaskStop=True;"
+                        "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
+                        "$wstpDynTaskStop=.;$wstpDynTask=.];" + item.expr;
+            dynTaskInstalledInterval_ = 0;
+            DiagLog("[when-idle] prepending ScheduledTask stop");
+        }
         struct WhenIdleWorker : public Napi::AsyncWorker {
             WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
                            std::atomic<bool>& workerReadingLink,
@@ -2306,7 +2348,7 @@ public:
         workerReadingLink_.store(true, std::memory_order_release);
         (new WhenIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
                             workerReadingLink_,
-                            [this]() { busy_.store(false); MaybeStartNext(); }))->Queue();
+                            [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); }))->Queue();
     }
 
     // -----------------------------------------------------------------------
@@ -2428,8 +2470,12 @@ public:
             autoTsfnActive_.store(true);
         }
 
-        if (!busy_.load()) {
+        if (!evalActive_.load()) {
             // Idle path: forward to whenIdleQueue (same as subWhenIdle).
+            // Use evalActive_ (not busy_) so subAuto goes to idle path
+            // even when a WhenIdleWorker/SubIdleWorker holds busy_.
+            // The busy path requires Dialog[] from a running EvaluateWorker;
+            // WhenIdleWorker has no Dialog[] so autoExprQueue entries strand.
             DiagLog("[subAuto] idle path for expr='" + expr + "'");
             {
                 std::lock_guard<std::mutex> lk(queueMutex_);
@@ -3174,6 +3220,7 @@ private:
     std::atomic<int64_t>        nextLine_{1};      // 1-based In[n] counter for EvalResult.cellIndex
     std::atomic<bool>           abortFlag_{false};
     std::atomic<bool>           busy_{false};
+    std::atomic<bool>           evalActive_{false};  // true only during EvaluateWorker — subAuto uses this for routing
     // Set true before queuing a worker, set false from within Execute() (background
     // thread) right after DrainToEvalResult returns.  CleanUp() spins on this flag
     // rather than busy_ (which is cleared on the main thread and cannot be polled
@@ -3510,7 +3557,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
     // version — mirrors package.json "version"; read-only string constant.
-    exports.Set("version", Napi::String::New(env, "0.6.6"));
+    exports.Set("version", Napi::String::New(env, "0.6.8"));
     return exports;
 }
 

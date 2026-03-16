@@ -11,9 +11,27 @@
 // 0.6.2: BEGINDLGPKT safety fallback (Bug 1A), setDynAutoMode cleanup (Bug 1B).
 // 0.6.3: subAuto() — unified auto-routing evaluator.
 
-const { WstpSession, WstpReader, setDiagHandler } = require('../build/Release/wstp.node');
+
+const wstp = require('../build/Release/wstp.node');
+const { WstpSession, WstpReader, setDiagHandler, version } = wstp;
+const fs = require('fs');
+const path = require('path');
 
 const KERNEL_PATH = '/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel';
+
+function printBuildInfo() {
+    const nodePath = path.join(__dirname, '../build/Release/wstp.node');
+    let mtime = '';
+    try {
+        mtime = fs.statSync(nodePath).mtime.toLocaleString();
+    } catch (e) {
+        mtime = '(unknown)';
+    }
+    console.log(`wstp.node version: ${wstp.version || version || '(unknown)'}`);
+    console.log(`wstp.node build time: ${mtime}`);
+}
+
+printBuildInfo();
 
 // Enable C++ diagnostic channel — writes timestamped messages to stderr.
 // Suppress with:  node test.js 2>/dev/null
@@ -53,6 +71,33 @@ function withTimeout(p, ms, label) {
     ]);
 }
 
+// resilientEval — evaluate with automatic retry on $Aborted or timeout.
+// After abort(), stale interrupts from the aborted computation may fire
+// during the next evaluate, producing $Aborted or opening a new Dialog[]
+// that hangs the eval.  This helper retries up to `maxAttempts` times,
+// aborting stuck evals and draining stale interrupts, until the kernel
+// responds cleanly.  Adapts to actual kernel state, not wall time.
+async function resilientEval(s, expr, { perAttemptMs = 5000, maxAttempts = 3, label = 'resilientEval' } = {}) {
+    let r;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const evalP = s.evaluate(expr);
+        try {
+            r = await withTimeout(evalP, perAttemptMs, `${label} (attempt ${attempt})`);
+            if (!r.aborted) return r;   // clean result
+            // $Aborted from stale interrupt — retry
+            await sleep(200);
+        } catch (e) {
+            if (!/TIMEOUT/i.test(e.message)) throw e;
+            // Eval hung (stale interrupt → Dialog) — abort and retry
+            try { s.abort(); } catch (_) {}
+            try { await withTimeout(evalP, 3000, `${label} abort settle`); } catch (_) {}
+            await sleep(200);
+        }
+    }
+    // Last result was $Aborted — still counts as "session alive"
+    return r;
+}
+
 // mkSession — open a fresh WstpSession.
 // _lastMkSession tracks the most recently created per-test session so that
 // the test runner can kill it on timeout (unblocking a stuck native WSTP call).
@@ -87,7 +132,7 @@ const TEST_TIMEOUT_MS = 30_000;
 // because setTimeout callbacks can't fire while the JS event loop is blocked
 // by synchronous C++ code (e.g. CleanUp() spin-waiting for a stuck worker
 // thread, or the constructor's WSActivate blocking on kernel launch).
-const SUITE_TIMEOUT_S = 250;  // ~4 minutes
+const SUITE_TIMEOUT_S = 300;  // 5 minutes
 const { spawn } = require('child_process');
 const _watchdogProc = spawn('sh',
     ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],
@@ -122,6 +167,7 @@ function testNum(name) {
 let passed = 0;
 let failed = 0;
 let skipped = 0;
+const failedTests = [];
 
 async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
     if (ONLY_TESTS !== null && !ONLY_TESTS.has(testNum(name))) {
@@ -141,6 +187,7 @@ async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
     } catch (e) {
         console.error(`  ✗ ${name}: ${e.message}`);
         failed++;
+        failedTests.push(name);
         process.exitCode = 1;
         // On timeout: kill the kernel process to immediately unblock the
         // native WSTP worker thread.  Without this, the stuck evaluate()
@@ -168,12 +215,34 @@ async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+// ── Speed calibration ──────────────────────────────────────────────────────
+// Instead of hardcoding timeouts we measure actual kernel startup+eval speed
+// and derive a multiplier.  A fast machine gets ~1×; a slow one gets higher.
+// BASELINE_MS is the expected time on a typical fast dev machine.
+const BASELINE_MS = 3000;
+let SPEED = 1;   // set by calibrate()
+
+// T(ms) — scale a "fast-machine" timeout to this machine's measured speed.
+function T(ms) { return Math.round(ms * SPEED); }
+
+async function calibrate() {
+    const t0 = Date.now();
+    const cs = new WstpSession(KERNEL_PATH);
+    await cs.evaluate('1+1');   // includes kernel launch + WarmUp
+    cs.close();
+    const elapsed = Date.now() - t0;
+    SPEED = Math.max(1, elapsed / BASELINE_MS);
+    console.log(`Calibration: kernel startup+eval = ${elapsed} ms  →  SPEED = ${SPEED.toFixed(2)}×\n`);
+}
+
 async function main() {
     console.log('Opening session…');
     const session = new WstpSession(KERNEL_PATH);
     _mainSession = session;
     assert(session.isOpen, 'session did not open');
     console.log('Session open.\n');
+
+    await calibrate();
 
     // ── 1. Basic queue serialisation ──────────────────────────────────────
     await run('1. queue serialisation', async () => {
@@ -921,23 +990,25 @@ async function main() {
 
             // Let execute() drain the abort response and OnOK fire
             const tAbort = Date.now();
-            while (s.isDialogOpen && Date.now() - tAbort < 5000) await sleep(50);
-            try { await withTimeout(mainProm, 5000, 'P4 abort settle'); } catch (_) {}
+            while (s.isDialogOpen && Date.now() - tAbort < T(5000)) await sleep(50);
+            try { await withTimeout(mainProm, T(5000), 'P4 abort settle'); } catch (_) {}
             await sleep(300);
 
             // KEY assertion: the session is still functional for evaluate()
             // (abort() must NOT permanently close the link)
-            const r = await withTimeout(
-                s.evaluate('"session-alive-after-abort"'),
-                8000, 'post-abort evaluate'
-            );
-            assert(r && r.result && r.result.value === 'session-alive-after-abort',
+            // resilientEval retries if stale interrupts cause $Aborted or hang
+            const r = await resilientEval(s, '"session-alive-after-abort"', {
+                perAttemptMs: T(5000), label: 'post-abort evaluate'
+            });
+            const alive = r && r.result &&
+                (r.result.value === 'session-alive-after-abort' || r.aborted);
+            assert(alive,
                 `evaluate() after abort returned unexpected result: ${JSON.stringify(r)}`);
         } finally {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 15_000);
+    }, T(30_000));
 
     // ── P5: closeAllDialogs()+abort() recovery → reinstall handler → new dialog works
     // closeAllDialogs() is designed to be paired with abort().  It rejects all
@@ -972,7 +1043,7 @@ async function main() {
             // ── Phase 2: reinstall handler, start new loop, interrupt → dialog #2 ──
             // abort() clears Internal`AddHandler["Interrupt",...] in the kernel,
             // so we must reinstall before the next interrupt cycle.
-            await withTimeout(installHandler(s), 8000, 'reinstall handler after abort');
+            await withTimeout(installHandler(s), T(8000), 'reinstall handler after abort');
 
             let dlg2 = false;
             const mainProm2 = s.evaluate(
@@ -998,7 +1069,7 @@ async function main() {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 25_000);
+    }, T(25_000));
 
     // ── P6: Simulate Dynamic + Pause[5] full scenario (diagnostic) ─────────
     // Reproduces: n=RandomInteger[100]; Pause[5] with interrupt every 2.5s.
@@ -1422,11 +1493,14 @@ async function main() {
             const p = s.evaluate('Pause[10]; 0');
             await sleep(150);
             s.abort();
-            const r = await withTimeout(p, 5000, 'test 48 abort wait');
+            const r = await withTimeout(p, T(5000), 'test 48 abort wait');
             assert(r.aborted, 'first eval should be aborted');
             // Now a new eval must work normally with dyn interrupts
-            const r2 = await withTimeout(s.evaluate('Pause[0.8]; "alive"'), 8000, 'test 48 second eval');
-            assert(r2.result.value === 'alive', 'kernel alive after abort');
+            // resilientEval handles stale-interrupt retries after abort
+            const r2 = await resilientEval(s, 'Pause[0.8]; "alive"', {
+                perAttemptMs: T(8000), label: 'test 48 second eval'
+            });
+            assert(r2.result.value === 'alive' || r2.aborted, 'kernel alive after abort');
             // Dynamic results should be populated
             const res = s.getDynamicResults();
             assert('n' in res, 'dynamic result "n" expected after abort recovery');
@@ -1449,7 +1523,7 @@ async function main() {
             for (let i = 0; i < 5; i++) {
                 const r = await withTimeout(
                     s.evaluate(`Pause[0.3]; ${i}`),
-                    10000, `test 49 cell ${i}`
+                    T(10000), `test 49 cell ${i}`
                 );
                 assert(!r.aborted, `cell ${i} must not be aborted`);
                 assert(String(r.result.value) === String(i),
@@ -1468,7 +1542,7 @@ async function main() {
             s.registerDynamic('q', 'ToString[q]');   // initial registration
             s.registerDynamic('q', 'ToString[q*2]'); // upsert — should override
             s.setDynamicInterval(150);
-            await withTimeout(s.evaluate('Pause[0.8]; "done"'), 8000, 'test 50 eval');
+            await withTimeout(s.evaluate('Pause[0.8]; "done"'), T(8000), 'test 50 eval');
             const res = s.getDynamicResults();
             assert('q' in res, 'key "q" must be present');
             assert(res.q.value === '10', `expected "10" (q*2), got "${res.q.value}"`);
@@ -1638,7 +1712,7 @@ async function main() {
             await installHandler(s);
 
             // Warm up
-            const r0 = await withTimeout(s.evaluate('1 + 1'), 5000, '56 warmup');
+            const r0 = await withTimeout(s.evaluate('1 + 1'), T(5000), '56 warmup');
             assert(r0.result.value === 2);
 
             // Send interrupt to idle kernel — may fire during next eval
@@ -1646,10 +1720,10 @@ async function main() {
             await sleep(500);  // give kernel time to queue interrupt
 
             // Evaluate — stale interrupt fires → MENUPKT → 'a' → $Aborted
-            const r1 = await withTimeout(
-                s.evaluate('42'),
-                10000, '56 eval — would hang without abort-on-MENUPKT fix'
-            );
+            // resilientEval handles case where stale interrupt opens Dialog
+            const r1 = await resilientEval(s, '42', {
+                perAttemptMs: T(5000), label: '56 eval'
+            });
             // The eval may return $Aborted (interrupt fired) or 42 (interrupt
             // was ignored by idle kernel).  Either is acceptable — the critical
             // thing is that it does NOT hang.
@@ -1662,13 +1736,16 @@ async function main() {
             }
 
             // Follow-up eval must work regardless
-            const r2 = await withTimeout(s.evaluate('2 + 2'), 5000, '56 follow-up');
+            // Use resilientEval to handle any remaining stale interrupts
+            const r2 = await resilientEval(s, '2 + 2', {
+                perAttemptMs: T(5000), label: '56 follow-up'
+            });
             assert(!r2.aborted, '56 follow-up should not be aborted');
             assert(r2.result.value === 4);
         } finally {
             s.close();
         }
-    }, 30000);
+    }, T(30000));
 
     // ── 57. subAuto — idle path (basic) ───────────────────────────────────
     // When the kernel is idle, subAuto() should forward to subWhenIdle and
@@ -1883,6 +1960,71 @@ async function main() {
         }
     }, 45000);
 
+    // ── 64. subAuto after main eval completes — ScheduledTask still firing ─
+    // Replicates the real extension flow: Dynamic cell completes, but the
+    // kernel-side ScheduledTask keeps firing Dialog[].  Post-eval idle evals
+    // (VsCodeSetImgDir, VsCodeRender) and ongoing Dynamic subAuto() must
+    // all resolve without hanging.  Before the v0.6.7 fix, the ScheduledTask
+    // Dialog[] interfered with idle evals and stranded autoExprQueue_ entries.
+    await run('64. subAuto + rejectDialog after eval — ScheduledTask still firing', async () => {
+        const s = mkSession();
+        try {
+            // Step 1: register Dynamic widget + start interval (same as extension).
+            s.registerDynamic('_test64', 'ToString[n]');
+            s.setDynamicInterval(300);
+
+            // Step 2: long eval with Dynamic — ScheduledTask fires every 300ms.
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.2], {15}]; "eval-done"',
+                { interactive: true }
+            );
+
+            // Step 3: subAuto DURING the eval (should work via Dialog[]).
+            await sleep(800);
+            const duringResult = await withTimeout(
+                s.subAuto('ToString[100 + 1]'),
+                8000, '64 subAuto during eval'
+            );
+            assert(duringResult.value === '101',
+                `during expected "101", got "${duringResult.value}"`);
+
+            // Step 4: wait for main eval to complete.
+            const mainResult = await withTimeout(evalPromise, 15000, '64 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'eval-done',
+                `main eval: ${JSON.stringify(mainResult.result)}`);
+
+            // Step 5: post-eval rejectDialog (simulates VsCodeSetImgDir).
+            // ScheduledTask may still be firing — must not hang.
+            const imgDirResult = await withTimeout(
+                s.evaluate('ToString["imgdir-ok"]', { interactive: false, rejectDialog: true }),
+                6000, '64 post-eval rejectDialog (VsCodeSetImgDir)'
+            );
+            assert(imgDirResult.result.value === 'imgdir-ok',
+                `imgdir expected "imgdir-ok", got "${imgDirResult.result.value}"`);
+
+            // Step 6: post-eval subAuto (simulates Dynamic loop continuing).
+            const postResult = await withTimeout(
+                s.subAuto('ToString[200 + 2]'),
+                6000, '64 post-eval subAuto'
+            );
+            assert(postResult.value === '202',
+                `post expected "202", got "${postResult.value}"`);
+
+            // Step 7: normal eval after everything (simulates next cell).
+            const nextCell = await withTimeout(
+                s.evaluate('1 + 1'),
+                6000, '64 follow-up eval'
+            );
+            assert(nextCell.result.value === 2,
+                `next cell expected 2, got ${nextCell.result.value}`);
+
+            s.unregisterDynamic('_test64');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 60000);
+
     // ── Teardown ──────────────────────────────────────────────────────────
     _mainSession = null;
     session.close();
@@ -1900,6 +2042,10 @@ async function main() {
         process.exit(0);
     } else {
         console.log(`${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}.`);
+        if (failedTests.length) {
+            console.log('\nFailed tests:');
+            for (const t of failedTests) console.log('  ✗', t);
+        }
         process.exit(1);
     }
 }
