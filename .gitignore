@@ -13,3 +13,4 @@ node_modules/
 
 # Temporary / scratch files
 /tmp/
+*.bak

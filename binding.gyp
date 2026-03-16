@@ -8,7 +8,15 @@
   "targets": [
     {
       "target_name": "wstp",
-      "sources": ["src/addon.cc"],
+      "sources": [
+        "src/addon.cc",
+        "src/diag.cc",
+        "src/wstp_expr.cc",
+        "src/drain.cc",
+        "src/evaluate_worker.cc",
+        "src/wstp_session.cc",
+        "src/wstp_reader.cc"
+      ],
 
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",

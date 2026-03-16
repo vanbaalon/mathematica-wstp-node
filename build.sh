@@ -98,25 +98,38 @@ echo "WSTP SDK      : $WSTP_SDK"
 NODE_LIB="$(node -p "process.execPath")"
 echo "Node lib      : $NODE_LIB"
 
-# ── compile source ────────────────────────────────────────────────────────────
-SOURCE="$SCRIPT_DIR/src/addon.cc"
+# ── compile sources ───────────────────────────────────────────────────────────
+SOURCES=(
+    "$SCRIPT_DIR/src/addon.cc"
+    "$SCRIPT_DIR/src/diag.cc"
+    "$SCRIPT_DIR/src/wstp_expr.cc"
+    "$SCRIPT_DIR/src/drain.cc"
+    "$SCRIPT_DIR/src/evaluate_worker.cc"
+    "$SCRIPT_DIR/src/wstp_session.cc"
+    "$SCRIPT_DIR/src/wstp_reader.cc"
+)
 
-echo ""
-echo "Compiling $SOURCE …"
-
-clang++ \
-    -std=c++17 \
-    "${OPT_FLAGS[@]}" \
-    -Wall -Wextra \
-    -fPIC \
-    -fvisibility=hidden \
-    -DBUILDING_NODE_EXTENSION \
-    -DNAPI_DISABLE_CPP_EXCEPTIONS \
-    -I "$NODE_HEADERS" \
-    -I "$NAPI_INCLUDE" \
-    -I "$WSTP_SDK" \
-    -c "$SOURCE" \
-    -o "$OUT_DIR/addon.o"
+OBJECTS=()
+for SRC in "${SOURCES[@]}"; do
+    BASE="$(basename "$SRC" .cc)"
+    OBJ="$OUT_DIR/${BASE}.o"
+    OBJECTS+=("$OBJ")
+    echo "Compiling $SRC …"
+    clang++ \
+        -std=c++17 \
+        "${OPT_FLAGS[@]}" \
+        -Wall -Wextra \
+        -fPIC \
+        -fvisibility=hidden \
+        -DBUILDING_NODE_EXTENSION \
+        -DNAPI_DISABLE_CPP_EXCEPTIONS \
+        -I "$NODE_HEADERS" \
+        -I "$NAPI_INCLUDE" \
+        -I "$WSTP_SDK" \
+        -I "$SCRIPT_DIR/src" \
+        -c "$SRC" \
+        -o "$OBJ"
+done
 
 echo "Linking $OUTPUT …"
 
@@ -124,7 +137,7 @@ clang++ \
     -dynamiclib \
     -undefined dynamic_lookup \
     -o "$OUTPUT" \
-    "$OUT_DIR/addon.o" \
+    "${OBJECTS[@]}" \
     "$WSTP_SDK/libWSTPi4.a" \
     -framework Foundation \
     -framework SystemConfiguration \
