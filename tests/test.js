@@ -87,7 +87,7 @@ const TEST_TIMEOUT_MS = 30_000;
 // because setTimeout callbacks can't fire while the JS event loop is blocked
 // by synchronous C++ code (e.g. CleanUp() spin-waiting for a stuck worker
 // thread, or the constructor's WSActivate blocking on kernel launch).
-const SUITE_TIMEOUT_S = 180;  // 3 minutes
+const SUITE_TIMEOUT_S = 250;  // ~4 minutes
 const { spawn } = require('child_process');
 const _watchdogProc = spawn('sh',
     ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],

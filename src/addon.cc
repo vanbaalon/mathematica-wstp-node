@@ -1,5 +1,5 @@
 // =============================================================================
-// wstp-backend/src/addon.cc   (v0.6.3 — subAuto auto-routing evaluator)
+// wstp-backend/src/addon.cc   (v0.6.4 — stale-drain, timer+MENUPKT for subAuto)
 //
 // Architecture:
 //   Execute()  runs on the libuv thread pool → does ALL blocking WSTP I/O,
@@ -1061,11 +1061,19 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 continue;
             }
 
-            // ---- dynAutoMode: C++-internal Dynamic evaluation ---------------
-            // When dynAutoMode is true, all registered Dynamic expressions are
+            // ---- dynAutoMode / subAuto: C++-internal inline evaluation -------
+            // Enter this block when:
+            //   (a) dynAutoMode is true (Dynamic widgets active), OR
+            //   (b) autoExprQueue has pending subAuto entries (⌥⇧↵ during busy)
+            // All registered Dynamic expressions + pending subAuto entries are
             // evaluated inline inside the dialog — no JS roundtrip needed.
             // The dialog is then closed unconditionally with Return[$Failed].
-            if (!opts || opts->dynAutoMode) {
+            bool hasAutoEntries = false;
+            if (opts && opts->autoMutex && opts->autoExprQueue) {
+                std::lock_guard<std::mutex> lk(*opts->autoMutex);
+                hasAutoEntries = !opts->autoExprQueue->empty();
+            }
+            if (!opts || opts->dynAutoMode || hasAutoEntries) {
                 // Check if aborted before entering evaluation.
                 if (opts && opts->abortFlag && opts->abortFlag->load()) {
                     if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
@@ -1496,7 +1504,15 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             // the kernel never sends RETURNPKT.  Aborting cleanly produces
             // $Aborted and keeps the session alive.
             // For non-interrupt menus (type != 1), 'c' is still safe.
+            // Respond 'i' (inspect → Dialog[]) when:
+            //   - Legacy dialog path: dynAutoMode=false + hasOnDialogBegin
+            //   - subAuto busy path: autoExprQueue has pending entries
+            //     (dynAutoMode handler will process them and auto-close)
             bool wantInspect = opts && !opts->dynAutoMode && opts->hasOnDialogBegin;
+            if (!wantInspect && opts && opts->autoMutex && opts->autoExprQueue) {
+                std::lock_guard<std::mutex> lk(*opts->autoMutex);
+                if (!opts->autoExprQueue->empty()) wantInspect = true;
+            }
             const char* resp;
             if (wantInspect) {
                 resp = "i";
@@ -1637,7 +1653,7 @@ public:
         // Install a kernel-side ScheduledTask that calls Dialog[] periodically.
         // Only install when:
         //   (a) dynAutoMode is active
-        //   (b) there are registered Dynamic expressions
+        //   (b) there are registered Dynamic expressions OR pending subAuto entries
         //   (c) interval > 0
         //   (d) the currently installed task has a DIFFERENT interval (or none)
         //
@@ -1652,6 +1668,11 @@ public:
             if (opts_.dynMutex && opts_.dynRegistry) {
                 std::lock_guard<std::mutex> lk(*opts_.dynMutex);
                 hasRegs = !opts_.dynRegistry->empty();
+            }
+            // Also install if subAuto entries are pending (⌥⇧↵ without Dynamic widget).
+            if (!hasRegs && opts_.autoMutex && opts_.autoExprQueue) {
+                std::lock_guard<std::mutex> lk(*opts_.autoMutex);
+                hasRegs = !opts_.autoExprQueue->empty();
             }
 
             int installedInterval = opts_.dynTaskInstalledInterval
@@ -2171,6 +2192,13 @@ public:
                   workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
 
             void Execute() override {
+                // Drain stale ScheduledTask Dialog[] packets before sending
+                // our EvaluatePacket — otherwise, the kernel processes our
+                // packet inside the stale Dialog[] context and hangs.
+                if (WSReady(lp_)) {
+                    DiagLog("[sub-idle] pre-eval: stale data on link — draining");
+                    drainStalePackets(lp_, nullptr);
+                }
                 if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
                     !WSPutFunction(lp_, "ToExpression",   1) ||
                     !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
@@ -2228,6 +2256,13 @@ public:
                   workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
 
             void Execute() override {
+                // Drain stale ScheduledTask Dialog[] packets before sending
+                // our EvaluatePacket — otherwise, the kernel processes our
+                // packet inside the stale Dialog[] context and hangs.
+                if (WSReady(lp_)) {
+                    DiagLog("[when-idle] pre-eval: stale data on link — draining");
+                    drainStalePackets(lp_, nullptr);
+                }
                 if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
                     !WSPutFunction(lp_, "ToExpression",   1) ||
                     !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
@@ -2916,18 +2951,36 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms > 0 ? ms : 100));
                 if (!open_) break;
                 if (!busy_.load()) continue;                      // kernel idle
+                bool hasDynRegs = false;
                 {
                     std::lock_guard<std::mutex> lk(dynMutex_);
-                    if (dynRegistry_.empty()) continue;           // nothing registered
+                    hasDynRegs = !dynRegistry_.empty();
                 }
+                bool hasAutoEntries = false;
+                {
+                    std::lock_guard<std::mutex> lk(autoMutex_);
+                    hasAutoEntries = !autoExprQueue_.empty();
+                }
+                if (!hasDynRegs && !hasAutoEntries) continue;     // nothing to do
                 if (dynIntervalMs_.load() == 0) break;
                 // Check enough time has elapsed since last eval.
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - dynLastEval_).count();
                 if (elapsed < dynIntervalMs_.load()) continue;
 
-                if (workerReadingLink_.load() && !dialogOpen_.load() && !dynAutoMode_.load()) {
-                    WSPutMessage(lp_, WSInterruptMessage);
+                if (workerReadingLink_.load() && !dialogOpen_.load()) {
+                    // Decide whether to send an interrupt:
+                    //  - dynAutoMode=false + hasDynRegs: legacy Dynamic path (no ScheduledTask)
+                    //  - hasAutoEntries + no ScheduledTask: subAuto needs Dialog[] via interrupt
+                    // When ScheduledTask IS installed (dynAutoMode=true + hasDynRegs),
+                    // Dialog[] fires from the kernel side — no interrupt needed.
+                    bool taskInstalled = dynAutoMode_.load() && (dynTaskInstalledInterval_ > 0);
+                    bool needInterrupt = false;
+                    if (!dynAutoMode_.load() && hasDynRegs) needInterrupt = true;
+                    if (hasAutoEntries && !taskInstalled) needInterrupt = true;
+                    if (needInterrupt) {
+                        WSPutMessage(lp_, WSInterruptMessage);
+                    }
                 }
             }
             dynTimerRunning_.store(false);
