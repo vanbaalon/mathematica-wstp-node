@@ -2337,6 +2337,8 @@ public:
         int ms = static_cast<int>(info[0].As<Napi::Number>().Int32Value());
         if (ms < 0) ms = 0;
         int prev = dynIntervalMs_.exchange(ms);
+        // Auto-enable dynAutoMode when interval > 0, auto-disable when 0.
+        dynAutoMode_.store(ms > 0);
         // Start timer thread if transitioning from 0 to non-zero.
         if (prev == 0 && ms > 0 && !dynTimerRunning_.load()) {
             StartDynTimer();
@@ -2717,7 +2719,7 @@ private:
     std::vector<DynRegistration>          dynRegistry_;        // registered exprs
     std::vector<DynResult>                dynResults_;         // accumulated results (swapped on getDynamicResults)
     std::atomic<int>                      dynIntervalMs_{0};   // 0 = disabled
-    std::atomic<bool>                     dynAutoMode_{true};  // true = inline C++ path; false = legacy JS path
+    std::atomic<bool>                     dynAutoMode_{false}; // true = inline C++ path; false = legacy JS path
     int                                   dynTaskInstalledInterval_{0}; // interval of currently installed ScheduledTask (0 = none)
     std::chrono::steady_clock::time_point dynLastEval_{};      // time of last successful dialog eval
     std::thread                           dynTimerThread_;

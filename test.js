@@ -735,8 +735,7 @@ async function main() {
 
             let evalDone = false;
             const mainProm = s.evaluate(
-                'pP1 = 0; Pause[8]; pP1 = 1; "p1-done"',
-                { onDialogBegin: () => {}, onDialogEnd: () => {} }
+                'pP1 = 0; Pause[8]; pP1 = 1; "p1-done"'
             ).then(() => { evalDone = true; });
 
             await sleep(300);
