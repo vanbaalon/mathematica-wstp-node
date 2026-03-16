@@ -1,15 +1,17 @@
 'use strict';
 
-// ── Test suite for wstp-backend v0.6.2 ────────────────────────────────────
+// ── Test suite for wstp-backend v0.6.3 ────────────────────────────────────
 // Covers: evaluation queue, streaming callbacks, sub() priority, abort
 //         behaviour, WstpReader side-channel, edge cases, Dialog[] subsession
 //         (dialogEval, exitDialog, isDialogOpen, onDialogBegin/End/Print),
 //         subWhenIdle() (background queue, timeout, close rejection), kernelPid,
 //         Dynamic eval API (registerDynamic, getDynamicResults, setDynamicInterval,
-//         setDynAutoMode, dynamicActive, rejectDialog, abort deduplication).
+//         setDynAutoMode, dynamicActive, rejectDialog, abort deduplication),
+//         subAuto() (auto-routing: idle→subWhenIdle, busy→Dialog[] inline eval).
 // 0.6.2: BEGINDLGPKT safety fallback (Bug 1A), setDynAutoMode cleanup (Bug 1B).
+// 0.6.3: subAuto() — unified auto-routing evaluator.
 
-const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wstp.node');
+const { WstpSession, WstpReader, setDiagHandler } = require('../build/Release/wstp.node');
 
 const KERNEL_PATH = '/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel';
 
@@ -1667,6 +1669,145 @@ async function main() {
             s.close();
         }
     }, 30000);
+
+    // ── 57. subAuto — idle path (basic) ───────────────────────────────────
+    // When the kernel is idle, subAuto() should forward to subWhenIdle and
+    // resolve with the evaluation result.
+    await run('57. subAuto — idle path resolves correctly', async () => {
+        const s = mkSession();
+        try {
+            const r = await withTimeout(s.subAuto('ToString[1 + 1]'), 10000, '57 idle subAuto');
+            assert(r.type === 'string', `expected string type, got ${r.type}`);
+            assert(r.value === '2', `expected "2", got "${r.value}"`);
+
+            // Follow-up: another idle subAuto.
+            const r2 = await withTimeout(s.subAuto('ToString[6 * 7]'), 10000, '57 idle subAuto 2');
+            assert(r2.value === '42', `expected "42", got "${r2.value}"`);
+        } finally {
+            s.close();
+        }
+    });
+
+    // ── 58. subAuto — busy path via Dialog[] ──────────────────────────────
+    // When the kernel is busy (Do[Pause[...], ...]), subAuto() should queue
+    // the expression for evaluation in the next ScheduledTask Dialog[] cycle
+    // and resolve with the result DURING the busy eval.
+    await run('58. subAuto — busy path resolves during active eval', async () => {
+        const s = mkSession();
+        try {
+            // Enable dynAutoMode and ScheduledTask BEFORE starting the eval,
+            // so the ScheduledTask is installed inside Execute() and Dialog[]
+            // fires periodically during the busy eval.
+            s.registerDynamic('_test58', 'ToString[1]');
+            s.setDynamicInterval(300);
+
+            // Start a long-running eval (interactive mode for Dialog[] support).
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.2], {30}]; "cell-done"',
+                { interactive: true }
+            );
+
+            // Wait for eval to become busy.
+            await sleep(800);
+            assert(!s.isReady, 'kernel should be busy');
+
+            // subAuto should evaluate via Dialog[] while kernel is busy.
+            const r = await withTimeout(
+                s.subAuto('ToString[100 + 23]'),
+                8000, '58 subAuto during busy'
+            );
+            assert(r.value === '123', `expected "123", got "${r.value}"`);
+
+            // Wait for main eval to complete.
+            const mainResult = await withTimeout(evalPromise, 15000, '58 main eval');
+            assert(!mainResult.aborted, 'main eval should not be aborted');
+            assert(mainResult.result.value === 'cell-done',
+                `main eval expected "cell-done", got "${mainResult.result.value}"`);
+
+            // Cleanup
+            s.unregisterDynamic('_test58');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
+    // ── 59. subAuto — multiple calls during busy eval ─────────────────────
+    // Multiple subAuto() calls queued while busy should all resolve.
+    await run('59. subAuto — multiple calls during busy eval', async () => {
+        const s = mkSession();
+        try {
+            // Enable dynAutoMode before eval.
+            s.registerDynamic('_test59', 'ToString[1]');
+            s.setDynamicInterval(300);
+
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.2], {40}]; "multi-done"',
+                { interactive: true }
+            );
+            await sleep(800);
+            assert(!s.isReady, 'kernel should be busy');
+
+            // Queue 3 subAuto calls.
+            const [r1, r2, r3] = await withTimeout(
+                Promise.all([
+                    s.subAuto('ToString[10]'),
+                    s.subAuto('ToString[20]'),
+                    s.subAuto('ToString[30]'),
+                ]),
+                12000, '59 multiple subAuto'
+            );
+            assert(r1.value === '10', `r1 expected "10", got "${r1.value}"`);
+            assert(r2.value === '20', `r2 expected "20", got "${r2.value}"`);
+            assert(r3.value === '30', `r3 expected "30", got "${r3.value}"`);
+
+            const mainResult = await withTimeout(evalPromise, 15000, '59 main eval');
+            assert(!mainResult.aborted);
+
+            s.unregisterDynamic('_test59');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
+    // ── 60. subAuto — busy-to-idle promotion ──────────────────────────────
+    // If subAuto is called just as the eval finishes (busy→idle transition),
+    // pending entries should be promoted to whenIdleQueue and resolve normally.
+    await run('60. subAuto — busy-to-idle promotion', async () => {
+        const s = mkSession();
+        try {
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.1], {5}]; "short-done"',
+                { interactive: true }
+            );
+
+            // Brief pause, then queue subAuto — eval may finish before Dialog[] fires.
+            await sleep(200);
+            const r = await withTimeout(
+                s.subAuto('ToString[99]'),
+                10000, '60 subAuto promotion'
+            );
+            assert(r.value === '99', `expected "99", got "${r.value}"`);
+
+            await withTimeout(evalPromise, 10000, '60 main eval');
+        } finally {
+            s.close();
+        }
+    }, 30000);
+
+    // ── 61. subAuto — rejects after session close ─────────────────────────
+    await run('61. subAuto — rejects after session close', async () => {
+        const s = mkSession();
+        s.close();
+        try {
+            await s.subAuto('ToString[1]');
+            assert(false, 'should have rejected');
+        } catch (e) {
+            assert(/closed/i.test(e.message),
+                `expected "closed" error, got: ${e.message}`);
+        }
+    });
 
     // ── Teardown ──────────────────────────────────────────────────────────
     _mainSession = null;

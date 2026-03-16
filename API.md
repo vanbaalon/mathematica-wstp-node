@@ -21,6 +21,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
    - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
    - [`subWhenIdle(expr, opts?)`](#subwhenidleexpr-opts) — background evaluation that runs only when the kernel is fully idle
+   - [`subAuto(expr)`](#subautoexpr) — auto-routing evaluator: idle→`subWhenIdle`, busy→Dialog[] inline eval
    - [`abort()`](#abort) — interrupt the currently running evaluation
    - [`closeAllDialogs()`](#closealldialogs) — immediately reject all pending dialog promises and reset dialog state
    - [`dialogEval(expr)`](#dialogevalexpr) — evaluate inside an active `Dialog[]` subsession
@@ -272,6 +273,47 @@ const result = await session.subWhenIdle('SomeHeavyQuery[]', { timeout: 5000 });
 session.subWhenIdle('Names["Global`*"]').then(names => {
     updateSymbolColors(names);
 }).catch(() => { /* session closed or timed out */ });
+```
+
+---
+
+### `subAuto(expr)`
+
+```ts
+session.subAuto(expr: string): Promise<WExpr>
+```
+
+Auto-routing evaluator that transparently chooses the best evaluation path based on
+the kernel's current state:
+
+| Kernel state | Path used | Latency |
+|-------------|-----------|---------|
+| **Idle** | `subWhenIdle` — evaluates immediately via the lowest-priority queue | ~instant |
+| **Busy** | Dialog[] inline eval — evaluates inside the next ScheduledTask `Dialog[]` cycle | ~300ms (configurable via `setDynamicInterval`) |
+
+Use this for **Dynamic widget updates** and **live-watch expressions** that need to
+evaluate regardless of whether the kernel is running a cell. The caller never needs to
+check `isReady` or manage `registerDynamic` / `getDynamicResults` — C++ handles the routing.
+
+**Busy path prerequisites:** For inline Dialog[] evaluation during a busy cell, the
+ScheduledTask mechanism must be active. Call `setDynamicInterval(ms)` **before** the
+cell eval starts (this is done automatically by the extension's Dynamic widget setup).
+
+**Busy→idle promotion:** If the main evaluation finishes before the ScheduledTask fires,
+any pending `subAuto()` entries are automatically promoted to the `subWhenIdle` queue
+and resolve normally once the kernel is idle.
+
+```js
+// Works whether kernel is idle or busy:
+const r = await session.subAuto('ToString[n]');
+console.log(r.value);  // current value of n
+
+// Dynamic update pattern (inside a polling loop):
+while (widgetActive) {
+    const result = await session.subAuto('ToString[myDynamicVar]');
+    renderWidget(result.value);
+    await sleep(300);
+}
 ```
 
 ---

@@ -1,5 +1,5 @@
 // =============================================================================
-// wstp-backend/src/addon.cc   (v6 — dialog subsession support)
+// wstp-backend/src/addon.cc   (v0.6.3 — subAuto auto-routing evaluator)
 //
 // Architecture:
 //   Execute()  runs on the libuv thread pool → does ALL blocking WSTP I/O,
@@ -20,12 +20,14 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <signal.h>   // kill(), SIGTERM
@@ -106,6 +108,21 @@ struct DynResult {
     std::string error;             // non-empty if evaluation failed
 };
 
+// ---------------------------------------------------------------------------
+// subAuto() — one-shot auto-routing evaluation types.
+// When the kernel is busy, these are evaluated inline inside the next
+// ScheduledTask Dialog[]; when idle, they fall through to subWhenIdle.
+// ---------------------------------------------------------------------------
+struct AutoExprEntry {
+    size_t      id;
+    std::string expr;
+};
+struct AutoResultEntry {
+    size_t      id;
+    std::string value;
+    std::string error;
+};
+
 struct EvalOptions {
     Napi::ThreadSafeFunction onPrint;         // fires once per Print[] line
     Napi::ThreadSafeFunction onMessage;       // fires once per kernel message
@@ -135,6 +152,14 @@ struct EvalOptions {
     bool         dynAutoMode       = true;   // mirrors dynAutoMode_ at time of queue dispatch
     int          dynIntervalMs     = 0;      // mirrors dynIntervalMs_ at time of queue dispatch
     int*         dynTaskInstalledInterval = nullptr; // non-owning; tracks installed ScheduledTask interval
+    // subAuto() — one-shot inline Dialog[] evaluations.
+    // Pointers wired by Evaluate() so DrainToEvalResult can evaluate
+    // pending subAuto() entries inside BEGINDLGPKT alongside dynRegistry.
+    std::mutex*                       autoMutex        = nullptr;
+    std::deque<AutoExprEntry>*        autoExprQueue    = nullptr;
+    std::vector<AutoResultEntry>*     autoCompleted    = nullptr;
+    Napi::ThreadSafeFunction*         autoResolverTsfn = nullptr;
+    std::atomic<bool>*                autoTsfnActive   = nullptr;
     CompleteCtx* ctx               = nullptr;  // non-owning; set when TSFNs are in use
 
     // Pointers to session's dialog queue — set by WstpSession::Evaluate() so the
@@ -1153,6 +1178,70 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                     }
                 }
 
+                // ---- Process one-shot subAuto() entries (dialog still open) ----
+                if (opts && opts->autoMutex && opts->autoExprQueue && opts->autoCompleted) {
+                    std::lock_guard<std::mutex> aLk(*opts->autoMutex);
+                    while (!opts->autoExprQueue->empty()) {
+                        auto entry = std::move(opts->autoExprQueue->front());
+                        opts->autoExprQueue->pop_front();
+
+                        DiagLog("[Eval] dynAutoMode(BEGINDLG): subAuto id=" +
+                                std::to_string(entry.id) + " expr='" + entry.expr + "'");
+                        bool sentAuto =
+                            WSPutFunction(lp, "EnterTextPacket", 1) &&
+                            WSPutUTF8String(lp,
+                                reinterpret_cast<const unsigned char*>(entry.expr.c_str()),
+                                static_cast<int>(entry.expr.size())) &&
+                            WSEndPacket(lp) && WSFlush(lp);
+
+                        if (!sentAuto) {
+                            opts->autoCompleted->push_back({entry.id, "", "failed to send expression"});
+                        } else {
+                            DynResult dr;
+                            readDynResultWithTimeout(lp, dr, 2000, &capturedOuterResult);
+                            opts->autoCompleted->push_back({entry.id, dr.value, dr.error});
+                        }
+                        // If the outer eval's result arrived, stop processing.
+                        bool autoOuterCaptured =
+                            capturedOuterResult.kind != WExpr::WError ||
+                            !capturedOuterResult.strVal.empty();
+                        if (autoOuterCaptured) break;
+                        if (opts->abortFlag && opts->abortFlag->load()) break;
+                    }
+                    // Signal main thread to resolve pending subAuto deferreds.
+                    if (!opts->autoCompleted->empty() &&
+                        opts->autoTsfnActive && opts->autoTsfnActive->load()) {
+                        opts->autoResolverTsfn->NonBlockingCall(
+                            [](Napi::Env, Napi::Function fn) { fn.Call({}); });
+                    }
+                }
+
+                // Check if the outer eval was captured during autoQueue processing.
+                {
+                    bool outerCapturedInAuto =
+                        capturedOuterResult.kind != WExpr::WError ||
+                        !capturedOuterResult.strVal.empty();
+                    if (outerCapturedInAuto) {
+                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured during subAuto — returning directly");
+                        {
+                            const char* closeExpr = "Return[$Failed]";
+                            WSPutFunction(lp, "EnterTextPacket", 1);
+                            WSPutUTF8String(lp,
+                                reinterpret_cast<const unsigned char*>(closeExpr),
+                                static_cast<int>(std::strlen(closeExpr)));
+                            WSEndPacket(lp);
+                            WSFlush(lp);
+                        }
+                        drainUntilEndDialog(lp, 3000);
+                        r.result = std::move(capturedOuterResult);
+                        if (r.result.kind == WExpr::Symbol &&
+                            stripCtx(r.result.strVal) == "$Aborted")
+                            r.aborted = true;
+                        drainStalePackets(lp, opts);
+                        return r;
+                    }
+                }
+
                 // Close the dialog: send Return[$Failed] then drain ENDDLGPKT.
                 {
                     const char* closeExpr = "Return[$Failed]";
@@ -1767,6 +1856,7 @@ public:
             InstanceMethod<&WstpSession::Evaluate>        ("evaluate"),
             InstanceMethod<&WstpSession::Sub>             ("sub"),
             InstanceMethod<&WstpSession::SubWhenIdle>     ("subWhenIdle"),
+            InstanceMethod<&WstpSession::SubAuto>         ("subAuto"),
             InstanceMethod<&WstpSession::DialogEval>      ("dialogEval"),
             InstanceMethod<&WstpSession::ExitDialog>      ("exitDialog"),
             InstanceMethod<&WstpSession::Interrupt>       ("interrupt"),
@@ -1967,6 +2057,13 @@ public:
         opts.dynAutoMode   = dynAutoMode_.load();
         opts.dynIntervalMs = dynIntervalMs_.load();
         opts.dynTaskInstalledInterval = &dynTaskInstalledInterval_;
+        // Wire up subAuto() pointers so DrainToEvalResult can evaluate
+        // pending one-shot subAuto() entries inside BEGINDLGPKT.
+        opts.autoMutex        = &autoMutex_;
+        opts.autoExprQueue    = &autoExprQueue_;
+        opts.autoCompleted    = &autoCompleted_;
+        opts.autoResolverTsfn = &autoResolverTsfn_;
+        opts.autoTsfnActive   = &autoTsfnActive_;
 
         {
             std::lock_guard<std::mutex> lk(queueMutex_);
@@ -2055,7 +2152,7 @@ public:
             std::move(item.opts),
             abortFlag_,
             workerReadingLink_,
-            [this]() { busy_.store(false); MaybeStartNext(); },
+            [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
             nextLine_.fetch_add(1),
             evalInteractive
         );
@@ -2251,6 +2348,132 @@ public:
         }
         MaybeStartNext();
         return promise;
+    }
+
+    // -----------------------------------------------------------------------
+    // subAuto(expr) → Promise<WExpr>
+    //
+    // Auto-routing evaluator: when idle, evaluates via the subWhenIdle path;
+    // when busy, evaluates inline inside the next ScheduledTask Dialog[] cycle.
+    // Callers never need to check busy/idle — C++ handles the routing.
+    //
+    // Results are delivered as resolved/rejected Promises with a WExpr value
+    // (same format as subWhenIdle: {type:"string", value:"..."}).
+    // -----------------------------------------------------------------------
+    Napi::Value SubAuto(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        auto deferred = Napi::Promise::Deferred::New(env);
+        auto promise  = deferred.Promise();
+
+        if (!open_) {
+            deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
+            return promise;
+        }
+        if (info.Length() < 1 || !info[0].IsString()) {
+            deferred.Reject(Napi::TypeError::New(env,
+                "subAuto(expr: string)").Value());
+            return promise;
+        }
+        std::string expr = info[0].As<Napi::String>().Utf8Value();
+
+        // Lazy-init the auto-resolver TSFN on first subAuto() call.
+        // The TSFN fires a bound callback on the main thread that drains
+        // completed results and resolves the corresponding deferreds.
+        if (!autoTsfnActive_.load()) {
+            auto resolver = Napi::Function::New(env,
+                [](const Napi::CallbackInfo& cbInfo) {
+                    auto* self = static_cast<WstpSession*>(cbInfo.Data());
+                    self->DrainAutoResults(cbInfo.Env());
+                }, "autoResolver", this);
+            autoResolverTsfn_ = Napi::ThreadSafeFunction::New(
+                env, resolver, "subAutoResolver", 0, 1);
+            autoResolverTsfn_.Unref(env);  // don't keep event loop alive
+            autoTsfnActive_.store(true);
+        }
+
+        if (!busy_.load()) {
+            // Idle path: forward to whenIdleQueue (same as subWhenIdle).
+            DiagLog("[subAuto] idle path for expr='" + expr + "'");
+            {
+                std::lock_guard<std::mutex> lk(queueMutex_);
+                whenIdleQueue_.push(QueuedWhenIdle{
+                    std::move(expr), std::move(deferred),
+                    std::chrono::steady_clock::time_point::max() });
+            }
+            MaybeStartNext();
+        } else {
+            // Busy path: queue for evaluation in the next Dialog[] cycle.
+            size_t id = autoNextId_.fetch_add(1);
+            DiagLog("[subAuto] busy path id=" + std::to_string(id) +
+                    " expr='" + expr + "'");
+            {
+                std::lock_guard<std::mutex> lk(autoMutex_);
+                autoExprQueue_.push_back({id, std::move(expr)});
+            }
+            autoDeferreds_.emplace(id, std::move(deferred));
+
+            // Ensure dynAutoMode and ScheduledTask timer are active so the
+            // Dialog[] mechanism fires and our expression gets evaluated.
+            if (!dynAutoMode_.load()) dynAutoMode_.store(true);
+            if (dynIntervalMs_.load() == 0) {
+                dynIntervalMs_.store(300);
+                if (!dynTimerRunning_.load()) StartDynTimer();
+            }
+        }
+        return promise;
+    }
+
+    // -----------------------------------------------------------------------
+    // DrainAutoResults — resolve pending subAuto deferreds on the main thread.
+    // Called from the auto-resolver TSFN callback (main thread only).
+    // -----------------------------------------------------------------------
+    void DrainAutoResults(Napi::Env env) {
+        std::vector<AutoResultEntry> results;
+        {
+            std::lock_guard<std::mutex> lk(autoMutex_);
+            results.swap(autoCompleted_);
+        }
+        for (auto& ar : results) {
+            auto it = autoDeferreds_.find(ar.id);
+            if (it == autoDeferreds_.end()) continue;
+            if (ar.error.empty()) {
+                auto obj = Napi::Object::New(env);
+                obj.Set("type",  Napi::String::New(env, "string"));
+                obj.Set("value", Napi::String::New(env, ar.value));
+                it->second.Resolve(obj);
+            } else {
+                it->second.Reject(Napi::Error::New(env, ar.error).Value());
+            }
+            autoDeferreds_.erase(it);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PromoteAutoToWhenIdle — move any pending subAuto entries that were not
+    // evaluated during the busy cycle into the whenIdleQueue so they run
+    // normally once the kernel is free.  Called on busy→idle transition.
+    // -----------------------------------------------------------------------
+    void PromoteAutoToWhenIdle() {
+        std::deque<AutoExprEntry> remaining;
+        {
+            std::lock_guard<std::mutex> lk(autoMutex_);
+            remaining.swap(autoExprQueue_);
+        }
+        if (remaining.empty()) return;
+        DiagLog("[subAuto] promoting " + std::to_string(remaining.size()) +
+                " pending entries to whenIdleQueue");
+        std::lock_guard<std::mutex> qlk(queueMutex_);
+        for (auto& entry : remaining) {
+            auto it = autoDeferreds_.find(entry.id);
+            if (it != autoDeferreds_.end()) {
+                whenIdleQueue_.push(QueuedWhenIdle{
+                    std::move(entry.expr),
+                    std::move(it->second),
+                    std::chrono::steady_clock::time_point::max()
+                });
+                autoDeferreds_.erase(it);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2717,6 +2940,21 @@ private:
         dynIntervalMs_.store(0);
         dynTimerRunning_.store(false);
 
+        // Release the subAuto resolver TSFN and reject pending deferreds.
+        if (autoTsfnActive_.load()) {
+            autoTsfnActive_.store(false);
+            autoResolverTsfn_.Release();
+        }
+        for (auto& [id, def] : autoDeferreds_) {
+            try { def.Reject(Napi::Error::New(def.Env(), "Session is closed").Value()); } catch (...) {}
+        }
+        autoDeferreds_.clear();
+        {
+            std::lock_guard<std::mutex> lk(autoMutex_);
+            autoExprQueue_.clear();
+            autoCompleted_.clear();
+        }
+
         // Immediately reject all queued subWhenIdle() requests before the link
         // is torn down.  These items have never been dispatched to a worker so
         // they won't receive an OnError callback — we must reject them here.
@@ -2901,6 +3139,17 @@ private:
     std::chrono::steady_clock::time_point dynLastEval_{};      // time of last successful dialog eval
     std::thread                           dynTimerThread_;
     std::atomic<bool>                     dynTimerRunning_{false};
+
+    // -----------------------------------------------------------------------
+    // subAuto() state — one-shot auto-routing evaluations
+    // -----------------------------------------------------------------------
+    std::atomic<size_t>                                autoNextId_{0};
+    std::mutex                                         autoMutex_;          // protects autoExprQueue_ + autoCompleted_
+    std::deque<AutoExprEntry>                          autoExprQueue_;      // pending exprs for next Dialog[] cycle
+    std::vector<AutoResultEntry>                       autoCompleted_;      // results from worker thread
+    std::unordered_map<size_t, Napi::Promise::Deferred> autoDeferreds_;    // main-thread only: id → deferred
+    Napi::ThreadSafeFunction                           autoResolverTsfn_;   // signals main thread to drain results
+    std::atomic<bool>                                  autoTsfnActive_{false};
 };
 
 // ===========================================================================
