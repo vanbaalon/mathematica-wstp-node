@@ -306,20 +306,25 @@ static void drainDialogAbortResponse(WSLINK lp) {
 // about this dialog so there's nobody to call exitDialog().
 // ---------------------------------------------------------------------------
 static void drainStalePackets(WSLINK lp, EvalOptions* opts) {
-    // When dynAutoMode is active, use a short timeout (50ms) so we do NOT
-    // accidentally consume a ScheduledTask Dialog[] that the main eval's
-    // dynAutoMode handler should handle.  The stale packets we are looking
-    // for (from PREVIOUS evals) are already sitting on the link and arrive
-    // instantly, so 50ms is plenty.  The longer 200ms timeout is only needed
-    // for non-dynAutoMode scenarios.
-    int timeoutMs = (opts && opts->dynAutoMode) ? 50 : 200;
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeoutMs);
-    while (std::chrono::steady_clock::now() < deadline) {
+    // Stale packets (from PREVIOUS evals) are already sitting on the link
+    // and arrive instantly.  Use a short idle timeout: if nothing arrives
+    // for idleMs, exit early.  The hard timeout caps the total drain time
+    // in case packets keep arriving (e.g. nested Dialog[] rejections).
+    int hardTimeoutMs = (opts && opts->dynAutoMode) ? 50 : 200;
+    int idleMs = 5;  // exit after 5ms of silence
+    auto hardDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(hardTimeoutMs);
+    auto idleDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(idleMs);
+    while (std::chrono::steady_clock::now() < hardDeadline &&
+           std::chrono::steady_clock::now() < idleDeadline) {
         if (!WSReady(lp)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
+        // Packet arrived — reset idle deadline.
+        idleDeadline = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(idleMs);
         int pkt = WSNextPacket(lp);
         if (pkt == BEGINDLGPKT) {
             // Stale dialog — consume level int then auto-close.
@@ -1594,12 +1599,33 @@ public:
             }
         }
 
+        // ---- ScheduledTask Dialog[] suppression ----
+        // When a ScheduledTask is installed (dynTaskInstalledInterval > 0),
+        // its Dialog[] calls can fire between evals and during rejectDialog
+        // setup/render evals, causing hangs and adding ~500ms per rejection.
+        // Suppress the task during rejectDialog evals by prepending
+        // $wstpDynTaskStop=True to the expression.  Resume it for the main
+        // eval by prepending $wstpDynTaskStop=. so the dynAutoMode handler
+        // can process Dynamic expressions during the cell's execution.
+        int installedTask = opts_.dynTaskInstalledInterval
+                          ? *opts_.dynTaskInstalledInterval : 0;
+        std::string sendExpr = expr_;
+        if (installedTask > 0) {
+            if (opts_.rejectDialog) {
+                sendExpr = "$wstpDynTaskStop=True;" + expr_;
+                DiagLog("[Eval] prepend $wstpDynTaskStop=True (rejectDialog)");
+            } else {
+                sendExpr = "$wstpDynTaskStop=.;" + expr_;
+                DiagLog("[Eval] prepend $wstpDynTaskStop=. (main eval)");
+            }
+        }
+
         bool sent;
         if (!interactive_) {
             // EvaluatePacket + ToExpression: non-interactive, does NOT populate In[n]/Out[n].
             sent = WSPutFunction(lp_, "EvaluatePacket", 1) &&
                    WSPutFunction(lp_, "ToExpression",   1) &&
-                   WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) &&
+                   WSPutUTF8String(lp_, (const unsigned char *)sendExpr.c_str(), (int)sendExpr.size()) &&
                    WSEndPacket  (lp_)                      &&
                    WSFlush      (lp_);
         } else {
@@ -1608,7 +1634,7 @@ public:
             // as the real Mathematica frontend does.  Responds with RETURNEXPRPKT.
             sent = WSPutFunction(lp_, "EnterExpressionPacket", 1) &&
                    WSPutFunction(lp_, "ToExpression",          1) &&
-                   WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) &&
+                   WSPutUTF8String(lp_, (const unsigned char *)sendExpr.c_str(), (int)sendExpr.size()) &&
                    WSEndPacket  (lp_)                             &&
                    WSFlush      (lp_);
         }
@@ -2717,11 +2743,28 @@ private:
             FlushDialogQueueWithError("session closed");
             dialogOpen_.store(false);
             WSPutMessage(lp_, WSAbortMessage);
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            // Phase 1: wait up to 2s for WSAbortMessage to unblock the worker.
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (workerReadingLink_.load(std::memory_order_acquire) &&
                    std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // Phase 2: if the worker is still stuck (e.g. Pause[] ignoring
+            // WSAbortMessage), SIGKILL the kernel to break the link.  This
+            // makes WSNextPacket return an error so the worker exits promptly.
+            if (workerReadingLink_.load(std::memory_order_acquire) &&
+                kernelPid_ > 0 && !kernelKilled_) {
+                kernelKilled_ = true;
+                kill(kernelPid_, SIGKILL);
+                DiagLog("[CleanUp] SIGKILL pid " + std::to_string(kernelPid_) +
+                        " — worker still reading after 2s");
+                // Brief wait for the worker to notice the dead link.
+                deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(2);
+                while (workerReadingLink_.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
         if (lp_)    { WSClose(lp_);           lp_    = nullptr; }
         if (wsEnv_) { WSDeinitialize(wsEnv_); wsEnv_ = nullptr; }
@@ -3156,7 +3199,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
     // version — mirrors package.json "version"; read-only string constant.
-    exports.Set("version", Napi::String::New(env, "0.6.5"));
+    exports.Set("version", Napi::String::New(env, "0.6.6"));
     return exports;
 }
 

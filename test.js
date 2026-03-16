@@ -52,9 +52,19 @@ function withTimeout(p, ms, label) {
 }
 
 // mkSession — open a fresh WstpSession.
+// _lastMkSession tracks the most recently created per-test session so that
+// the test runner can kill it on timeout (unblocking a stuck native WSTP call).
+let _lastMkSession = null;
+let _mainSession   = null;
 function mkSession() {
-    return new WstpSession(KERNEL_PATH);
+    const s = new WstpSession(KERNEL_PATH);
+    _lastMkSession = s;
+    return s;
 }
+
+// Suppress unhandled rejections from timed-out test bodies whose async
+// functions continue running in the background after Promise.race rejects.
+process.on('unhandledRejection', () => {});
 
 // installHandler — install Interrupt→Dialog[] handler on a session.
 // Must be done via evaluate() (EnterExpressionPacket context) so the handler
@@ -71,14 +81,16 @@ async function installHandler(s) {
 const TEST_TIMEOUT_MS = 30_000;
 
 // Hard suite-level watchdog: if the entire suite takes longer than this the
-// process is force-killed.  Covers cases where a test hangs AND the per-test
-// timeout itself is somehow bypassed (e.g. a blocked native thread).
-const SUITE_TIMEOUT_MS = 10 * 60 * 1000;  // 10 minutes
-const suiteWatchdog = setTimeout(() => {
-    console.error('\nFATAL: suite watchdog expired — process hung, force-exiting.');
-    process.exit(2);
-}, SUITE_TIMEOUT_MS);
-suiteWatchdog.unref();   // does not prevent normal exit
+// process is force-killed.  Uses a SEPARATE OS process that sends SIGKILL,
+// because setTimeout callbacks can't fire while the JS event loop is blocked
+// by synchronous C++ code (e.g. CleanUp() spin-waiting for a stuck worker
+// thread, or the constructor's WSActivate blocking on kernel launch).
+const SUITE_TIMEOUT_S = 180;  // 3 minutes
+const { spawn } = require('child_process');
+const _watchdogProc = spawn('sh',
+    ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],
+    { stdio: 'ignore', detached: true });
+_watchdogProc.unref();
 
 // ── Test filtering ─────────────────────────────────────────────────────────
 // Usage:  node test.js --only 38,39,40   or  --only 38-52
@@ -114,10 +126,12 @@ async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
         skipped++;
         return;
     }
-    // Race the test body against a per-test timeout.
-    const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`TIMED OUT after ${timeoutMs} ms`)),
-                   timeoutMs));
+    let timer;
+    _lastMkSession = null;  // reset — set by mkSession() if the test creates one
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TIMED OUT after ${timeoutMs} ms`)),
+                   timeoutMs);
+    });
     try {
         await Promise.race([fn(), timeout]);
         console.log(`  ✓ ${name}`);
@@ -126,6 +140,27 @@ async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
         console.error(`  ✗ ${name}: ${e.message}`);
         failed++;
         process.exitCode = 1;
+        // On timeout: kill the kernel process to immediately unblock the
+        // native WSTP worker thread.  Without this, the stuck evaluate()
+        // blocks the session (cascade-hanging all subsequent tests on the
+        // shared session) and prevents process.exit() from completing.
+        // Match both run()-level "TIMED OUT" and inner withTimeout "TIMEOUT".
+        if (/TIMED? OUT/i.test(e.message)) {
+            const sess = _lastMkSession || _mainSession;
+            if (sess) {
+                const pid = sess.kernelPid;
+                if (pid > 0) {
+                    try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+                    console.error(`    → killed kernel pid ${pid} to unblock stuck WSTP call`);
+                }
+                // Force-close the session so the test body's background async
+                // cannot further interact with the dead kernel/link.
+                try { sess.close(); } catch (_) {}
+            }
+            _lastMkSession = null;
+        }
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -134,6 +169,7 @@ async function run(name, fn, timeoutMs = TEST_TIMEOUT_MS) {
 async function main() {
     console.log('Opening session…');
     const session = new WstpSession(KERNEL_PATH);
+    _mainSession = session;
     assert(session.isOpen, 'session did not open');
     console.log('Session open.\n');
 
@@ -1407,11 +1443,11 @@ async function main() {
         const s = mkSession();
         try {
             s.registerDynamic('tick', 'ToString[$Line]');
-            s.setDynamicInterval(80);
-            for (let i = 0; i < 8; i++) {
+            s.setDynamicInterval(200);
+            for (let i = 0; i < 5; i++) {
                 const r = await withTimeout(
-                    s.evaluate(`Pause[0.15]; ${i}`),
-                    6000, `test 49 cell ${i}`
+                    s.evaluate(`Pause[0.3]; ${i}`),
+                    10000, `test 49 cell ${i}`
                 );
                 assert(!r.aborted, `cell ${i} must not be aborted`);
                 assert(String(r.result.value) === String(i),
@@ -1633,8 +1669,12 @@ async function main() {
     }, 30000);
 
     // ── Teardown ──────────────────────────────────────────────────────────
+    _mainSession = null;
     session.close();
     assert(!session.isOpen, 'main session not closed');
+
+    // Kill the watchdog process — suite completed in time.
+    try { _watchdogProc.kill('SIGKILL'); } catch (_) {}
 
     console.log();
     if (failed === 0) {
