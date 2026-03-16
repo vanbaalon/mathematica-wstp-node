@@ -1,5 +1,5 @@
 // =============================================================================
-// wstp-backend/src/addon.cc   (v0.6.4 — stale-drain, timer+MENUPKT for subAuto)
+// wstp-backend/src/addon.cc   (v0.6.6 — timer-never-exit, no dynAutoMode leak, rejectDialog MENUPKT)
 //
 // Architecture:
 //   Execute()  runs on the libuv thread pool → does ALL blocking WSTP I/O,
@@ -1515,9 +1515,11 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             }
             const char* resp;
             if (wantInspect) {
-                resp = "i";
+                resp = "i";  // inspect → trigger Dialog[] for pending work
+            } else if (opts && opts->rejectDialog) {
+                resp = "c";  // never abort internal evals (VsCodeRender, etc.)
             } else if (menuType_ == 1) {
-                resp = "a";
+                resp = "a";  // abort user-visible eval on interrupt
             } else {
                 resp = "c";
             }
@@ -2447,13 +2449,14 @@ public:
             }
             autoDeferreds_.emplace(id, std::move(deferred));
 
-            // Ensure dynAutoMode and ScheduledTask timer are active so the
-            // Dialog[] mechanism fires and our expression gets evaluated.
-            if (!dynAutoMode_.load()) dynAutoMode_.store(true);
-            if (dynIntervalMs_.load() == 0) {
-                dynIntervalMs_.store(300);
-                if (!dynTimerRunning_.load()) StartDynTimer();
-            }
+            // Ensure the timer thread is running so it can fire
+            // WSInterruptMessage → MENUPKT 'i' → Dialog[] for our entry.
+            // Do NOT set dynAutoMode_ — it would leak to subsequent evals
+            // and cause ScheduledTask to fire during VsCodeRender (rejectDialog)
+            // evals, aborting them.  The timer, MENUPKT handler, and BEGINDLGPKT
+            // handler all check autoExprQueue independently of dynAutoMode.
+            if (dynIntervalMs_.load() == 0) dynIntervalMs_.store(300);
+            if (!dynTimerRunning_.load()) StartDynTimer();
         }
         return promise;
     }
@@ -2946,9 +2949,16 @@ private:
         if (dynTimerRunning_.exchange(true)) return;  // already running
         if (dynTimerThread_.joinable()) dynTimerThread_.join();
         dynTimerThread_ = std::thread([this]() {
-            while (open_ && dynIntervalMs_.load() > 0) {
+            while (open_) {
                 int ms = dynIntervalMs_.load();
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms > 0 ? ms : 100));
+                // When interval is 0, idle-sleep with a longer period.
+                // The thread stays alive so SubAuto can set the interval
+                // and get immediate service without a start-timer race.
+                if (ms <= 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    continue;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 if (!open_) break;
                 if (!busy_.load()) continue;                      // kernel idle
                 bool hasDynRegs = false;
@@ -2962,7 +2972,6 @@ private:
                     hasAutoEntries = !autoExprQueue_.empty();
                 }
                 if (!hasDynRegs && !hasAutoEntries) continue;     // nothing to do
-                if (dynIntervalMs_.load() == 0) break;
                 // Check enough time has elapsed since last eval.
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - dynLastEval_).count();

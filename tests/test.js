@@ -1809,6 +1809,80 @@ async function main() {
         }
     });
 
+    // ── 62. subAuto — busy path WITHOUT pre-registered Dynamic widgets ───
+    // Matches the real extension's ⌥⇧↵ flow: the eval is already running,
+    // no Dynamic widgets are registered, and subAuto is called cold.  The
+    // timer thread must fire WSInterruptMessage, MENUPKT must respond 'i',
+    // and BEGINDLGPKT must process autoExprQueue — all without dynAutoMode
+    // being set at eval-start time.
+    await run('62. subAuto — busy path without Dynamic widgets (real ⌥⇧↵ flow)', async () => {
+        const s = mkSession();
+        try {
+            // Start a long eval WITHOUT any Dynamic setup.
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.2], {40}]; "no-dyn-done"',
+                { interactive: true }
+            );
+            await sleep(800);
+            assert(!s.isReady, 'kernel should be busy');
+
+            // subAuto with no pre-registered Dynamic widgets.
+            const r = await withTimeout(
+                s.subAuto('ToString[42 + 58]'),
+                10000, '62 subAuto without Dynamic'
+            );
+            assert(r.value === '100', `expected "100", got "${r.value}"`);
+
+            const mainResult = await withTimeout(evalPromise, 20000, '62 main eval');
+            assert(!mainResult.aborted, 'main eval should not be aborted');
+            assert(mainResult.result.value === 'no-dyn-done',
+                `main eval expected "no-dyn-done", got "${mainResult.result.value}"`);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
+    // ── 63. rejectDialog eval not aborted by timer interrupt ─────────────
+    // When a rejectDialog eval runs while the timer is active (autoExprQueue
+    // pending or dynRegistry non-empty), MENUPKT must respond 'c' (continue)
+    // not 'a' (abort).  This prevents VsCodeRender from being aborted.
+    await run('63. rejectDialog eval survives timer interrupt', async () => {
+        const s = mkSession();
+        try {
+            // Register a Dynamic widget so the timer fires interrupts.
+            s.registerDynamic('_test63', 'ToString[1]');
+            s.setDynamicInterval(300);
+
+            // Start a long eval (interactive) to keep the kernel busy.
+            const evalPromise = s.evaluate(
+                'Do[Pause[0.2], {30}]; "bg-done"',
+                { interactive: true }
+            );
+            await sleep(800);
+
+            // Run a rejectDialog eval while the timer is firing.
+            // This simulates VsCodeRender — must NOT be aborted.
+            const renderResult = await withTimeout(
+                s.evaluate('ToString[111 + 222]', { rejectDialog: true }),
+                10000, '63 rejectDialog eval'
+            );
+            // The rejectDialog eval runs on the whenIdle queue, so it will
+            // resolve after the main eval completes — but it must not be aborted.
+
+            const mainResult = await withTimeout(evalPromise, 20000, '63 main eval');
+            assert(!mainResult.aborted, 'main eval should not be aborted');
+
+            assert(renderResult.result.value === '333',
+                `render expected "333", got "${renderResult.result.value}"`);
+            assert(!renderResult.aborted, 'rejectDialog eval should not be aborted');
+
+            s.unregisterDynamic('_test63');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
     // ── Teardown ──────────────────────────────────────────────────────────
     _mainSession = null;
     session.close();
