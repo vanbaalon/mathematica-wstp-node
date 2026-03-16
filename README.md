@@ -1,43 +1,60 @@
-# wstp-backend — API Reference
+# wstp-backend
 
 **Author:** Nikolay Gromov
 
-Native Node.js addon for Wolfram kernel communication over WSTP — supports full
-notebook-style evaluation with automatic `In`/`Out` history, real-time streaming,
-and an internal evaluation queue.  All blocking I/O runs on the libuv thread pool;
-the JS event loop is never stalled.
+Native Node.js addon for Wolfram kernel communication over WSTP. Enables notebook-style evaluation, real-time streaming, and robust kernel management from JavaScript.
 
-```js
-const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wstp.node');
+## Purpose
+
+This package lets you control a WolframKernel process from Node.js, supporting both batch and interactive notebook-style evaluation. It is ideal for building VS Code extensions, automating Mathematica workflows, and integrating Wolfram computation into JS apps.
+
+## Installation
+
+### Prerequisites
+
+| Requirement | Notes |
+|-------------|-------|
+| macOS | Tested on macOS 13+ (ARM64 and x86-64) |
+| Windows 10/11 x64 | See [InstallationWindows.md](InstallationWindows.md) for the full Windows guide |
+| Linux x86-64 / ARM64 | Should work with standard `node-gyp` toolchain |
+| Node.js ≥ 18 | Earlier versions may work but are untested |
+| Clang / Xcode Command Line Tools (macOS) | `xcode-select --install` |
+| MSVC Build Tools with C++ workload (Windows) | Visual Studio 2019+ or Build Tools |
+| Wolfram Mathematica or Wolfram Engine | Provides `WolframKernel` and the WSTP SDK headers/libraries |
+
+### 1. Clone
+
+```bash
+git clone https://github.com/vanbaalon/mathematica-wstp-node.git
+cd mathematica-wstp-node
 ```
 
----
+### 2. Install Node dependencies
 
-## Table of Contents
+```bash
+npm install
+```
 
-1. [Installation](#installation)
-2. [Batch mode vs interactive mode](#batch-mode-vs-interactive-mode)
-3. [Return types — `WExpr` and `EvalResult`](#return-types)
-4. [`WstpSession` — main evaluation session](#wstpsession)
-   - [Constructor](#constructor) — launch a kernel and open a session
-   - [`evaluate(expr, opts?)`](#evaluateexpr-opts) — queue an expression for evaluation; supports streaming `Print` callbacks
-   - [`sub(expr)`](#subexpr) — priority evaluation that jumps ahead of the queue, for quick queries during a long computation
-   - [`abort()`](#abort) — interrupt the currently running evaluation
-   - [`closeAllDialogs()`](#closealldialogs) — immediately reject all pending dialog promises and reset dialog state
-   - [`dialogEval(expr)`](#dialogevalexpr) — evaluate inside an active `Dialog[]` subsession
-   - [`exitDialog(retVal?)`](#exitdialogretval) — exit the current dialog and resume the main evaluation
-   - [`interrupt()`](#interrupt) — send a low-level interrupt signal to the kernel
-   - [`createSubsession(kernelPath?)`](#createsubsessionkernelpath) — spawn an independent parallel kernel session
-   - [`close()`](#close) — gracefully shut down the kernel and free resources
-   - [`isOpen` / `isDialogOpen`](#isopen--isdialogopen) — read-only status flags
-   - [Dynamic eval API](#dynamic-eval-api) — register expressions for automatic periodic evaluation
-5. [`WstpReader` — kernel-pushed side channel](#wstpreader)
-6. [`setDiagHandler(fn)`](#setdiaghandlerfn)
-5. [Usage examples](#usage-examples)
-   - [Basic evaluation](#basic-evaluation)
-   - [Interactive mode — In/Out history](#interactive-mode--inout-history)
-   - [Streaming output](#streaming-output)
-   - [Concurrent evaluations](#concurrent-evaluations)
+### 3. Build the native addon
+
+```bash
+bash build.sh
+```
+
+## Quick Start
+
+```js
+const { WstpSession } = require('./build/Release/wstp.node');
+const session = new WstpSession();
+session.evaluate('Prime[10]').then(r => {
+  console.log(r.result.value); // 29
+  session.close();
+});
+```
+
+## API Reference
+
+See [API.md](./API.md) for full API details, usage examples, and advanced features.
    - [Priority `sub()` calls](#priority-sub-calls)
    - [Abort a long computation](#abort-a-long-computation)
    - [Dialog subsessions](#dialog-subsessions)
