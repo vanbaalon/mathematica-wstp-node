@@ -601,10 +601,21 @@ session.setDynAutoMode(auto: boolean): void
 
 Switch the `Dialog[]` handling mode:
 
-- `true` (default): C++ intercepts every `BEGINDLGPKT` and evaluates all
+- `true`: C++ intercepts every `BEGINDLGPKT` and evaluates all
   registered expressions inline — no JS round-trip required.
-- `false`: Falls back to the legacy JS callback path
-  (`onDialogBegin` / `dialogEval` / `exitDialog`).
+- `false` **(default)**: Falls back to the legacy JS callback path
+  (`onDialogBegin` / `dialogEval` / `exitDialog`). Required for interactive
+  Dialog[] debugging. Without `false`, `dialogEval`/`exitDialog` cannot work.
+
+Transitioning from `true` → `false` (Dynamic cleanup) also stops the C++
+interrupt timer thread (`dynIntervalMs_` is reset to 0) to prevent stale
+`WSInterruptMessage` calls after Dynamic teardown.
+
+**Safety fallback (v0.6.2):** When `false` and no `onDialogBegin` is registered
+on an `evaluate()` call, any `BEGINDLGPKT` that arrives (e.g. from a stale
+kernel-side `ScheduledTask`) is auto-closed immediately rather than entering
+the legacy loop with nobody to service it. To opt into the legacy loop, always
+pass at least `onDialogBegin: () => {}` in `evaluate()` opts.
 
 #### `dynamicActive`
 
@@ -694,6 +705,19 @@ try {
 >   then races with the simultaneous `LinkClose` on the last value.
 > - Add `Pause[1]` before `LinkClose` so the reader receives the final expression before
 >   the link-close signal arrives.
+
+---
+
+## `version`
+
+```ts
+const { version } = require('./build/Release/wstp.node');
+console.log(version);  // e.g. "0.6.2"
+```
+
+Read-only string constant that mirrors the `version` field in `package.json`.
+Useful for diagnostics and compatibility checks without reading `package.json`
+at runtime.
 
 ---
 

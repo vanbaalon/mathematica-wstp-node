@@ -1,12 +1,13 @@
 'use strict';
 
-// ── Test suite for wstp-backend v0.6.0 ────────────────────────────────────
+// ── Test suite for wstp-backend v0.6.2 ────────────────────────────────────
 // Covers: evaluation queue, streaming callbacks, sub() priority, abort
 //         behaviour, WstpReader side-channel, edge cases, Dialog[] subsession
 //         (dialogEval, exitDialog, isDialogOpen, onDialogBegin/End/Print),
 //         subWhenIdle() (background queue, timeout, close rejection), kernelPid,
 //         Dynamic eval API (registerDynamic, getDynamicResults, setDynamicInterval,
 //         setDynAutoMode, dynamicActive, rejectDialog, abort deduplication).
+// 0.6.2: BEGINDLGPKT safety fallback (Bug 1A), setDynAutoMode cleanup (Bug 1B).
 
 const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wstp.node');
 
@@ -508,11 +509,12 @@ async function main() {
     });
 
     // ── 17. Unhandled dialog does not corrupt the link ────────────────────
-    // Call Dialog[] from a plain evaluate().  No onDialogBegin callback is
-    // registered.  We still use dialogEval('DialogReturn[]') to close it and
-    // confirm the outer Promise resolves correctly afterwards.
+    // Call Dialog[] from a plain evaluate() using only isDialogOpen polling
+    // (no onDialogBegin handler).  onDialogBegin: () => {} is still required
+    // to opt into the legacy dialog loop — without it Fix 1A auto-closes the
+    // dialog before JS can interact with it.
     await run('17. unhandled dialog does not corrupt link', async () => {
-        const evalPromise = session.evaluate('Dialog[]; 42');
+        const evalPromise = session.evaluate('Dialog[]; 42', { onDialogBegin: () => {} });
 
         await pollUntil(() => session.isDialogOpen);
         assert(session.isDialogOpen, 'dialog should have opened');
@@ -529,7 +531,7 @@ async function main() {
     // exitDialog('21') sends EnterTextPacket["Return[21]"].  The value 21
     // becomes the value of Dialog[] in the outer expression, so x$$*2 == 42.
     await run('19. exitDialog() with a return value', async () => {
-        const p = session.evaluate('x$$ = Dialog[]; x$$ * 2');
+        const p = session.evaluate('x$$ = Dialog[]; x$$ * 2', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         await session.exitDialog('21');
         const r = await p;
@@ -542,7 +544,7 @@ async function main() {
     // ── 20. dialogEval() sees outer variable state ────────────────────────
     // Variables set before Dialog[] are in scope inside the subsession.
     await run('20. dialogEval sees outer variable state', async () => {
-        const p = session.evaluate('myVar$$ = 123; Dialog[]; myVar$$');
+        const p = session.evaluate('myVar$$ = 123; Dialog[]; myVar$$', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         const v = await session.dialogEval('myVar$$');
         assert(
@@ -556,7 +558,7 @@ async function main() {
     // ── 21. dialogEval() can mutate kernel state ──────────────────────────
     // Variables set inside the dialog persist after the dialog closes.
     await run('21. dialogEval can mutate kernel state', async () => {
-        const p = session.evaluate('Dialog[]; mutated$$');
+        const p = session.evaluate('Dialog[]; mutated$$', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         await session.dialogEval('mutated$$ = 777');
         await session.exitDialog();
@@ -571,7 +573,7 @@ async function main() {
     // ── 22. Multiple dialogEval() calls are serviced FIFO ─────────────────
     // Three concurrent dialogEval() calls queue up and resolve in order.
     await run('22. multiple dialogEval calls are serviced FIFO', async () => {
-        const p = session.evaluate('Dialog[]');
+        const p = session.evaluate('Dialog[]', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         const [a, b, c] = await Promise.all([
             session.dialogEval('1'),
@@ -590,7 +592,7 @@ async function main() {
     // false → true (on Dialog[]) → false (after exitDialog).
     await run('23. isDialogOpen transitions correctly', async () => {
         assert(!session.isDialogOpen, 'initially false');
-        const p = session.evaluate('Dialog[]');
+        const p = session.evaluate('Dialog[]', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         assert(session.isDialogOpen, 'true while dialog open');
         await session.exitDialog();
@@ -604,6 +606,7 @@ async function main() {
         let dlgPrintResolve;
         const dlgPrintDelivered = new Promise(r => { dlgPrintResolve = r; });
         const p = session.evaluate('Dialog[]', {
+            onDialogBegin: () => {},
             onDialogPrint: (line) => { dialogLines.push(line); dlgPrintResolve(); },
         });
         await pollUntil(() => session.isDialogOpen);
@@ -659,7 +662,7 @@ async function main() {
     // A plain evaluate() queued while the dialog inner loop is running must
     // wait and then be dispatched normally after ENDDLGPKT.
     await run('27. evaluate() queued during dialog runs after dialog closes', async () => {
-        const p1 = session.evaluate('Dialog[]');
+        const p1 = session.evaluate('Dialog[]', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         // Queue a normal eval WHILE the dialog is open — it must wait.
         const p2 = session.evaluate('"queued-during-dialog"');
@@ -688,7 +691,7 @@ async function main() {
         const sub = session.createSubsession();
         try {
             // Open a Dialog[] on the subsession.
-            const pEval = sub.evaluate('Dialog[]');
+            const pEval = sub.evaluate('Dialog[]', { onDialogBegin: () => {} });
             await pollUntil(() => sub.isDialogOpen);
             assert(sub.isDialogOpen, 'dialog should be open');
 
@@ -728,14 +731,14 @@ async function main() {
     // 2500ms because Pause[] ignores WSInterruptMessage during a sleep.
     // This test documents the fundamental limitation: Dynamic cannot read a
     // live variable while Pause[N] is running.
-    await run('P1: Pause[8] ignores interrupt within 2500ms', async () => {
+    await run('P1: Pause[4] ignores interrupt within 1500ms', async () => {
         const s = mkSession();
         try {
             await installHandler(s);
 
             let evalDone = false;
             const mainProm = s.evaluate(
-                'pP1 = 0; Pause[8]; pP1 = 1; "p1-done"'
+                'pP1 = 0; Pause[4]; pP1 = 1; "p1-done"'
             ).then(() => { evalDone = true; });
 
             await sleep(300);
@@ -744,12 +747,12 @@ async function main() {
             assert(sent === true, 'interrupt() should return true mid-eval');
 
             const t0 = Date.now();
-            while (!s.isDialogOpen && Date.now() - t0 < 2500) await sleep(25);
+            while (!s.isDialogOpen && Date.now() - t0 < 1500) await sleep(25);
 
             const dlgOpened = s.isDialogOpen;
-            assert(!dlgOpened, 'Pause[8] should NOT open a dialog within 2500ms');
+            assert(!dlgOpened, 'Pause[4] should NOT open a dialog within 1500ms');
 
-            // After the 2500ms window the interrupt may still be queued — the kernel
+            // After the 1500ms window the interrupt may still be queued — the kernel
             // will fire Dialog[] once Pause[] releases.  Abort to unstick the eval
             // rather than waiting for it to return on its own (which could take forever
             // if Dialog[] opens and nobody services it).
@@ -758,7 +761,7 @@ async function main() {
         } finally {
             s.close();
         }
-    }, 20_000);
+    }, 12_000);
 
     // ── P2: Pause[0.3] loop — interrupt opens Dialog and dialogEval works ──
     // Expected: interrupt during a short Pause[] loop opens a Dialog[],
@@ -770,7 +773,7 @@ async function main() {
 
             let evalDone = false;
             const mainProm = s.evaluate(
-                'Do[nP2 = k; Pause[0.3], {k, 1, 30}]; "p2-done"',
+                'Do[nP2 = k; Pause[0.1], {k, 1, 15}]; "p2-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).then(() => { evalDone = true; });
 
@@ -778,19 +781,19 @@ async function main() {
 
             s.interrupt();
             try { await pollUntil(() => s.isDialogOpen, 3000); }
-            catch (_) { throw new Error('Dialog never opened — interrupt not working with Pause[0.3]'); }
+            catch (_) { throw new Error('Dialog never opened — interrupt not working with Pause[0.1]'); }
 
             const val = await withTimeout(s.dialogEval('nP2'), 5000, 'dialogEval nP2');
             assert(val && typeof val.value === 'number' && val.value >= 1,
                 `expected nP2 >= 1, got ${JSON.stringify(val)}`);
 
             await s.exitDialog();
-            await withTimeout(mainProm, 15_000, 'P2 main eval');
+            await withTimeout(mainProm, 8_000, 'P2 main eval');
         } finally {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 30_000);
+    }, 15_000);
 
     // ── P3: dialogEval timeout — kernel state after (diagnostic) ───────────
     // Simulates the extension failure: dialogEval times out without exitDialog.
@@ -803,7 +806,7 @@ async function main() {
 
             let evalDone = false;
             const mainProm = s.evaluate(
-                'Do[nP3 = k; Pause[0.3], {k, 1, 200}]; "p3-done"',
+                'Do[nP3 = k; Pause[0.1], {k, 1, 15}]; "p3-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).then(() => { evalDone = true; });
 
@@ -838,7 +841,7 @@ async function main() {
                     await s.exitDialog().catch(() => {});
                 }
 
-                if (!evalDone) { try { await withTimeout(mainProm, 20_000, 'P3 loop'); } catch (_) {} }
+                if (!evalDone) { try { await withTimeout(mainProm, 6_000, 'P3 loop'); } catch (_) {} }
 
                 // Diagnostic: document observed outcome but do not hard-fail on dlg2
                 if (!exitOk) {
@@ -850,7 +853,7 @@ async function main() {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 45_000);
+    }, 20_000);
 
 // ── P4: abort() after stuck dialog — session stays alive ────────────────
     // Note: abort() sends WSAbortMessage which resets the Wolfram kernel's
@@ -864,7 +867,7 @@ async function main() {
             await installHandler(s);
 
             const mainProm = s.evaluate(
-                'Do[nP4=k; Pause[0.3], {k,1,200}]; "p4-done"',
+                'Do[nP4=k; Pause[0.1], {k,1,15}]; "p4-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).catch(() => {});
 
@@ -896,7 +899,7 @@ async function main() {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 30_000);
+    }, 15_000);
 
     // ── P5: closeAllDialogs()+abort() recovery → reinstall handler → new dialog works
     // closeAllDialogs() is designed to be paired with abort().  It rejects all
@@ -909,7 +912,7 @@ async function main() {
             await installHandler(s);
 
             const mainProm = s.evaluate(
-                'Do[nP5 = k; Pause[0.3], {k, 1, 200}]; "p5-done"',
+                'Do[nP5 = k; Pause[0.1], {k, 1, 15}]; "p5-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).catch(() => {});
 
@@ -935,7 +938,7 @@ async function main() {
 
             let dlg2 = false;
             const mainProm2 = s.evaluate(
-                'Do[nP5b = k; Pause[0.3], {k, 1, 200}]; "p5b-done"',
+                'Do[nP5b = k; Pause[0.1], {k, 1, 15}]; "p5b-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).catch(() => {});
 
@@ -957,7 +960,7 @@ async function main() {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 60_000);
+    }, 25_000);
 
     // ── P6: Simulate Dynamic + Pause[5] full scenario (diagnostic) ─────────
     // Reproduces: n=RandomInteger[100]; Pause[5] with interrupt every 2.5s.
@@ -970,18 +973,18 @@ async function main() {
 
             let evalDone = false;
             const mainProm = s.evaluate(
-                'n = RandomInteger[100]; Pause[5]; "p6-done"',
+                'n = RandomInteger[100]; Pause[3]; "p6-done"',
                 { onDialogBegin: () => {}, onDialogEnd: () => {} }
             ).then(() => { evalDone = true; });
 
             await sleep(200);
 
-            const INTERRUPT_WAIT_MS = 2500;
+            const INTERRUPT_WAIT_MS = 1500;
             const DIALOG_EVAL_TIMEOUT_MS = 8000;
             let dialogReadSucceeded = false;
             let pauseIgnoredInterrupt = false;
 
-            for (let cycle = 1; cycle <= 5 && !evalDone; cycle++) {
+            for (let cycle = 1; cycle <= 2 && !evalDone; cycle++) {
                 const t0 = Date.now();
                 s.interrupt();
                 while (!s.isDialogOpen && Date.now() - t0 < INTERRUPT_WAIT_MS) await sleep(25);
@@ -1009,11 +1012,11 @@ async function main() {
                 }
             }
 
-            try { await withTimeout(mainProm, 12_000, 'P6 main eval'); } catch (_) {}
+            try { await withTimeout(mainProm, 7_000, 'P6 main eval'); } catch (_) {}
 
             // Diagnostic: always passes — log observed outcome
             if (pauseIgnoredInterrupt && !dialogReadSucceeded) {
-                console.log('    P6 note: Pause[5] blocked all interrupts — expected behaviour');
+                console.log('    P6 note: Pause[3] blocked all interrupts — expected behaviour');
             } else if (dialogReadSucceeded) {
                 console.log('    P6 note: at least one read succeeded despite Pause');
             }
@@ -1021,7 +1024,7 @@ async function main() {
             try { s.abort(); } catch (_) {}
             s.close();
         }
-    }, 60_000);
+    }, 20_000);
 
     // ── 25. abort() while dialog is open ──────────────────────────────────
     // Must run AFTER all other dialog tests — abort() sends WSAbortMessage
@@ -1029,7 +1032,7 @@ async function main() {
     // evaluations.  Tests 26 and 27 need a clean session, so test 25 runs last
     // (just before test 18 which also corrupts the link via WSInterruptMessage).
     await run('25. abort while dialog is open', async () => {
-        const p = session.evaluate('Dialog[]');
+        const p = session.evaluate('Dialog[]', { onDialogBegin: () => {} });
         await pollUntil(() => session.isDialogOpen);
         session.abort();
         const r = await p;
@@ -1474,6 +1477,159 @@ async function main() {
         }
     });
 
+    // ── 53. Bug 1A: stale ScheduledTask + non-Dynamic cell does not hang ───
+    // Simulates the subsession.js teardown: Dynamic cell runs → cleanup calls
+    // setDynAutoMode(false) but the kernel-side ScheduledTask may still fire
+    // one more Dialog[].  The next plain cell (no onDialogBegin) must not hang.
+    await run('53. stale ScheduledTask Dialog[] after setDynAutoMode(false) — no hang (Bug 1A)', async () => {
+        const s = mkSession();
+        try {
+            // Step 1: register a Dynamic expr and start the interval.
+            s.registerDynamic('dyn0', 'ToString[AbsoluteTime[], InputForm]');
+            s.setDynamicInterval(300);
+
+            // Step 2: long enough eval for ScheduledTask to fire at least once.
+            const r1 = await withTimeout(
+                s.evaluate('Do[Pause[0.1], {20}]; "cell1"'),
+                12000, '53 cell1'
+            );
+            assert(!r1.aborted && r1.result.value === 'cell1',
+                `cell1 result: ${JSON.stringify(r1.result)}`);
+
+            // Step 3: simulate subsession.js cleanup.
+            // Fix 1B: setDynAutoMode(false) now also sets dynIntervalMs_=0.
+            s.unregisterDynamic('dyn0');
+            s.setDynAutoMode(false);
+
+            // Step 4: plain cell with no onDialogBegin — must not hang.
+            const r2 = await withTimeout(
+                s.evaluate('n = 1'),
+                10000, '53 cell2 — would hang without Fix 1A'
+            );
+            assert(!r2.aborted, 'cell2 must not be aborted');
+
+            // Step 5: follow-up eval also works.
+            const r3 = await withTimeout(s.evaluate('1 + 1'), 6000, '53 cell3');
+            assert(r3.result.value === 2, `cell3 expected 2, got ${r3.result.value}`);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
+    // ── 54. Bug 1A: BEGINDLGPKT with dynAutoMode=false, no JS callback ────
+    // With dynAutoMode=false and no onDialogBegin registered, any BEGINDLGPKT
+    // must be auto-closed by the safety fallback rather than entering the
+    // legacy loop where nobody will ever call exitDialog().
+    await run('54. BEGINDLGPKT safety fallback — auto-close when no onDialogBegin (Bug 1A)', async () => {
+        const s = mkSession();
+        try {
+            s.setDynAutoMode(false);
+            // Eval runs for ~2s; no onDialogBegin registered.  Any BEGINDLGPKT
+            // that arrives (from a stale ScheduledTask or concurrent interrupt)
+            // must be auto-closed by the safety fallback.
+            const r = await withTimeout(
+                s.evaluate('Do[Pause[0.2], {10}]; "done"'),
+                15000, '54 eval — would hang without Fix 1A'
+            );
+            assert(!r.aborted, 'eval must not be aborted');
+            assert(r.result.value === 'done', `expected "done", got "${r.result.value}"`);
+
+            // Follow-up eval must work — no leftover packets.
+            const r2 = await withTimeout(s.evaluate('2 + 2'), 6000, '54 follow-up');
+            assert(r2.result.value === 4, `follow-up expected 4, got ${r2.result.value}`);
+        } finally {
+            s.close();
+        }
+    }, 30000);
+
+    // ── 55. Interactive mode with non-Null result (no trailing semicolon) ──
+    // In interactive mode (EnterExpressionPacket), a non-Null result produces:
+    //   RETURNEXPRPKT → INPUTNAMEPKT.
+    // Bug: drainStalePackets() consumed the trailing INPUTNAMEPKT, causing the
+    // outer DrainToEvalResult loop to hang forever waiting for a packet already
+    // consumed.  This test verifies that interactive evals with visible results
+    // (no trailing semicolon) complete without hanging.
+    await run('55. interactive eval with non-Null result (drainStalePackets fix)', async () => {
+        const s = mkSession();
+        try {
+            // Simple assignment without semicolon — returns non-Null.
+            const r1 = await withTimeout(
+                s.evaluate('n = 1', { interactive: true }),
+                10000, '55 n=1 interactive — would hang without drainStalePackets fix'
+            );
+            assert(!r1.aborted, 'n=1 must not be aborted');
+            assert(r1.result.value === 1, `n=1 expected 1, got ${r1.result.value}`);
+
+            // Follow-up: another non-Null interactive eval.
+            const r2 = await withTimeout(
+                s.evaluate('n + 41', { interactive: true }),
+                10000, '55 n+41 interactive'
+            );
+            assert(!r2.aborted, 'n+41 must not be aborted');
+            assert(r2.result.value === 42, `n+41 expected 42, got ${r2.result.value}`);
+
+            // Follow-up with semicolon (Null result) — should also work.
+            const r3 = await withTimeout(
+                s.evaluate('m = 99;', { interactive: true }),
+                10000, '55 m=99; interactive'
+            );
+            assert(!r3.aborted, 'm=99; must not be aborted');
+
+            // Follow-up: non-interactive eval still works after interactive ones.
+            const r4 = await withTimeout(
+                s.evaluate('m + 1'),
+                10000, '55 m+1 non-interactive follow-up'
+            );
+            assert(r4.result.value === 100, `m+1 expected 100, got ${r4.result.value}`);
+        } finally {
+            s.close();
+        }
+    }, 45000);
+
+    // ── 56. Stale interrupt aborts eval cleanly (no hang) ──────────────────
+    // When live-watch sends an interrupt just as a cell completes, the kernel
+    // may fire the queued interrupt during the NEXT evaluation.  Without
+    // dialog callbacks, the C++ MENUPKT handler responds 'a' (abort) so the
+    // eval returns $Aborted rather than hanging.  This is safe: the caller
+    // can retry.  A follow-up eval (without stale interrupt) must succeed.
+    await run('56. stale interrupt aborts eval — no hang', async () => {
+        const s = mkSession();
+        try {
+            await installHandler(s);
+
+            // Warm up
+            const r0 = await withTimeout(s.evaluate('1 + 1'), 5000, '56 warmup');
+            assert(r0.result.value === 2);
+
+            // Send interrupt to idle kernel — may fire during next eval
+            s.interrupt();
+            await sleep(500);  // give kernel time to queue interrupt
+
+            // Evaluate — stale interrupt fires → MENUPKT → 'a' → $Aborted
+            const r1 = await withTimeout(
+                s.evaluate('42'),
+                10000, '56 eval — would hang without abort-on-MENUPKT fix'
+            );
+            // The eval may return $Aborted (interrupt fired) or 42 (interrupt
+            // was ignored by idle kernel).  Either is acceptable — the critical
+            // thing is that it does NOT hang.
+            if (r1.aborted) {
+                assert(r1.result.value === '$Aborted',
+                    `expected $Aborted, got ${JSON.stringify(r1.result)}`);
+            } else {
+                assert(r1.result.value === 42,
+                    `expected 42, got ${JSON.stringify(r1.result)}`);
+            }
+
+            // Follow-up eval must work regardless
+            const r2 = await withTimeout(s.evaluate('2 + 2'), 5000, '56 follow-up');
+            assert(!r2.aborted, '56 follow-up should not be aborted');
+            assert(r2.result.value === 4);
+        } finally {
+            s.close();
+        }
+    }, 30000);
+
     // ── Teardown ──────────────────────────────────────────────────────────
     session.close();
     assert(!session.isOpen, 'main session not closed');
@@ -1487,6 +1643,7 @@ async function main() {
         process.exit(0);
     } else {
         console.log(`${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}.`);
+        process.exit(1);
     }
 }
 

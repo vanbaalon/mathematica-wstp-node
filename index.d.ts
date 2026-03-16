@@ -429,3 +429,12 @@ export class WstpReader {
  *            or `null` / `undefined` to clear a previously-set handler.
  */
 export function setDiagHandler(fn: ((msg: string) => void) | null | undefined): void;
+
+/**
+ * Addon version string — mirrors the `version` field in `package.json`.
+ *
+ * @example
+ * const { version } = require('./build/Release/wstp.node');
+ * console.log(version);  // "0.6.2"
+ */
+export declare const version: string;

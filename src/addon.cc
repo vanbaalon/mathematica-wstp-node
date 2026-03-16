@@ -882,13 +882,18 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             // Drain any stale packets (e.g. late BEGINDLGPKT from a concurrent
             // interrupt that arrived just as this cell's RETURNPKT was sent).
             // This prevents Pattern D: stale BEGINDLGPKT corrupting next eval.
-            if (!r.aborted) drainStalePackets(lp, opts);
-            // In interactive mode the kernel always follows RETURNEXPRPKT with a
-            // trailing INPUTNAMEPKT (the next "In[n+1]:=" prompt).  We must consume
-            // that packet before returning so the wire is clean for the next eval.
-            // Continue the loop; the INPUTNAMEPKT branch below will break cleanly.
-            if (!opts || !opts->interactive) break;
-            // (fall through to the next WSNextPacket iteration)
+            //
+            // IMPORTANT: In interactive mode (EnterExpressionPacket), the kernel
+            // follows RETURNEXPRPKT with a trailing INPUTNAMEPKT ("In[n+1]:=").
+            // drainStalePackets must NOT run here because it would consume that
+            // INPUTNAMEPKT and discard it, causing the outer loop to block forever
+            // waiting for a packet that was already eaten.  Drain is deferred to
+            // the INPUTNAMEPKT handler below.
+            if (!opts || !opts->interactive) {
+                if (!r.aborted) drainStalePackets(lp, opts);
+                break;
+            }
+            // Interactive mode: fall through to consume trailing INPUTNAMEPKT.
         }
         else if (pkt == INPUTNAMEPKT) {
             const char* s = nullptr; WSGetString(lp, &s);
@@ -906,7 +911,9 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                     break;
                 }
                 // Trailing INPUTNAMEPKT after RETURNEXPRPKT — consume and exit.
-                // (Next eval starts with no leftover INPUTNAMEPKT on the wire.)
+                // Now safe to drain stale packets (Pattern D prevention) —
+                // the trailing INPUTNAMEPKT has already been consumed above.
+                if (!r.aborted) drainStalePackets(lp, opts);
                 break;
             }
             r.cellIndex = parseCellIndex(nameStr);
@@ -1159,6 +1166,60 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 continue;
             }
 
+            // ---- Safety fallback: no onDialogBegin callback registered -----
+            // Legacy dialog loop (below) requires JS to call dialogEval()/
+            // exitDialog() in response to the onDialogBegin callback.  If no
+            // callback is registered (e.g. stale ScheduledTask Dialog[] call
+            // arriving during a non-Dynamic cell), nobody will ever call those
+            // functions and the eval hangs permanently.  Auto-close the dialog
+            // using the same inline path as rejectDialog.
+            if (!opts || !opts->hasOnDialogBegin) {
+                DiagLog("[Eval] BEGINDLGPKT: no onDialogBegin callback — auto-closing "
+                        "(dynAutoMode=false, hasOnDialogBegin=false)");
+                // Pre-drain INPUTNAMEPKT — Dialog[] from ScheduledTask sends
+                // INPUTNAMEPKT before accepting EnterTextPacket.
+                {
+                    auto preDl = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(500);
+                    while (std::chrono::steady_clock::now() < preDl) {
+                        if (!WSReady(lp)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int ipkt = WSNextPacket(lp);
+                        DiagLog("[Eval] BEGINDLGPKT safety: pre-drain pkt=" + std::to_string(ipkt));
+                        WSNewPacket(lp);
+                        if (ipkt == INPUTNAMEPKT) break;
+                        if (ipkt == 0 || ipkt == ILLEGALPKT) { WSClearError(lp); break; }
+                    }
+                }
+                const char* closeExpr = "Return[$Failed]";
+                WSPutFunction(lp, "EnterTextPacket", 1);
+                WSPutUTF8String(lp,
+                    reinterpret_cast<const unsigned char*>(closeExpr),
+                    static_cast<int>(std::strlen(closeExpr)));
+                WSEndPacket(lp);
+                WSFlush(lp);
+                DiagLog("[Eval] BEGINDLGPKT safety: sent Return[$Failed], draining until ENDDLGPKT");
+                {
+                    auto dlgDeadline = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds(2000);
+                    while (std::chrono::steady_clock::now() < dlgDeadline) {
+                        if (!WSReady(lp)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int rp = WSNextPacket(lp);
+                        DiagLog("[Eval] BEGINDLGPKT safety: drain pkt=" + std::to_string(rp));
+                        WSNewPacket(lp);
+                        if (rp == ENDDLGPKT) break;
+                        if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
+                    }
+                }
+                // Continue outer drain loop — original RETURNPKT is still coming.
+                continue;
+            }
+
             if (opts && opts->dialogOpen)
                 opts->dialogOpen->store(true);
             if (opts && opts->hasOnDialogBegin)
@@ -1297,9 +1358,23 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
             // Legacy dialog path: when dynAutoMode is false and the eval has
             // dialog callbacks, respond 'i' (inspect) so the kernel enters
             // inspect mode and the Internal`AddHandler fires Dialog[].
-            // Otherwise respond 'c' (continue) to dismiss the menu.
+            // For type-1 (interrupt menu) without dialog callbacks, respond
+            // 'a' (abort) rather than 'c' (continue).  On ARM64/Wolfram 3,
+            // 'c' can leave the kernel in a stuck state when the interrupt
+            // handler (Internal`AddHandler["Interrupt", Function[.., Dialog[]]])
+            // is installed — Dialog[] interferes with the continuation and
+            // the kernel never sends RETURNPKT.  Aborting cleanly produces
+            // $Aborted and keeps the session alive.
+            // For non-interrupt menus (type != 1), 'c' is still safe.
             bool wantInspect = opts && !opts->dynAutoMode && opts->hasOnDialogBegin;
-            const char* resp = wantInspect ? "i" : "c";
+            const char* resp;
+            if (wantInspect) {
+                resp = "i";
+            } else if (menuType_ == 1) {
+                resp = "a";
+            } else {
+                resp = "c";
+            }
             DiagLog("[Eval] MENUPKT type=" + std::to_string(menuType_) + " — responding '" + resp + "'");
             WSPutString(lp, resp);
             WSEndPacket(lp);
@@ -1413,6 +1488,21 @@ public:
 
     // ---- thread-pool thread: send packet; block until response ----
     void Execute() override {
+        // ---- Pre-eval drain: consume stale packets on the link --------
+        // If an interrupt was sent just as the previous eval completed,
+        // the kernel may have opened a Dialog[] (via the interrupt handler)
+        // while idle.  The resulting BEGINDLGPKT sits unread on the link.
+        // Without draining it first, our EvaluatePacket is processed inside
+        // the stale Dialog context and its RETURNPKT is consumed during the
+        // BEGINDLGPKT handler's drain — leaving the outer DrainToEvalResult
+        // loop waiting forever for a RETURNPKT that was already eaten.
+        // Only check if data is already buffered (WSReady) to avoid adding
+        // latency in the normal case (no stale packets).
+        if (WSReady(lp_)) {
+            DiagLog("[Eval] pre-eval: stale data on link — draining");
+            drainStalePackets(lp_, nullptr);
+        }
+
         // ---- Phase 2: ScheduledTask[Dialog[], interval] management ----
         // Install a kernel-side ScheduledTask that calls Dialog[] periodically.
         // Only install when:
@@ -2348,8 +2438,8 @@ public:
 
     // -----------------------------------------------------------------------
     // setDynAutoMode(auto) → void
-    // true  = C++-internal inline dialog path (default)
-    // false = legacy JS dialogEval/exitDialog path (for debugger)
+    // true  = C++-internal inline dialog path
+    // false = legacy JS dialogEval/exitDialog path (default; for debugger)
     // -----------------------------------------------------------------------
     Napi::Value SetDynAutoMode(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
@@ -2358,7 +2448,15 @@ public:
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        dynAutoMode_.store(info[0].As<Napi::Boolean>().Value());
+        bool newMode = info[0].As<Napi::Boolean>().Value();
+        bool oldMode = dynAutoMode_.exchange(newMode);
+        // When transitioning true→false (Dynamic cleanup), stop the timer
+        // thread.  Prevents stale ScheduledTask Dialog[] calls from reaching
+        // the BEGINDLGPKT handler after cleanup.  The safety fallback in
+        // BEGINDLGPKT handles any Dialog[] that fires before this takes effect.
+        if (oldMode && !newMode) {
+            dynIntervalMs_.store(0);
+        }
         return env.Undefined();
     }
 
@@ -3021,6 +3119,8 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     WstpReader::Init(env, exports);
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
+    // version — mirrors package.json "version"; read-only string constant.
+    exports.Set("version", Napi::String::New(env, "0.6.4"));
     return exports;
 }
 

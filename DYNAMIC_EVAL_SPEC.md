@@ -1,8 +1,8 @@
 # WSTP Dynamic Evaluation — Technical Specification
 
-**Status:** Proposal  
+**Status:** Partially implemented — Bug fixes landed in v0.6.2  
 **Author:** Wolfbook Extension Team  
-**Date:** 2026-03-15  
+**Date:** 2026-03-15 (updated 2026-03-16)  
 **Affected file:** `WSTP Backend/src/addon.cc`
 
 ---
@@ -232,11 +232,16 @@ case BEGINDLGPKT: {
 The debugger uses `dialogEval()` and `exitDialog()` for interactive step-through debugging.
 This path is **separate** from Dynamic evaluation and must be preserved.
 
-**Approach:** Add a flag `dynAutoMode_` (default: `true`). When `true`, BEGINDLGPKT is handled
-inline as above. When `false`, the current JS-callback path is used.
+**Approach:** Add a flag `dynAutoMode_` (default: `false`). When `true`, BEGINDLGPKT is handled
+inline as above. When `false`, the current JS-callback path is used (required for Dialog[]
+interactivity — `dynAutoMode_{true}` breaks 11 existing tests).
+
+> **v0.6.2 implementation note:** The default was changed from `true` (spec) to `false`
+> (implementation) to preserve Dialog[] interactivity for the full test suite. See
+> `WSTP_0.6.1_BUGS.md` for details.
 
 ```cpp
-std::atomic<bool> dynAutoMode_{true};
+std::atomic<bool> dynAutoMode_{false}; // default false preserves Dialog[] interactivity
 
 // In BEGINDLGPKT handler:
 if (dynAutoMode_.load()) {

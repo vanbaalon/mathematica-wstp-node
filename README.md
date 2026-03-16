@@ -98,7 +98,7 @@ The script automatically locates the WSTP SDK inside the default Wolfram install
 node test.js
 ```
 
-Expected last line: `All 52 tests passed.`
+Expected last line: `All 61 tests passed.`
 
 A more comprehensive suite (both modes + In/Out + comparison) lives in `tmp/tests_all.js`:
 

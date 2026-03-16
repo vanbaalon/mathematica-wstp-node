@@ -5,6 +5,9 @@ build/
 # Dependencies
 node_modules/
 
+# Auth tokens — never commit
+.npmrc
+
 # macOS
 .DS_Store
 
