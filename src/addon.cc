@@ -992,6 +992,12 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 WSFlush(lp);
                 DiagLog("[Eval] rejectDialog: sent Return[$Failed], draining until ENDDLGPKT");
                 // Drain until ENDDLGPKT — kernel will close the dialog level.
+                // IMPORTANT: the outer eval's RETURNPKT may land inside the
+                // dialog context (race with ScheduledTask Dialog[]).  We MUST
+                // capture it here; otherwise the outer DrainToEvalResult loop
+                // waits forever for a RETURNPKT that was already consumed.
+                WExpr rejectCaptured;
+                bool  rejectGotOuter = false;
                 {
                     auto dlgDeadline = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(2000);
@@ -1002,10 +1008,24 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                         }
                         int rp = WSNextPacket(lp);
                         DiagLog("[Eval] rejectDialog: drain pkt=" + std::to_string(rp));
+                        if ((rp == RETURNPKT || rp == RETURNEXPRPKT) && !rejectGotOuter) {
+                            rejectCaptured  = ReadExprRaw(lp);
+                            rejectGotOuter  = true;
+                            DiagLog("[Eval] rejectDialog: captured outer RETURNPKT");
+                        }
                         WSNewPacket(lp);
                         if (rp == ENDDLGPKT) break;
                         if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
                     }
+                }
+                if (rejectGotOuter) {
+                    DiagLog("[Eval] rejectDialog: returning captured outer result");
+                    r.result = std::move(rejectCaptured);
+                    if (r.result.kind == WExpr::Symbol &&
+                        stripCtx(r.result.strVal) == "$Aborted")
+                        r.aborted = true;
+                    drainStalePackets(lp, opts);
+                    return r;
                 }
                 // Continue outer drain loop — the original RETURNPKT is still coming.
                 continue;
@@ -1201,6 +1221,8 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                 WSEndPacket(lp);
                 WSFlush(lp);
                 DiagLog("[Eval] BEGINDLGPKT safety: sent Return[$Failed], draining until ENDDLGPKT");
+                WExpr safetyCaptured;
+                bool  safetyGotOuter = false;
                 {
                     auto dlgDeadline = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(2000);
@@ -1211,10 +1233,24 @@ static EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts = nullptr) {
                         }
                         int rp = WSNextPacket(lp);
                         DiagLog("[Eval] BEGINDLGPKT safety: drain pkt=" + std::to_string(rp));
+                        if ((rp == RETURNPKT || rp == RETURNEXPRPKT) && !safetyGotOuter) {
+                            safetyCaptured = ReadExprRaw(lp);
+                            safetyGotOuter = true;
+                            DiagLog("[Eval] BEGINDLGPKT safety: captured outer RETURNPKT");
+                        }
                         WSNewPacket(lp);
                         if (rp == ENDDLGPKT) break;
                         if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
                     }
+                }
+                if (safetyGotOuter) {
+                    DiagLog("[Eval] BEGINDLGPKT safety: returning captured outer result");
+                    r.result = std::move(safetyCaptured);
+                    if (r.result.kind == WExpr::Symbol &&
+                        stripCtx(r.result.strVal) == "$Aborted")
+                        r.aborted = true;
+                    drainStalePackets(lp, opts);
+                    return r;
                 }
                 // Continue outer drain loop — original RETURNPKT is still coming.
                 continue;
@@ -3120,7 +3156,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
     // version — mirrors package.json "version"; read-only string constant.
-    exports.Set("version", Napi::String::New(env, "0.6.4"));
+    exports.Set("version", Napi::String::New(env, "0.6.5"));
     return exports;
 }
 

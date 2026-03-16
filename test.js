@@ -1489,8 +1489,10 @@ async function main() {
             s.setDynamicInterval(300);
 
             // Step 2: long enough eval for ScheduledTask to fire at least once.
+            // Use interactive mode — matches the extension's actual cell-eval path
+            // and lets the kernel process Dialog[] commands during Pause[].
             const r1 = await withTimeout(
-                s.evaluate('Do[Pause[0.1], {20}]; "cell1"'),
+                s.evaluate('Do[Pause[0.1], {20}]; "cell1"', { interactive: true }),
                 12000, '53 cell1'
             );
             assert(!r1.aborted && r1.result.value === 'cell1',
