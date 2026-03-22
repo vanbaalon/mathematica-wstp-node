@@ -145,4 +145,7 @@ struct EvalOptions {
     // Session-level abort flag — set by abort() on the main thread; checked in
     // the dialog inner loop to break out proactively when abort() is called.
     std::atomic<bool>*         abortFlag     = nullptr;
+    // Link-dead flag — set by DrainToEvalResult on pkt=0; early-rejects
+    // future evaluate/sub/subAuto calls without touching the broken link.
+    std::atomic<bool>*         linkDead      = nullptr;
 };

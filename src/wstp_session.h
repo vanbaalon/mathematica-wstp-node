@@ -48,6 +48,7 @@ public:
     Napi::Value IsOpen       (const Napi::CallbackInfo& info);
     Napi::Value IsDialogOpen (const Napi::CallbackInfo& info);
     Napi::Value IsReady      (const Napi::CallbackInfo& info);
+    Napi::Value IsLinkDead   (const Napi::CallbackInfo& info);
     Napi::Value KernelPid    (const Napi::CallbackInfo& info);
     Napi::Value DynamicActive(const Napi::CallbackInfo& info);
 
@@ -103,6 +104,7 @@ private:
     std::atomic<bool>           busy_{false};
     std::atomic<bool>           evalActive_{false};
     std::atomic<bool>           workerReadingLink_{false};
+    std::atomic<bool>           linkDead_{false};
 
     std::mutex                  queueMutex_;
     std::queue<QueuedEval>      queue_;

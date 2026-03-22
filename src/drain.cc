@@ -314,10 +314,22 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
     // Helper: handle a MESSAGEPKT (already current) — shared by outer and
     // dialog inner loops.  Reads the follow-up TEXTPKT, extracts the message
     // string, appends it to r.messages, and fires the onMessage TSFN.
+    // Returns false if the link died during message handling.
     // -----------------------------------------------------------------------
-    auto handleMessage = [&]([[maybe_unused]] bool forDialog) {
+    auto handleMessage = [&]([[maybe_unused]] bool forDialog) -> bool {
         WSNewPacket(lp);  // discard message-name expression
-        if (WSNextPacket(lp) == TEXTPKT) {
+        int nextPkt = WSNextPacket(lp);
+        if (nextPkt == 0 || nextPkt == ILLEGALPKT) {
+            // Link died between MESSAGEPKT and TEXTPKT — propagate immediately.
+            const char* m = WSErrorMessage(lp);
+            std::string s = m ? m : "WSTP link error (during message)";
+            WSClearError(lp);
+            DiagLog("[Eval] handleMessage: pkt=0 after MESSAGEPKT — link dead");
+            if (opts && opts->linkDead) opts->linkDead->store(true);
+            r.result = WExpr::mkError(s);
+            return false;
+        }
+        if (nextPkt == TEXTPKT) {
             const char* s = nullptr; WSGetString(lp, &s);
             if (s) {
                 std::string text = s;
@@ -349,6 +361,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             }
         }
         WSNewPacket(lp);
+        return true;
     };
 
     // -----------------------------------------------------------------------
@@ -465,7 +478,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 dialogEndedHere = true;
                 break;
             }
-            if (p2 == MESSAGEPKT) { handleMessage(true); continue; }
+            if (p2 == MESSAGEPKT) { if (!handleMessage(true)) { r.result = WExpr::mkError("WSTP link error during dialog message"); break; } continue; }
             if (p2 == TEXTPKT) {
                 const char* s = nullptr; WSGetString(lp, &s);
                 if (s) {
@@ -633,7 +646,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             WSNewPacket(lp);
         }
         else if (pkt == MESSAGEPKT) {
-            handleMessage(false);
+            if (!handleMessage(false)) break;
         }
         else if (pkt == BEGINDLGPKT) {
             // ----------------------------------------------------------------
@@ -1035,11 +1048,15 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                     WSNewPacket(lp);
                 }
                 else if (dpkt == MESSAGEPKT) {
-                    handleMessage(true);
+                    if (!handleMessage(true)) {
+                        r.result = WExpr::mkError("WSTP link error during message");
+                        return r;
+                    }
                 }
                 else if (dpkt == 0 || dpkt == ILLEGALPKT) {
                     const char* m = WSErrorMessage(lp);
                     WSClearError(lp);
+                    if (opts && opts->linkDead) opts->linkDead->store(true);
                     if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
                     if (opts && opts->abortFlag && opts->abortFlag->load()) {
                         r.result = WExpr::mkSymbol("System`$Aborted");
@@ -1059,6 +1076,8 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             const char* m = WSErrorMessage(lp);
             std::string s = m ? m : "WSTP link error";
             WSClearError(lp);
+            DiagLog("[Eval] pkt=0 in outer loop — link dead: " + s);
+            if (opts && opts->linkDead) opts->linkDead->store(true);
             r.result = WExpr::mkError(s);
             break;
         }

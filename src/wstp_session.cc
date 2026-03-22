@@ -36,6 +36,7 @@ Napi::Object WstpSession::Init(Napi::Env env, Napi::Object exports) {
         InstanceAccessor<&WstpSession::IsOpen>        ("isOpen"),
         InstanceAccessor<&WstpSession::IsDialogOpen>  ("isDialogOpen"),
         InstanceAccessor<&WstpSession::IsReady>       ("isReady"),
+        InstanceAccessor<&WstpSession::IsLinkDead>    ("isLinkDead"),
         InstanceAccessor<&WstpSession::KernelPid>     ("kernelPid"),
         InstanceAccessor<&WstpSession::DynamicActive> ("dynamicActive"),
     });
@@ -135,6 +136,10 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
         deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
         return promise;
     }
+    if (linkDead_.load()) {
+        deferred.Reject(Napi::Error::New(env, "WSTP link is dead").Value());
+        return promise;
+    }
     if (info.Length() < 1 || !info[0].IsString()) {
         deferred.Reject(Napi::TypeError::New(env, "evaluate(expr: string, opts?: object)").Value());
         return promise;
@@ -179,6 +184,7 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
     opts.dialogPending = &dialogPending_;
     opts.dialogOpen    = &dialogOpen_;
     opts.abortFlag     = &abortFlag_;
+    opts.linkDead      = &linkDead_;
     opts.dynMutex      = &dynMutex_;
     opts.dynRegistry   = &dynRegistry_;
     opts.dynResults    = &dynResults_;
@@ -335,26 +341,105 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
 // StartWhenIdleWorker
 // ---------------------------------------------------------------------------
 void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
-    if (dynTaskInstalledInterval_ > 0) {
-        item.expr = "Quiet[$wstpDynTaskStop=True;"
-                    "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
-                    "$wstpDynTaskStop=.;$wstpDynTask=.];" + item.expr;
+    bool hadTask = (dynTaskInstalledInterval_ > 0);
+    if (hadTask) {
         dynTaskInstalledInterval_ = 0;
-        DiagLog("[when-idle] prepending ScheduledTask stop");
+        DiagLog("[when-idle] will stop ScheduledTask before eval");
     }
     struct WhenIdleWorker : public Napi::AsyncWorker {
         WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
                        std::atomic<bool>& workerReadingLink,
-                       std::function<void()> done)
+                       std::function<void()> done, bool stopTask)
             : Napi::AsyncWorker(d.Env()),
               deferred_(std::move(d)), lp_(lp), expr_(std::move(expr)),
-              workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
+              workerReadingLink_(workerReadingLink), done_(std::move(done)),
+              stopTask_(stopTask) {}
 
         void Execute() override {
-            if (WSReady(lp_)) {
-                DiagLog("[when-idle] pre-eval: stale data on link — draining");
-                drainStalePackets(lp_, nullptr);
+            // ---- Phase A: drain ALL stale Dialogs from the ScheduledTask ----
+            // The ScheduledTask fires Dialog[] every ~300 ms.  We need to
+            // close every pending Dialog AND stop the task so that no new
+            // Dialog opens while we send our EvaluatePacket.
+            //
+            // Strategy: read packets from the link.  When we see a
+            // BEGINDLGPKT, enter the Dialog, send a command that both
+            // suppresses the task AND exits the Dialog (via Return[]),
+            // then drain until ENDDLGPKT.  Repeat until 400 ms of silence
+            // (longer than one ScheduledTask interval).
+            if (stopTask_) {
+                auto lastActivity = std::chrono::steady_clock::now();
+                auto hardDeadline = std::chrono::steady_clock::now() +
+                                    std::chrono::milliseconds(2000);
+                while (std::chrono::steady_clock::now() < hardDeadline) {
+                    if (!WSReady(lp_)) {
+                        auto silence = std::chrono::steady_clock::now() - lastActivity;
+                        if (silence > std::chrono::milliseconds(400))
+                            break;  // 400 ms of silence — task stopped
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        continue;
+                    }
+                    lastActivity = std::chrono::steady_clock::now();
+                    int pkt = WSNextPacket(lp_);
+                    DiagLog("[when-idle] drain pkt=" + std::to_string(pkt));
+                    if (pkt == BEGINDLGPKT) {
+                        WSNewPacket(lp_);
+                        // Pre-drain until INPUTNAMEPKT (Dialog prompt).
+                        {
+                            auto dl = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(500);
+                            while (std::chrono::steady_clock::now() < dl) {
+                                if (!WSReady(lp_)) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::milliseconds(2));
+                                    continue;
+                                }
+                                int ipkt = WSNextPacket(lp_);
+                                DiagLog("[when-idle] dlg pre-drain pkt=" +
+                                        std::to_string(ipkt));
+                                WSNewPacket(lp_);
+                                if (ipkt == INPUTNAMEPKT) break;
+                                if (ipkt == 0 || ipkt == ILLEGALPKT) {
+                                    WSClearError(lp_);
+                                    break;
+                                }
+                            }
+                        }
+                        // Stop the ScheduledTask AND close the Dialog
+                        // in one EnterTextPacket (the correct packet type
+                        // for Dialog input).
+                        const char* stopClose =
+                            "$wstpDynTaskStop=True;"
+                            "Quiet[If[ValueQ[$wstpDynTask],"
+                            "RemoveScheduledTask[$wstpDynTask]]];"
+                            "$wstpDynTask=.;"
+                            "Return[$Failed]";
+                        WSPutFunction(lp_, "EnterTextPacket", 1);
+                        WSPutUTF8String(
+                            lp_,
+                            reinterpret_cast<const unsigned char*>(stopClose),
+                            static_cast<int>(std::strlen(stopClose)));
+                        WSEndPacket(lp_);
+                        WSFlush(lp_);
+                        DiagLog("[when-idle] sent stop+Return inside Dialog");
+                        drainUntilEndDialog(lp_, 3000);
+                        lastActivity = std::chrono::steady_clock::now();
+                    } else if (pkt == 0 || pkt == ILLEGALPKT) {
+                        WSClearError(lp_);
+                        break;
+                    } else {
+                        WSNewPacket(lp_);  // discard INPUTNAMEPKT, etc.
+                    }
+                }
+                DiagLog("[when-idle] drain complete — ScheduledTask stopped");
+            } else {
+                // No ScheduledTask — just drain any stale packets.
+                if (WSReady(lp_)) {
+                    DiagLog("[when-idle] pre-eval: stale data on link — draining");
+                    drainStalePackets(lp_, nullptr);
+                }
             }
+
+            // ---- Phase B: send the actual eval (no more Dialog expected) ----
             if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
                 !WSPutFunction(lp_, "ToExpression",   1) ||
                 !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
@@ -390,13 +475,15 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
         std::string             expr_;
         std::atomic<bool>&      workerReadingLink_;
         std::function<void()>   done_;
+        bool                    stopTask_;
         EvalResult              result_;
     };
 
     workerReadingLink_.store(true, std::memory_order_release);
     (new WhenIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
                         workerReadingLink_,
-                        [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); }))->Queue();
+                        [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
+                        hadTask))->Queue();
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +496,10 @@ Napi::Value WstpSession::Sub(const Napi::CallbackInfo& info) {
 
     if (!open_) {
         deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
+        return promise;
+    }
+    if (linkDead_.load()) {
+        deferred.Reject(Napi::Error::New(env, "WSTP link is dead").Value());
         return promise;
     }
     if (info.Length() < 1 || !info[0].IsString()) {
@@ -435,6 +526,10 @@ Napi::Value WstpSession::SubWhenIdle(const Napi::CallbackInfo& info) {
 
     if (!open_) {
         deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
+        return promise;
+    }
+    if (linkDead_.load()) {
+        deferred.Reject(Napi::Error::New(env, "WSTP link is dead").Value());
         return promise;
     }
     if (info.Length() < 1 || !info[0].IsString()) {
@@ -474,6 +569,10 @@ Napi::Value WstpSession::SubAuto(const Napi::CallbackInfo& info) {
 
     if (!open_) {
         deferred.Reject(Napi::Error::New(env, "Session is closed").Value());
+        return promise;
+    }
+    if (linkDead_.load()) {
+        deferred.Reject(Napi::Error::New(env, "WSTP link is dead").Value());
         return promise;
     }
     if (info.Length() < 1 || !info[0].IsString()) {
@@ -867,10 +966,14 @@ Napi::Value WstpSession::IsDialogOpen(const Napi::CallbackInfo& info) {
 Napi::Value WstpSession::IsReady(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(info.Env(),
         open_
+        && !linkDead_.load(std::memory_order_relaxed)
         && !busy_.load(std::memory_order_relaxed)
         && !dialogOpen_.load(std::memory_order_relaxed)
         && queue_.empty()
         && subIdleQueue_.empty());
+}
+Napi::Value WstpSession::IsLinkDead(const Napi::CallbackInfo& info) {
+    return Napi::Boolean::New(info.Env(), linkDead_.load());
 }
 Napi::Value WstpSession::KernelPid(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), static_cast<double>(kernelPid_));
@@ -951,6 +1054,7 @@ void WstpSession::StartDynTimer() {
 void WstpSession::CleanUp() {
     dynIntervalMs_.store(0);
     dynTimerRunning_.store(false);
+    linkDead_.store(false);
 
     if (autoTsfnActive_.load()) {
         autoTsfnActive_.store(false);

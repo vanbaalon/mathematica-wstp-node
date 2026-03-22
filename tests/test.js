@@ -10,6 +10,7 @@
 //         subAuto() (auto-routing: idle→subWhenIdle, busy→Dialog[] inline eval).
 // 0.6.2: BEGINDLGPKT safety fallback (Bug 1A), setDynAutoMode cleanup (Bug 1B).
 // 0.6.3: subAuto() — unified auto-routing evaluator.
+// 0.7.1: tests 65–70 — post-eval idle subAuto hang (stale BEGINDLGPKT drain).
 
 
 const wstp = require('../build/Release/wstp.node');
@@ -2024,6 +2025,302 @@ async function main() {
             s.close();
         }
     }, 60000);
+
+    // ── 65. Post-eval idle subAuto hang — full extension flow ─────────────
+    // Replicates the exact extension pattern that causes a permanent hang:
+    //   3 registered Dynamic entries (2 widget slots + watch panel),
+    //   many busy-path subAuto calls during Do[Pause[...], ...],
+    //   then idle-path subAuto after eval completes.
+    // The stale ScheduledTask BEGINDLGPKT after eval end corrupts the link
+    // and the idle-path eval hangs forever.
+    await run('65. post-eval idle subAuto hang — full extension flow (3 dyn + many busy subAuto)', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '65 warmup');
+
+            s.registerDynamic('_t65_slot1', 'ToString[n]');
+            s.registerDynamic('_t65_slot2', 'ToString[n]');
+            s.registerDynamic('_t65_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            );
+
+            await sleep(1000);
+            assert(!s.isReady, '65: kernel should be busy');
+
+            let busyCalls = 0;
+            for (let i = 0; i < 8; i++) {
+                if (s.isReady) break;
+                try {
+                    await withTimeout(
+                        s.subAuto('ToString[n]'),
+                        5000, `65 busy subAuto #${i + 1}`
+                    );
+                    busyCalls++;
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            const mainResult = await withTimeout(evalPromise, 30000, '65 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'done',
+                `65 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            // THE CRITICAL CALL: post-eval idle-path subAuto
+            const idleResult = await withTimeout(
+                s.subAuto('ToString[1 + 1]'),
+                10000, '65 post-eval idle subAuto'
+            );
+            assert(idleResult.value === '2',
+                `65 idle expected "2", got "${idleResult?.value}"`);
+
+            // Verify kernel still functional
+            const nextCell = await withTimeout(s.evaluate('2 + 2'), 10000, '65 follow-up');
+            assert(nextCell.result.value === 4,
+                `65 follow-up expected 4, got ${nextCell.result.value}`);
+
+            s.unregisterDynamic('_t65_slot1');
+            s.unregisterDynamic('_t65_slot2');
+            s.unregisterDynamic('_t65_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 66. Post-eval idle subAuto — 3 dyn entries, NO JS subAuto calls ───
+    // Only C++-internal Dialog cycle processing during the busy eval.
+    // Tests whether the C++ auto-ScheduledTask alone can trigger the hang.
+    await run('66. post-eval idle subAuto — 3 dyn entries, no JS subAuto during busy', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '66 warmup');
+
+            s.registerDynamic('_t66_slot1', 'ToString[n]');
+            s.registerDynamic('_t66_slot2', 'ToString[n]');
+            s.registerDynamic('_t66_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            );
+
+            const mainResult = await withTimeout(evalPromise, 30000, '66 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'done',
+                `66 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            const idleResult = await withTimeout(
+                s.subAuto('ToString[1 + 1]'),
+                10000, '66 post-eval idle subAuto'
+            );
+            assert(idleResult.value === '2',
+                `66 idle expected "2", got "${idleResult?.value}"`);
+
+            const nextCell = await withTimeout(s.evaluate('2 + 2'), 10000, '66 follow-up');
+            assert(nextCell.result.value === 4,
+                `66 follow-up expected 4, got ${nextCell.result.value}`);
+
+            s.unregisterDynamic('_t66_slot1');
+            s.unregisterDynamic('_t66_slot2');
+            s.unregisterDynamic('_t66_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 67. Post-eval idle subAuto — 1 dyn entry + many JS subAuto calls ──
+    // Tests whether many JS-initiated busy-path subAuto calls with a single
+    // registered Dynamic entry can trigger the hang (vs. multiple entries).
+    await run('67. post-eval idle subAuto — 1 dyn entry + many JS subAuto', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '67 warmup');
+
+            s.registerDynamic('_t67_slot1', 'ToString[n]');
+            s.setDynamicInterval(300);
+
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            );
+
+            await sleep(1000);
+            let busyCalls = 0;
+            for (let i = 0; i < 8; i++) {
+                if (s.isReady) break;
+                try {
+                    await withTimeout(
+                        s.subAuto('ToString[n]'),
+                        5000, `67 busy subAuto #${i + 1}`
+                    );
+                    busyCalls++;
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            const mainResult = await withTimeout(evalPromise, 30000, '67 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'done',
+                `67 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            const idleResult = await withTimeout(
+                s.subAuto('ToString[1 + 1]'),
+                10000, '67 post-eval idle subAuto'
+            );
+            assert(idleResult.value === '2',
+                `67 idle expected "2", got "${idleResult?.value}"`);
+
+            const nextCell = await withTimeout(s.evaluate('2 + 2'), 10000, '67 follow-up');
+            assert(nextCell.result.value === 4,
+                `67 follow-up expected 4, got ${nextCell.result.value}`);
+
+            s.unregisterDynamic('_t67_slot1');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 68. Post-eval IMMEDIATE idle subAuto — no cooldown ────────────────
+    // Same as 65 but calls subAuto immediately after eval completes (no sleep).
+    // Tests the zero-latency transition from busy→idle.
+    await run('68. post-eval immediate idle subAuto — no cooldown', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '68 warmup');
+
+            s.registerDynamic('_t68_slot1', 'ToString[n]');
+            s.registerDynamic('_t68_slot2', 'ToString[n]');
+            s.registerDynamic('_t68_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            let evalDone = false;
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            ).then(r => { evalDone = true; return r; });
+
+            await sleep(1000);
+            for (let i = 0; i < 8 && !evalDone; i++) {
+                try {
+                    await withTimeout(s.subAuto('ToString[n]'), 5000, `68 busy #${i + 1}`);
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            await withTimeout(evalPromise, 30000, '68 main eval');
+
+            // Immediately — no sleep/cooldown
+            const idleResult = await withTimeout(
+                s.subAuto('ToString[1 + 1]'),
+                10000, '68 immediate idle subAuto'
+            );
+            assert(idleResult.value === '2',
+                `68 idle expected "2", got "${idleResult?.value}"`);
+
+            s.unregisterDynamic('_t68_slot1');
+            s.unregisterDynamic('_t68_slot2');
+            s.unregisterDynamic('_t68_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 69. Post-eval subWhenIdle after busy Dialog cycles ────────────────
+    // Same scenario but uses subWhenIdle() directly. Isolates whether the bug
+    // is in subAuto routing logic or the underlying idle eval path.
+    await run('69. post-eval subWhenIdle after busy Dialog cycles', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '69 warmup');
+
+            s.registerDynamic('_t69_slot1', 'ToString[n]');
+            s.registerDynamic('_t69_slot2', 'ToString[n]');
+            s.registerDynamic('_t69_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            let evalDone = false;
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            ).then(r => { evalDone = true; return r; });
+
+            await sleep(1000);
+            for (let i = 0; i < 8 && !evalDone; i++) {
+                try {
+                    await withTimeout(s.subAuto('ToString[n]'), 5000, `69 busy #${i + 1}`);
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            await withTimeout(evalPromise, 30000, '69 main eval');
+
+            // subWhenIdle instead of subAuto
+            const idleResult = await withTimeout(
+                s.subWhenIdle('ToString[1 + 1]'),
+                10000, '69 post-eval subWhenIdle'
+            );
+            assert(idleResult.value === '2',
+                `69 idle expected "2", got "${idleResult?.value}"`);
+
+            s.unregisterDynamic('_t69_slot1');
+            s.unregisterDynamic('_t69_slot2');
+            s.unregisterDynamic('_t69_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 70. Post-eval evaluate() after busy Dialog cycles ─────────────────
+    // Same scenario but uses evaluate() for the post-eval call.
+    // If this hangs too, the bug is in the core idle evaluation path.
+    await run('70. post-eval evaluate() after busy Dialog cycles', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '70 warmup');
+
+            s.registerDynamic('_t70_slot1', 'ToString[n]');
+            s.registerDynamic('_t70_slot2', 'ToString[n]');
+            s.registerDynamic('_t70_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            let evalDone = false;
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            ).then(r => { evalDone = true; return r; });
+
+            await sleep(1000);
+            for (let i = 0; i < 8 && !evalDone; i++) {
+                try {
+                    await withTimeout(s.subAuto('ToString[n]'), 5000, `70 busy #${i + 1}`);
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            await withTimeout(evalPromise, 30000, '70 main eval');
+
+            // Regular evaluate()
+            const nextResult = await withTimeout(
+                s.evaluate('1 + 1'),
+                10000, '70 post-eval evaluate()'
+            );
+            assert(nextResult.result.value === 2,
+                `70 evaluate expected 2, got ${nextResult.result.value}`);
+
+            s.unregisterDynamic('_t70_slot1');
+            s.unregisterDynamic('_t70_slot2');
+            s.unregisterDynamic('_t70_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
 
     // ── Teardown ──────────────────────────────────────────────────────────
     _mainSession = null;

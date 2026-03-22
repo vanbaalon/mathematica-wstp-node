@@ -56,10 +56,14 @@ void EvaluateWorker::Execute() {
 
         if (needInstall) {
             double intervalSec = opts_.dynIntervalMs / 1000.0;
+            // $wstpDynTaskStop stays True — the ScheduledTask is
+            // initially suppressed.  Phase 3's "$wstpDynTaskStop=.;"
+            // unsuppresses it only once the kernel is evaluating the
+            // main expression, avoiding a race where Dialog[] fires
+            // before the kernel reads the main EvaluatePacket.
             std::string taskExpr =
                 "Quiet[$wstpDynTaskStop = True;"
                 " If[ValueQ[$wstpDynTask], RemoveScheduledTask[$wstpDynTask]];"
-                " $wstpDynTaskStop =.;"
                 " $wstpDynTask = RunScheduledTask["
                 "If[!TrueQ[$wstpDynTaskStop], Dialog[]], " +
                 std::to_string(intervalSec) + "]]";

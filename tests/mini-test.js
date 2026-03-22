@@ -2,7 +2,7 @@
 
 // ── mini-test.js — minimal fast diagnostic subset ────────────────────────
 // Purpose: quickly verify abort/dialog/interrupt recovery without running
-// the full 64-test suite (~5+ min).  Covers the 6 most indicative tests:
+// the full 70-test suite (~5+ min).  Covers the 7 most indicative tests:
 //
 //   M1  — basic eval (sanity)                         ~2s
 //   M2  — abort + session survives                    ~3s
@@ -10,8 +10,9 @@
 //   M4  — test 48: abort then Dynamic eval recovers   ~8s
 //   M5  — test 56: stale interrupt aborts cleanly     ~10s
 //   M6  — test 49: rapid cell transitions + Dynamic   ~8s
+//   M7  — test 65: post-eval idle subAuto hang         ~15s
 //
-// Total: ~50s vs ~300s+ for full suite.
+// Total: ~65s vs ~300s+ for full suite.
 //
 // Usage:
 //   node tests/mini-test.js                    # run all 6
@@ -350,12 +351,76 @@ async function main() {
         }
     });
 
+    // ── M7: post-eval idle subAuto hang — full extension flow ──────────────
+    // Replicates the exact extension pattern: 3 registered Dynamic entries,
+    // busy-path subAuto calls during Do[Pause[...], ...], then idle-path
+    // subAuto after eval completes.  The stale ScheduledTask BEGINDLGPKT
+    // after eval end can corrupt the link — idle eval hangs forever.
+    await run('M7. post-eval idle subAuto hang (3 dyn + busy subAuto + idle)', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, 'M7 warmup');
+
+            s.registerDynamic('_m7_slot1', 'ToString[n]');
+            s.registerDynamic('_m7_slot2', 'ToString[n]');
+            s.registerDynamic('_m7_watch', 'ToString[{n}]');
+            s.setDynamicInterval(300);
+
+            const evalPromise = s.evaluate(
+                'Do[n = k; Pause[1]; Print[n], {k, 1, 6}]; "done"',
+                { interactive: true }
+            );
+
+            await sleep(1000);
+            assert(!s.isReady, 'M7: kernel should be busy');
+
+            let busyCalls = 0;
+            for (let i = 0; i < 8; i++) {
+                if (s.isReady) break;
+                try {
+                    await withTimeout(
+                        s.subAuto('ToString[n]'),
+                        5000, `M7 busy subAuto #${i + 1}`
+                    );
+                    busyCalls++;
+                } catch (_) {}
+                await sleep(750);
+            }
+
+            const mainResult = await withTimeout(evalPromise, 30000, 'M7 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'done',
+                `M7 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            // THE CRITICAL CALL: post-eval idle-path subAuto
+            const idleResult = await withTimeout(
+                s.subAuto('ToString[1 + 1]'),
+                10000, 'M7 post-eval idle subAuto'
+            );
+            assert(idleResult.value === '2',
+                `M7 idle expected "2", got "${idleResult?.value}"`);
+
+            // Verify kernel still functional
+            // NOTE: explicit interactive:false to avoid inheriting the
+            // previous cell's EnterExpressionPacket mode.
+            const nextCell = await withTimeout(s.evaluate('2 + 2', {interactive: false}), 10000, 'M7 follow-up');
+            assert(nextCell.result.value === 4,
+                `M7 follow-up expected 4, got ${nextCell.result.value}`);
+
+            s.unregisterDynamic('_m7_slot1');
+            s.unregisterDynamic('_m7_slot2');
+            s.unregisterDynamic('_m7_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, T(90000));
+
     // ── Summary ───────────────────────────────────────────────────────────
-    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 6`);
+    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 7`);
     if (failedTests.length > 0) {
         console.log('Failed:', failedTests.join(', '));
     }
-    console.log(failed === 0 ? 'All mini-tests PASSED ✓' : 'Some mini-tests FAILED ✗');
+    console.log(failed === 0 ? 'All mini-tests PASSED \u2713' : 'Some mini-tests FAILED \u2717');
 
     _watchdogProc.kill('SIGKILL');
     process.exit(failed > 0 ? 1 : 0);

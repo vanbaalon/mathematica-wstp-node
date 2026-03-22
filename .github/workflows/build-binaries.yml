@@ -1,10 +1,30 @@
 # mathematica-wstp-node / .github/workflows/build-binaries.yml
 #
-# Builds platform-native wstp.node binaries on self-hosted runners
-# (your Mac ARM64 + Windows x64 machines, both with Wolfram Engine installed),
-# then publishes them as assets on a GitHub Release.
+# Builds platform-native wstp.node binaries and publishes them as GitHub
+# Release assets.  The wolfbook extension downloads these assets to package
+# platform-specific VSIXs.
 #
-# The wolfbook extension repo downloads these assets to package VSIXs.
+# ── Platform strategy ────────────────────────────────────────────────────────
+#
+#  Platform          Runner               WSTP SDK source
+#  ────────────────  ───────────────────  ─────────────────────────────────────
+#  linux-x64         GitHub-hosted        docker cp from wolframresearch/wolframengine
+#  linux-arm64       GitHub-hosted (ARM)  docker cp from wolframresearch/wolframengine (arm64)
+#                    fallback: QEMU       same, via QEMU on x64 host — see NOTE below
+#  darwin-arm64      self-hosted Mac M1   /Applications/Wolfram 3.app  (pre-installed)
+#  darwin-x64        self-hosted Intel    /Applications/Wolfram 3.app  (pre-installed)
+#  win32-x64         self-hosted Windows  auto-detected by scripts/wstp_dir.js
+#
+# NOTE — linux-arm64 runner label:
+#   `ubuntu-22.04-arm` and `ubuntu-24.04-arm` are available on GitHub Teams /
+#   Enterprise plans and on free plans via the public_repos beta (2025).
+#   If the runner is unavailable the job will fail with "No hosted runner found".
+#   Uncomment the QEMU fallback job further below to use x64+QEMU instead.
+#
+# NOTE — wolframresearch/wolframengine Docker image:
+#   We only call `docker create` + `docker cp` — the container is *never started*.
+#   No Wolfram licence is required to copy files from a Docker image layer.
+#   Wolfram Engine version is detected at runtime so `latest` always works.
 #
 # Triggers:
 #   - Push of a version tag:  git tag v0.x.x && git push --tags
@@ -19,20 +39,157 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create (e.g. v0.4.1)'
+        description: 'Release tag to create (e.g. v0.7.1)'
         required: true
 
+env:
+  NODE_VERSION: '22'
+  # Pin to a specific WolframEngine image tag for reproducible builds.
+  # List of tags: https://hub.docker.com/r/wolframresearch/wolframengine/tags
+  WE_IMAGE: wolframresearch/wolframengine:latest
+
 jobs:
-  # ── macOS ARM64 ──────────────────────────────────────────────────────────
+
+  # ── Linux x64 — GitHub-hosted, WSTP SDK from Docker image ───────────────
+  build-linux-x64:
+    name: linux-x64 (GitHub-hosted)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # clang is pre-installed on ubuntu-22.04 runners but ensure it's present
+      - name: Ensure clang is available
+        run: clang++ --version || sudo apt-get install -y clang
+
+      # --- Extract WSTP SDK without starting the kernel ---
+      # `docker create` + `docker cp` reads from image filesystem layers only.
+      # The container is never started → no Wolfram licence required.
+      - name: Extract WSTP SDK (linux/amd64)
+        run: |
+          docker pull --platform linux/amd64 "$WE_IMAGE"
+          # Detect the WolframEngine version directory (e.g. "14.2")
+          WE_VER=$(docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/ls "$WE_IMAGE" \
+            /usr/local/Wolfram/WolframEngine/ | head -1)
+          echo "Detected WolframEngine version: $WE_VER"
+          CID=$(docker create --platform linux/amd64 "$WE_IMAGE")
+          docker cp \
+            "$CID:/usr/local/Wolfram/WolframEngine/$WE_VER/SystemFiles/Links/WSTP/DeveloperKit/Linux-x86-64/CompilerAdditions" \
+            wstp-sdk
+          docker rm "$CID"
+          echo "SDK contents:"; ls wstp-sdk
+
+      - name: Build
+        run: npm ci && npm run build
+        env:
+          WSTP_DIR: ${{ github.workspace }}/wstp-sdk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wstp-linux-x64
+          path: build/Release/wstp.node
+
+  # ── Linux ARM64 — GitHub-hosted ARM runner ───────────────────────────────
+  # Requires ubuntu-22.04-arm runner (available on Teams/Enterprise and free
+  # public repos beta).  See NOTE at top of file.
+  # To use QEMU on x64 instead, comment this job out and uncomment the QEMU
+  # job further below.
+  build-linux-arm64:
+    name: linux-arm64 (GitHub-hosted ARM)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Ensure clang is available
+        run: clang++ --version || sudo apt-get install -y clang
+
+      - name: Extract WSTP SDK (linux/arm64)
+        run: |
+          docker pull --platform linux/arm64 "$WE_IMAGE"
+          WE_VER=$(docker run --rm --platform linux/arm64 \
+            --entrypoint /bin/ls "$WE_IMAGE" \
+            /usr/local/Wolfram/WolframEngine/ | head -1)
+          echo "Detected WolframEngine version: $WE_VER"
+          CID=$(docker create --platform linux/arm64 "$WE_IMAGE")
+          docker cp \
+            "$CID:/usr/local/Wolfram/WolframEngine/$WE_VER/SystemFiles/Links/WSTP/DeveloperKit/Linux-ARM64/CompilerAdditions" \
+            wstp-sdk
+          docker rm "$CID"
+          echo "SDK contents:"; ls wstp-sdk
+
+      - name: Build
+        run: npm ci && npm run build
+        env:
+          WSTP_DIR: ${{ github.workspace }}/wstp-sdk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wstp-linux-arm64
+          path: build/Release/wstp.node
+
+  # ── Linux ARM64 — QEMU fallback (x64 host + QEMU emulation) ─────────────
+  # Uncomment this job and comment out build-linux-arm64 above if you do not
+  # have access to native ARM64 GitHub-hosted runners.
+  # Slower than native (~3-5× for the compile step) but works on free plans.
+  #
+  # build-linux-arm64-qemu:
+  #   name: linux-arm64 (QEMU)
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Set up QEMU (ARM64)
+  #       uses: docker/setup-qemu-action@v3
+  #       with: { platforms: arm64 }
+  #
+  #     - name: Extract WSTP SDK (linux/arm64)
+  #       run: |
+  #         docker pull --platform linux/arm64 "$WE_IMAGE"
+  #         WE_VER=$(docker run --rm --platform linux/arm64 \
+  #           --entrypoint /bin/ls "$WE_IMAGE" \
+  #           /usr/local/Wolfram/WolframEngine/ | head -1)
+  #         echo "Detected WolframEngine version: $WE_VER"
+  #         CID=$(docker create --platform linux/arm64 "$WE_IMAGE")
+  #         docker cp \
+  #           "$CID:/usr/local/Wolfram/WolframEngine/$WE_VER/SystemFiles/Links/WSTP/DeveloperKit/Linux-ARM64/CompilerAdditions" \
+  #           wstp-sdk
+  #         docker rm "$CID"
+  #       env:
+  #         WE_IMAGE: ${{ env.WE_IMAGE }}
+  #
+  #     # Compile inside an ARM64 Node container via QEMU
+  #     - name: Build (ARM64 via QEMU)
+  #       run: |
+  #         docker run --rm --platform linux/arm64 \
+  #           -v "${{ github.workspace }}:/workspace" \
+  #           -w /workspace \
+  #           -e WSTP_DIR=/workspace/wstp-sdk \
+  #           node:22-bookworm \
+  #           bash -c "apt-get update -q && apt-get install -yq clang && npm ci && npm run build"
+  #
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: wstp-linux-arm64
+  #         path: build/Release/wstp.node
+
+  # ── macOS ARM64 — self-hosted Mac M1 (Wolfram 3.app pre-installed) ───────
   build-darwin-arm64:
-    name: Build darwin-arm64
+    name: darwin-arm64 (self-hosted)
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Build
         run: npm ci && npm run build
@@ -44,16 +201,39 @@ jobs:
           name: wstp-darwin-arm64
           path: build/Release/wstp.node
 
-  # ── Windows x64 ─────────────────────────────────────────────────────────
+  # ── macOS x64 — self-hosted Intel Mac (optional) ─────────────────────────
+  # Comment this job out if you do not have an Intel Mac self-hosted runner.
+  build-darwin-x64:
+    name: darwin-x64 (self-hosted)
+    runs-on: [self-hosted, macOS, X64]
+    continue-on-error: true   # don't block the release if Intel runner absent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build
+        run: npm ci && npm run build
+        env:
+          WSTP_DIR: /Applications/Wolfram 3.app/Contents/SystemFiles/Links/WSTP/DeveloperKit/MacOSX-x86-64/CompilerAdditions
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wstp-darwin-x64
+          path: build/Release/wstp.node
+
+  # ── Windows x64 — self-hosted (Wolfram Engine auto-detected) ────────────
   build-win32-x64:
-    name: Build win32-x64
+    name: win32-x64 (self-hosted)
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Build
         shell: cmd
@@ -62,32 +242,42 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wstp-win32-x64
-          path: build/Release/wstp.node
+          path: build\Release\wstp.node
 
-  # ── GitHub Release ───────────────────────────────────────────────────────
+  # ── Collect artifacts & publish GitHub Release ───────────────────────────
   release:
-    name: Create Release
-    needs: [build-darwin-arm64, build-win32-x64]
+    name: Create GitHub Release
+    # Wait for all required builds.  darwin-x64 is optional (continue-on-error).
+    needs:
+      - build-linux-x64
+      - build-linux-arm64
+      - build-darwin-arm64
+      - build-win32-x64
+    # Run even if optional jobs were skipped or failed so the release
+    # is created with whatever binaries are available.
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Download all wstp-* artifacts into artifacts/<name>/wstp.node
       - uses: actions/download-artifact@v4
         with:
-          name: wstp-darwin-arm64
-          path: artifacts/darwin-arm64/
+          path: artifacts/
+          pattern: wstp-*
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: wstp-win32-x64
-          path: artifacts/win32-x64/
-
-      - name: Rename artifacts
+      - name: Flatten artifacts (platform-named .node files)
         run: |
-          mv artifacts/darwin-arm64/wstp.node artifacts/wstp-darwin-arm64.node
-          mv artifacts/win32-x64/wstp.node    artifacts/wstp-win32-x64.node
+          mkdir -p dist
+          for dir in artifacts/wstp-*/; do
+            platform=$(basename "$dir")
+            if [[ -f "$dir/wstp.node" ]]; then
+              cp "$dir/wstp.node" "dist/${platform}.node"
+              echo "  ✓  dist/${platform}.node"
+            fi
+          done
 
-      - name: Determine tag
+      - name: Determine release tag
         id: tag
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -101,6 +291,4 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: wstp-node ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
-          files: |
-            artifacts/wstp-darwin-arm64.node
-            artifacts/wstp-win32-x64.node
+          files: dist/*.node
