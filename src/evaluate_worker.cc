@@ -59,16 +59,13 @@ void EvaluateWorker::Execute() {
 
         if (needInstall) {
             double intervalSec = opts_.dynIntervalMs / 1000.0;
-            // $wstpDynTaskStop stays True — the ScheduledTask is
-            // initially suppressed.  Phase 3's "$wstpDynTaskStop=.;"
-            // unsuppresses it only once the kernel is evaluating the
-            // main expression, avoiding a race where Dialog[] fires
-            // before the kernel reads the main EvaluatePacket.
+            // ScheduledTask always calls Dialog[] unconditionally.
+            // C++ handles every BEGINDLGPKT based on its state tracking
+            // (dialogOpen_, workerReadingLink_, dynAutoMode, etc.).
             std::string taskExpr =
-                "Quiet[$wstpDynTaskStop = True;"
+                "Quiet["
                 " If[ValueQ[$wstpDynTask], RemoveScheduledTask[$wstpDynTask]];"
-                " $wstpDynTask = RunScheduledTask["
-                "If[!TrueQ[$wstpDynTaskStop], Dialog[]], " +
+                " $wstpDynTask = RunScheduledTask[Dialog[], " +
                 std::to_string(intervalSec) + "]]";
             DiagLog("[Eval] dynAutoMode: installing ScheduledTask interval=" +
                     std::to_string(intervalSec) + "s");
@@ -90,20 +87,9 @@ void EvaluateWorker::Execute() {
         }
     }
 
-    // ---- ScheduledTask Dialog[] suppression ----
-    int installedTask = opts_.dynTaskInstalledInterval
-                      ? *opts_.dynTaskInstalledInterval : 0;
-    DiagLog("[Eval] suppress check: installedTask=" + std::to_string(installedTask));
+    // No kernel-level flag manipulation needed — C++ handles all
+    // BEGINDLGPKT packets based on its own state tracking.
     std::string sendExpr = expr_;
-    if (installedTask > 0) {
-        if (opts_.rejectDialog) {
-            sendExpr = "$wstpDynTaskStop=True;" + expr_;
-            DiagLog("[Eval] prepend $wstpDynTaskStop=True (rejectDialog)");
-        } else {
-            sendExpr = "$wstpDynTaskStop=.;" + expr_;
-            DiagLog("[Eval] prepend $wstpDynTaskStop=. (main eval)");
-        }
-    }
 
     DiagLog("[Eval] about to send " + std::string(interactive_ ? "EnterExpressionPacket" : "EvaluatePacket")
             + " expr=" + sendExpr.substr(0, 60));

@@ -1,4 +1,5 @@
 #include "drain.h"
+#include "kernel_state.h"
 #include "diag.h"
 #include "wstp_expr.h"
 
@@ -295,9 +296,62 @@ bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
             WSNewPacket(lp);
             continue;
         }
+        // Nested dialog: ScheduledTask fired Dialog[] during our expression
+        // evaluation.  Auto-close it at C++ level and continue waiting.
+        if (pkt == BEGINDLGPKT) {
+            WSNewPacket(lp);
+            // Drain to INPUTNAMEPKT (the nested dialog's prompt)
+            auto innerDl = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < innerDl) {
+                if (!WSReady(lp)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                int ip = WSNextPacket(lp);
+                DiagLog("[DynRead] nested-drain pkt=" + std::to_string(ip));
+                if (ip == MENUPKT) {
+                    WSNewPacket(lp);
+                    WSPutString(lp, "c");
+                    WSEndPacket(lp); WSFlush(lp);
+                    continue;
+                }
+                WSNewPacket(lp);
+                if (ip == INPUTNAMEPKT) break;
+                if (ip == 0 || ip == ILLEGALPKT) { WSClearError(lp); break; }
+            }
+            // Close nested dialog
+            const char* closeNested = "Return[$Failed]";
+            WSPutFunction(lp, "EnterTextPacket", 1);
+            WSPutUTF8String(lp,
+                reinterpret_cast<const unsigned char*>(closeNested),
+                static_cast<int>(std::strlen(closeNested)));
+            WSEndPacket(lp); WSFlush(lp);
+            DiagLog("[DynRead] auto-closed nested dialog");
+            // Drain until ENDDLGPKT for the nested dialog
+            auto endDl = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(1000);
+            while (std::chrono::steady_clock::now() < endDl) {
+                if (!WSReady(lp)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                int ep = WSNextPacket(lp);
+                DiagLog("[DynRead] nested-end pkt=" + std::to_string(ep));
+                if (ep == MENUPKT) {
+                    WSNewPacket(lp);
+                    WSPutString(lp, "c");
+                    WSEndPacket(lp); WSFlush(lp);
+                    continue;
+                }
+                WSNewPacket(lp);
+                if (ep == ENDDLGPKT) break;
+                if (ep == 0 || ep == ILLEGALPKT) { WSClearError(lp); break; }
+            }
+            continue;
+        }
         // Stale WSInterruptMessage arrived inside dialog.  Respond 'c'
         // (continue) — the kernel resumes evaluating our expression.
-        // ScheduledTask is already suppressed, so no nested Dialog opens.
         if (pkt == MENUPKT) {
             WSNewPacket(lp);
             WSPutString(lp, "c");
@@ -381,6 +435,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             WSClearError(lp);
             DiagLog("[Eval] handleMessage: pkt=0 after MESSAGEPKT — link dead");
             if (opts && opts->linkDead) opts->linkDead->store(true);
+            if (opts && opts->kernelStatus) SetLink(*opts->kernelStatus, LinkState::Dead, "drain:handleMessage:linkDead");
             r.result = WExpr::mkError(s);
             return false;
         }
@@ -733,39 +788,11 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                         if (ipkt == 0 || ipkt == ILLEGALPKT) { WSClearError(lp); dialogAlreadyClosed = true; break; }
                     }
                 }
-                // Step A: suppress ScheduledTask inside the dialog so it
-                // stops firing Dialog[] on subsequent intervals.
-                // Must be a SEPARATE EnterTextPacket — Return[] only works
-                // as standalone input, not inside CompoundExpression.
-                if (!dialogAlreadyClosed) {
-                    const char* stopExpr = "$wstpDynTaskStop=True";
-                    WSPutFunction(lp, "EnterTextPacket", 1);
-                    WSPutUTF8String(lp,
-                        reinterpret_cast<const unsigned char*>(stopExpr),
-                        static_cast<int>(std::strlen(stopExpr)));
-                    WSEndPacket(lp); WSFlush(lp);
-                    DiagLog("[Eval] rejectDialog: sent $wstpDynTaskStop=True");
-                    // Consume the result + wait for next INPUTNAMEPKT
-                    auto aDl = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(2000);
-                    while (std::chrono::steady_clock::now() < aDl) {
-                        if (!WSReady(lp)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                            continue;
-                        }
-                        int ap = WSNextPacket(lp);
-                        DiagLog("[Eval] rejectDialog: stepA pkt=" + std::to_string(ap));
-                        WSNewPacket(lp);
-                        if (ap == INPUTNAMEPKT) break;
-                        if (ap == ENDDLGPKT) { dialogAlreadyClosed = true; break; }
-                        if (ap == 0 || ap == ILLEGALPKT) { WSClearError(lp); dialogAlreadyClosed = true; break; }
-                    }
-                }
-                // Step B: close the dialog with Return[].
-                // Return[] exits the interrupt-triggered Dialog and resumes
-                // the outer evaluation.  Return[$Failed] also closes but
-                // propagates and aborts the outer eval (no RETURNPKT).
-                // Abort[] doesn't close the dialog at all.
+                // Close the dialog with Return[].
+                // No kernel-level flag needed — C++ handles all state.
+                // Return[] exits the Dialog and resumes the outer eval.
+                // drainUntilEndDialog handles any nested dialogs from
+                // ScheduledTask firing while we drain.
                 if (!dialogAlreadyClosed) {
                     const char* closeExpr = "Return[]";
                     WSPutFunction(lp, "EnterTextPacket", 1);
@@ -774,19 +801,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                         static_cast<int>(std::strlen(closeExpr)));
                     WSEndPacket(lp); WSFlush(lp);
                     DiagLog("[Eval] rejectDialog: sent Return[], draining until ENDDLGPKT");
-                    auto bDl = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(2000);
-                    while (std::chrono::steady_clock::now() < bDl) {
-                        if (!WSReady(lp)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                            continue;
-                        }
-                        int rp = WSNextPacket(lp);
-                        DiagLog("[Eval] rejectDialog: drain pkt=" + std::to_string(rp));
-                        WSNewPacket(lp);
-                        if (rp == ENDDLGPKT) break;
-                        if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
-                    }
+                    drainUntilEndDialog(lp, 3000);
                 }
                 DiagLog("[Eval] rejectDialog: dialog closed, continuing outer loop");
                 continue;
@@ -802,6 +817,22 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 // Signal the timer thread that a dialog is open so it
                 // doesn't send WSInterruptMessage while we do link I/O.
                 if (opts && opts->dialogOpen) opts->dialogOpen->store(true);
+                if (opts && opts->kernelStatus)
+                    SetDialog(*opts->kernelStatus, DialogState::DynDialog, "drain:BEGINDLGPKT:dynAuto");
+                // Safeguard: if abort is in progress, don't enter DynDialog — just close
+                if (opts && opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
+                    DiagLog("[Eval] BEGINDLGPKT dynAuto: abort in progress — auto-closing");
+                    if (opts->dialogOpen) opts->dialogOpen->store(false);
+                    if (opts->interruptPending) opts->interruptPending->store(false);
+                    SetDialog(*opts->kernelStatus, DialogState::None, "drain:BEGINDLGPKT:abortReject");
+                    const char* closeExpr = "Return[$Failed]";
+                    WSPutFunction(lp, "EnterTextPacket", 1);
+                    WSPutUTF8String(lp, reinterpret_cast<const unsigned char*>(closeExpr),
+                                   static_cast<int>(std::strlen(closeExpr)));
+                    WSEndPacket(lp); WSFlush(lp);
+                    drainUntilEndDialog(lp, 3000);
+                    continue;
+                }
                 // Also gate interruptPending_ to prevent the timer from
                 // sending WSInterruptMessage even if it checked dialogOpen_
                 // a moment before we set it (TOCTOU race).
@@ -852,24 +883,13 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                         }
                     }
 
-                    // Suppress ScheduledTask inside the dialog so it doesn't
-                    // fire competing Dialog[] calls while we do Dynamic eval.
-                    {
-                        const char* suppExpr = "$wstpDynTaskStop=True";
-                        WSPutFunction(lp, "EnterTextPacket", 1);
-                        WSPutUTF8String(lp,
-                            reinterpret_cast<const unsigned char*>(suppExpr),
-                            static_cast<int>(std::strlen(suppExpr)));
-                        WSEndPacket(lp); WSFlush(lp);
-                        DynResult suppDr;
-                        readDynResultWithTimeout(lp, suppDr, 1000, &capturedOuterResult);
-                        DiagLog("[Eval] dynAutoMode(BEGINDLG): suppressed ScheduledTask");
-                    }
-
-                    // If the outer result was NOT already captured during
-                    // the suppression step, send Dynamic expressions.
+                    // If the outer result was NOT already captured,
+                    // send Dynamic expressions.
                     if (capturedOuterResult.kind == WExpr::WError &&
                         capturedOuterResult.strVal.empty()) {
+
+                    if (opts->kernelStatus)
+                        SetSubWork(*opts->kernelStatus, SubWork::DynExpr, "drain:dynExpr:start");
 
                     auto nowMs = static_cast<double>(
                         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -877,6 +897,15 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                         .count());
 
                     for (const auto& reg : *opts->dynRegistry) {
+                        // Safeguard: check link/abort before each expression
+                        if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
+                            DiagLog("[Eval] dynExpr: link died mid-loop, stopping");
+                            break;
+                        }
+                        if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
+                            DiagLog("[Eval] dynExpr: abort detected mid-loop, stopping");
+                            break;
+                        }
                         DiagLog("[Eval] dynAutoMode(BEGINDLG): sending expr id=" + reg.id + " expr='" + reg.expr + "'");
                         bool sentDyn =
                             WSPutFunction(lp, "EnterTextPacket", 1) &&
@@ -904,6 +933,9 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
 
                     if (opts->dynLastEval)
                         *opts->dynLastEval = std::chrono::steady_clock::now();
+
+                    if (opts->kernelStatus)
+                        SetSubWork(*opts->kernelStatus, SubWork::None, "drain:dynExpr:done");
 
                     } else {
                         DiagLog("[Eval] dynAutoMode: outer result captured during suppress — skipping Dynamic exprs");
@@ -938,8 +970,20 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 if (opts && opts->autoMutex && opts->autoExprQueue && opts->autoCompleted) {
                     std::lock_guard<std::mutex> aLk(*opts->autoMutex);
                     while (!opts->autoExprQueue->empty()) {
+                        // Safeguard: check link/abort before each subAuto entry
+                        if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
+                            DiagLog("[Eval] subAuto: link died, stopping");
+                            break;
+                        }
+                        if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
+                            DiagLog("[Eval] subAuto: abort detected, stopping");
+                            break;
+                        }
                         auto entry = std::move(opts->autoExprQueue->front());
                         opts->autoExprQueue->pop_front();
+
+                        if (opts->kernelStatus)
+                            SetSubWork(*opts->kernelStatus, SubWork::SubBusy, "drain:subAuto");
 
                         DiagLog("[Eval] dynAutoMode(BEGINDLG): subAuto id=" +
                                 std::to_string(entry.id) + " expr='" + entry.expr + "'");
@@ -962,6 +1006,10 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                             !capturedOuterResult.strVal.empty();
                         if (autoOuterCaptured) break;
                         if (opts->abortFlag && opts->abortFlag->load()) break;
+                    }
+                    // Restore DynDialog state after subAuto processing
+                    if (opts->kernelStatus) {
+                        SetSubWork(*opts->kernelStatus, SubWork::None, "drain:subAuto:done");
                     }
                     if (!opts->autoCompleted->empty() &&
                         opts->autoTsfnActive && opts->autoTsfnActive->load()) {
@@ -1036,6 +1084,8 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 // Dialog closed — continue outer loop waiting for the original RETURNPKT.
                 if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
                 if (opts && opts->interruptPending) opts->interruptPending->store(false);
+                if (opts && opts->kernelStatus)
+                    SetDialog(*opts->kernelStatus, DialogState::None, "drain:dynDialog:closed");
                 continue;
             }
 
@@ -1102,6 +1152,8 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
 
             if (opts && opts->dialogOpen)
                 opts->dialogOpen->store(true);
+            if (opts && opts->kernelStatus)
+                SetDialog(*opts->kernelStatus, DialogState::UserDialog, "drain:BEGINDLGPKT:user");
             if (opts && opts->hasOnDialogBegin)
                 opts->onDialogBegin.NonBlockingCall(
                     [level](Napi::Env e, Napi::Function cb){
@@ -1141,6 +1193,8 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                     WSNewPacket(lp);
                     if (opts && opts->dialogOpen)
                         opts->dialogOpen->store(false);
+                    if (opts && opts->kernelStatus)
+                        SetDialog(*opts->kernelStatus, DialogState::None, "drain:userDialog:closed");
                     if (opts && opts->hasOnDialogEnd)
                         opts->onDialogEnd.NonBlockingCall(
                             [endLevel](Napi::Env e, Napi::Function cb){
@@ -1184,6 +1238,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                     const char* m = WSErrorMessage(lp);
                     WSClearError(lp);
                     if (opts && opts->linkDead) opts->linkDead->store(true);
+                    if (opts && opts->kernelStatus) SetLink(*opts->kernelStatus, LinkState::Dead, "drain:dialog:linkDead");
                     if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
                     if (opts && opts->abortFlag && opts->abortFlag->load()) {
                         r.result = WExpr::mkSymbol("System`$Aborted");
@@ -1205,6 +1260,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             WSClearError(lp);
             DiagLog("[Eval] pkt=0 in outer loop — link dead: " + s);
             if (opts && opts->linkDead) opts->linkDead->store(true);
+            if (opts && opts->kernelStatus) SetLink(*opts->kernelStatus, LinkState::Dead, "drain:outerLoop:linkDead");
             r.result = WExpr::mkError(s);
             break;
         }

@@ -102,6 +102,8 @@ struct AutoResultEntry {
     std::string error;
 };
 
+struct KernelStatus;   // forward decl (defined in kernel_state.h)
+
 struct EvalOptions {
     Napi::ThreadSafeFunction onPrint;         // fires once per Print[] line
     Napi::ThreadSafeFunction onMessage;       // fires once per kernel message
@@ -151,4 +153,7 @@ struct EvalOptions {
     // Interrupt pending flag — set by StartDynTimer when WSInterruptMessage sent,
     // cleared by MENUPKT handler after responding.  Prevents runaway interrupts.
     std::atomic<bool>*         interruptPending = nullptr;
+    // Unified kernel status — multi-dimensional state tracking.
+    // Updated via Set*() helpers which log every transition.
+    KernelStatus*              kernelStatus     = nullptr;
 };

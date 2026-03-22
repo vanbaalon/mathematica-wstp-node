@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "kernel_state.h"
 #include "evaluate_worker.h"
 #include <napi.h>
 #include <wstp.h>
@@ -50,7 +51,8 @@ public:
     Napi::Value IsReady      (const Napi::CallbackInfo& info);
     Napi::Value IsLinkDead   (const Napi::CallbackInfo& info);
     Napi::Value KernelPid    (const Napi::CallbackInfo& info);
-    Napi::Value DynamicActive(const Napi::CallbackInfo& info);
+    Napi::Value DynamicActive   (const Napi::CallbackInfo& info);
+    Napi::Value GetKernelStateName(const Napi::CallbackInfo& info);
 
     // Called from EvaluateWorker lambda (must be public)
     void DrainAutoResults   (Napi::Env env);
@@ -116,6 +118,7 @@ private:
     std::atomic<bool>           dialogPending_{false};
     std::atomic<bool>           dialogOpen_{false};
     std::atomic<bool>           interruptPending_{false};
+    KernelStatus                ks_;  // multi-dimensional kernel state
 
     // Dynamic evaluation state (Phase 2)
     std::mutex                            dynMutex_;

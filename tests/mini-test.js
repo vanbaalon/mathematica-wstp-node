@@ -489,13 +489,81 @@ async function main() {
         }
     }, T(60000));
 
+    // ── M9: Dynamic updates throughout long Do loop ───────────────────────
+    // Mimics:  Dynamic[n]; Do[n = k; Pause[1]; Print[n], {k, 1, 6}]
+    // Dynamic should update at least 3 times during the 6-second loop,
+    // not just for the first 1-2 iterations.
+    await run('M9. Dynamic updates throughout long Do loop', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, 'M9 warmup');
+            await installHandler(s);
+
+            s.registerDynamic('_m9_n', 'ToString[n$$m9]');
+            s.setDynamicInterval(300);
+
+            // Short first eval to install ScheduledTask
+            const cell1 = await withTimeout(
+                s.evaluate('n$$m9 = 0; "ready"', { interactive: true }),
+                15000, 'M9 cell1'
+            );
+            assert(cell1.result.value === 'ready',
+                `M9 cell1: ${JSON.stringify(cell1.result)}`);
+
+            // Long Do loop — Dynamic should update throughout
+            const seenValues = new Set();
+            const dynSnapshots = [];
+            const evalPromise = s.evaluate(
+                'Do[n$$m9 = k; Pause[1], {k, 1, 6}]; "loop-done"',
+                { interactive: true }
+            );
+
+            // Poll getDynamicResults every 500ms during the loop
+            const pollInterval = setInterval(() => {
+                try {
+                    const res = s.getDynamicResults();
+                    if (res['_m9_n'] && res['_m9_n'].value) {
+                        const v = res['_m9_n'].value;
+                        seenValues.add(v);
+                        dynSnapshots.push({ t: Date.now(), v });
+                    }
+                } catch (_) {}
+            }, 500);
+
+            const mainResult = await withTimeout(evalPromise, 30000, 'M9 main eval');
+            clearInterval(pollInterval);
+
+            assert(!mainResult.aborted && mainResult.result.value === 'loop-done',
+                `M9 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            // We should have seen at least 3 distinct values of n (out of 1..6)
+            // If Dynamic stalls after 1-2 updates, this will fail.
+            console.log(`    M9 saw ${seenValues.size} distinct Dynamic values: ${JSON.stringify([...seenValues])}`);
+            assert(seenValues.size >= 3,
+                `M9: expected >=3 distinct Dynamic values, got ${seenValues.size}: ${JSON.stringify([...seenValues])}`);
+
+            // Verify kernel still functional
+            const followUp = await withTimeout(
+                s.evaluate('2 + 2', { interactive: false }),
+                10000, 'M9 follow-up'
+            );
+            assert(followUp.result.value === 4,
+                `M9 follow-up expected 4, got ${followUp.result.value}`);
+
+            s.unregisterDynamic('_m9_n');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, T(60000));
+
     // ── Summary ───────────────────────────────────────────────────────────
-    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 8`);
+    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 9`);
     if (failedTests.length > 0) {
         console.log('Failed:', failedTests.join(', '));
     }
     console.log(failed === 0 ? 'All mini-tests PASSED \u2713' : 'Some mini-tests FAILED \u2717');
-    console.log(`out of 8`);
+    console.log(`out of 9`);
 
     _watchdogProc.kill('SIGKILL');
     process.exit(failed > 0 ? 1 : 0);

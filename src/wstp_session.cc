@@ -1,4 +1,5 @@
 #include "wstp_session.h"
+#include "kernel_state.h"
 #include "diag.h"
 #include "drain.h"
 #include "wstp_expr.h"
@@ -38,7 +39,8 @@ Napi::Object WstpSession::Init(Napi::Env env, Napi::Object exports) {
         InstanceAccessor<&WstpSession::IsReady>       ("isReady"),
         InstanceAccessor<&WstpSession::IsLinkDead>    ("isLinkDead"),
         InstanceAccessor<&WstpSession::KernelPid>     ("kernelPid"),
-        InstanceAccessor<&WstpSession::DynamicActive> ("dynamicActive"),
+        InstanceAccessor<&WstpSession::DynamicActive>      ("dynamicActive"),
+        InstanceAccessor<&WstpSession::GetKernelStateName> ("kernelState"),
     });
 
     Napi::FunctionReference* ctor = new Napi::FunctionReference();
@@ -186,6 +188,7 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
     opts.interruptPending = &interruptPending_;
     opts.abortFlag     = &abortFlag_;
     opts.linkDead      = &linkDead_;
+    opts.kernelStatus  = &ks_;
     opts.dynMutex      = &dynMutex_;
     opts.dynRegistry   = &dynRegistry_;
     opts.dynResults    = &dynResults_;
@@ -229,6 +232,7 @@ void WstpSession::MaybeStartNext() {
         auto item = std::move(subIdleQueue_.front());
         subIdleQueue_.pop();
         lk.unlock();
+        SetActivity(ks_, Activity::SubIdle, "MaybeStartNext:subIdle");
         StartSubIdleWorker(std::move(item));
         return;
     }
@@ -249,10 +253,12 @@ void WstpSession::MaybeStartNext() {
             auto wiItem = std::move(whenIdleQueue_.front());
             whenIdleQueue_.pop();
             lk.unlock();
+            SetActivity(ks_, Activity::WhenIdle, "MaybeStartNext:whenIdle");
             StartWhenIdleWorker(std::move(wiItem));
             return;
         }
         busy_.store(false);
+        SetActivity(ks_, Activity::Idle, "MaybeStartNext:allEmpty");
         return;
     }
     auto item = std::move(queue_.front());
@@ -264,6 +270,7 @@ void WstpSession::MaybeStartNext() {
     bool evalInteractive = (item.interactiveOverride == -1)
                             ? interactiveMode_
                             : (item.interactiveOverride == 1);
+    SetActivity(ks_, Activity::Eval, "MaybeStartNext:eval");
     evalActive_.store(true);
     workerReadingLink_.store(true, std::memory_order_release);
     auto* worker = new EvaluateWorker(
@@ -273,7 +280,7 @@ void WstpSession::MaybeStartNext() {
         std::move(item.opts),
         abortFlag_,
         workerReadingLink_,
-        [this]() { evalActive_.store(false); PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
+        [this]() { evalActive_.store(false); PromoteAutoToWhenIdle(); SetActivity(ks_, Activity::Idle, "EvalWorker:done"); SetAbort(ks_, AbortState::None, "EvalWorker:done"); busy_.store(false); MaybeStartNext(); },
         nextLine_.fetch_add(1),
         evalInteractive
     );
@@ -286,9 +293,9 @@ void WstpSession::MaybeStartNext() {
 // ---------------------------------------------------------------------------
 void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
     if (dynTaskInstalledInterval_ > 0) {
-        item.expr = "Quiet[$wstpDynTaskStop=True;"
+        item.expr = "Quiet["
                     "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
-                    "$wstpDynTaskStop=.;$wstpDynTask=.];" + item.expr;
+                    "$wstpDynTask=.];" + item.expr;
         dynTaskInstalledInterval_ = 0;
         DiagLog("[sub-idle] prepending ScheduledTask stop");
     }
@@ -349,7 +356,7 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
     workerReadingLink_.store(true, std::memory_order_release);
     (new SubIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
                        workerReadingLink_,
-                       [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); }))->Queue();
+                       [this]() { PromoteAutoToWhenIdle(); SetActivity(ks_, Activity::Idle, "SubIdleWorker:done"); busy_.store(false); MaybeStartNext(); }))->Queue();
 }
 
 // ---------------------------------------------------------------------------
@@ -375,10 +382,8 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
               needStop_(needStop), expr_(std::move(expr)),
               workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
 
-        // Close any stale dialog, setting $wstpDynTaskStop=True inside
-        // so that future task fires are suppressed.  Works because the
-        // dialog was opened while the kernel was IDLE — Return[$Failed]
-        // inside it doesn't abort any ongoing evaluation.
+        // Close any stale dialog that opened while the kernel was idle.
+        // No kernel-level flags needed — just close with Return[$Failed].
         void closeStaleDialogs() {
             auto deadline = std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(500);
@@ -392,7 +397,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                     wsint64 lvl = 0;
                     if (WSGetType(lp_) == WSTKINT) WSGetInteger64(lp_, &lvl);
                     WSNewPacket(lp_);
-                    DiagLog("[when-idle] stale BEGINDLGPKT — closing with stop flag");
+                    DiagLog("[when-idle] stale BEGINDLGPKT — closing");
                     // Wait for dialog's INPUTNAMEPKT
                     auto preDl = std::chrono::steady_clock::now() +
                                  std::chrono::milliseconds(500);
@@ -406,27 +411,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                         if (ip == INPUTNAMEPKT) break;
                         if (ip == 0 || ip == ILLEGALPKT) { WSClearError(lp_); return; }
                     }
-                    // Set the task-stop flag inside the dialog
-                    const char* stopExpr = "$wstpDynTaskStop=True";
-                    WSPutFunction(lp_, "EnterTextPacket", 1);
-                    WSPutUTF8String(lp_,
-                        reinterpret_cast<const unsigned char*>(stopExpr),
-                        static_cast<int>(std::strlen(stopExpr)));
-                    WSEndPacket(lp_); WSFlush(lp_);
-                    // Consume result packets until next INPUTNAMEPKT
-                    auto aDl = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(2000);
-                    while (std::chrono::steady_clock::now() < aDl) {
-                        if (!WSReady(lp_)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                            continue;
-                        }
-                        int ap = WSNextPacket(lp_);
-                        WSNewPacket(lp_);
-                        if (ap == INPUTNAMEPKT) break;
-                        if (ap == ENDDLGPKT || ap == 0 || ap == ILLEGALPKT) return;
-                    }
-                    // Close the dialog with separate Return[$Failed]
+                    // Close the dialog directly
                     const char* closeExpr = "Return[$Failed]";
                     WSPutFunction(lp_, "EnterTextPacket", 1);
                     WSPutUTF8String(lp_,
@@ -446,7 +431,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                         if (rp == ENDDLGPKT) break;
                         if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp_); return; }
                     }
-                    DiagLog("[when-idle] stale dialog closed, flag set");
+                    DiagLog("[when-idle] stale dialog closed");
                     // Reset the idle deadline — more stale data might follow
                     deadline = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(500);
@@ -516,9 +501,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                             }
                         }
                         // Evaluate: stop task + user expression, all at once
-                        // Also set a global flag to ignore the next interrupt.
                         std::string dialogExpr =
-                            "$wstpDynTaskStop=True;"
                             "Quiet[If[System`ValueQ[$wstpDynTask],System`RemoveScheduledTask[$wstpDynTask]]];"
                             "$wstpDynTask=.;"
                             "WSTP`IgnoreNextInterrupt=True;"
@@ -747,7 +730,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
             // (needStop_==false, or no stale dialog was found)
             std::string fullExpr;
             if (needStop_) {
-                fullExpr = "Quiet[$wstpDynTaskStop=True;"
+                fullExpr = "Quiet["
                            "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
                            "$wstpDynTask=.];" + expr_;
             } else {
@@ -804,6 +787,7 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                         [this]() {
                             DiagLog("[when-idle] done — promoting + next");
                             PromoteAutoToWhenIdle();
+                            SetActivity(ks_, Activity::Idle, "WhenIdleWorker:done");
                             busy_.store(false);
                             DiagLog("[when-idle] whenIdleQ=" + std::to_string(whenIdleQueue_.size()) +
                                     " queue=" + std::to_string(queue_.size()));
@@ -1245,8 +1229,13 @@ Napi::Value WstpSession::Abort(const Napi::CallbackInfo& info) {
     bool expected = false;
     if (!abortFlag_.compare_exchange_strong(expected, true))
         return Napi::Boolean::New(env, true);
+    SetAbort(ks_, AbortState::Aborting, "Abort");
     FlushDialogQueueWithError("abort");
     dialogOpen_.store(false);
+    if (GetLink(ks_) != LinkState::Alive) {
+        DiagLog("[Abort] link dead — cannot send WSAbortMessage");
+        return Napi::Boolean::New(env, false);
+    }
     int ok = WSPutMessage(lp_, WSAbortMessage);
     return Napi::Boolean::New(env, ok != 0);
 }
@@ -1302,6 +1291,9 @@ Napi::Value WstpSession::IsLinkDead(const Napi::CallbackInfo& info) {
 }
 Napi::Value WstpSession::KernelPid(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), static_cast<double>(kernelPid_));
+}
+Napi::Value WstpSession::GetKernelStateName(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), KernelStatusString(ks_));
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,15 +1351,21 @@ void WstpSession::StartDynTimer() {
             if (elapsed < dynIntervalMs_.load()) continue;
 
             if (workerReadingLink_.load() && !dialogOpen_.load()) {
-                // Always interrupt when busy and there are pending entries.
-                // ScheduledTask cannot fire during a busy kernel eval (Do[] etc.),
-                // so WSInterruptMessage is the only way to trigger Dialog[].
-                // Gate with interruptPending_ to allow only one in-flight
-                // interrupt — prevents runaway MENUPKT→Dialog loops after
-                // the main eval completes.
                 bool needInterrupt = (hasDynRegs || hasAutoEntries);
                 if (needInterrupt && !interruptPending_.exchange(true)) {
-                    WSPutMessage(lp_, WSInterruptMessage);
+                    // Safeguard: verify state is safe before sending interrupt
+                    if (GetLink(ks_) != LinkState::Alive) {
+                        DiagLog("[DynTimer] Skip interrupt: link dead");
+                        interruptPending_.store(false);
+                    } else if (GetAbort(ks_) != AbortState::None) {
+                        DiagLog("[DynTimer] Skip interrupt: abort in progress");
+                        interruptPending_.store(false);
+                    } else if (GetDialog(ks_) != DialogState::None) {
+                        DiagLog("[DynTimer] Skip interrupt: dialog already open");
+                        interruptPending_.store(false);
+                    } else {
+                        WSPutMessage(lp_, WSInterruptMessage);
+                    }
                 }
             }
         }
@@ -1411,6 +1409,7 @@ void WstpSession::CleanUp() {
     open_ = false;
     if (workerReadingLink_.load(std::memory_order_acquire) && lp_) {
         abortFlag_.store(true);
+        SetAbort(ks_, AbortState::Aborting, "CleanUp");
         FlushDialogQueueWithError("session closed");
         dialogOpen_.store(false);
         WSPutMessage(lp_, WSAbortMessage);
