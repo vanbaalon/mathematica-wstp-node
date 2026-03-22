@@ -31,6 +31,7 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [`close()`](#close) — gracefully shut down the kernel and free resources
    - [`isOpen` / `isDialogOpen` / `isReady`](#isopen--isdialogopen--isready) — read-only status flags
    - [`kernelPid`](#kernelpid) — OS process ID of the WolframKernel child process
+   - [`kernelState`](#kernelstate) — multi-dimensional kernel state snapshot
    - [Dynamic eval API](#dynamic-eval-api) — register expressions for automatic periodic evaluation
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
@@ -562,6 +563,52 @@ console.log(session.kernelPid);  // still 12345
 const { execSync } = require('child_process');
 try { execSync(`kill -9 ${session.kernelPid}`); } catch (_) {}
 ```
+
+---
+
+### `kernelState`
+
+```ts
+session.kernelState: string
+```
+
+Returns a snapshot of the kernel's internal state as a space-separated string of
+`dimension=value` pairs.  Unlike the boolean `isOpen` / `isDialogOpen` flags, this
+property captures **five independent dimensions** that can be active in parallel:
+
+| Dimension  | Values                                | Description |
+|------------|---------------------------------------|-------------|
+| `activity` | `Idle`, `Eval`, `SubIdle`, `WhenIdle` | Main job the kernel is doing |
+| `dialog`   | `None`, `UserDialog`, `DynDialog`     | Dialog subsession type |
+| `sub`      | `None`, `DynExpr`, `SubBusy`          | Sub-work inside a dialog |
+| `abort`    | `None`, `Aborting`                    | Abort in progress |
+| `link`     | `Alive`, `Dead`                       | WSTP link health |
+
+**Example:**
+```js
+console.log(session.kernelState);
+// "activity=Eval dialog=DynDialog sub=DynExpr abort=None link=Alive"
+
+// Parse a specific dimension:
+const m = session.kernelState.match(/activity=(\w+)/);
+if (m && m[1] === 'Eval') console.log('Kernel is evaluating');
+
+// Check link health:
+if (session.kernelState.includes('link=Dead')) {
+    console.error('WSTP link is dead — restart needed');
+}
+```
+
+Every transition is logged via `setDiagHandler` with a `[State:<dim>]` category tag:
+```
+[State:activity] Idle -> Eval (MaybeStartNext:eval)
+[State:dialog] None -> DynDialog (drain:BEGINDLGPKT:dynAuto)
+[State:sub] None -> DynExpr (drain:dynExpr:start)
+```
+
+The C++ layer uses these dimensions internally as **safeguards** — for example, it blocks
+`WSInterruptMessage` when the link is dead or an abort is already in flight, and auto-closes
+`Dialog[]` if an abort arrives mid-dialog.
 
 ---
 

@@ -295,6 +295,28 @@ export class WstpSession {
      */
     readonly kernelPid: number;
 
+    /**
+     * Multi-dimensional kernel state snapshot as a human-readable string.
+     *
+     * Returns a space-separated list of `dimension=value` pairs covering
+     * five independent state dimensions:
+     *
+     * | Dimension  | Values                                        |
+     * |------------|-----------------------------------------------|
+     * | `activity` | `Idle`, `Eval`, `SubIdle`, `WhenIdle`          |
+     * | `dialog`   | `None`, `UserDialog`, `DynDialog`              |
+     * | `sub`      | `None`, `DynExpr`, `SubBusy`                   |
+     * | `abort`    | `None`, `Aborting`                             |
+     * | `link`     | `Alive`, `Dead`                                |
+     *
+     * Example: `"activity=Eval dialog=DynDialog sub=DynExpr abort=None link=Alive"`
+     *
+     * Dimensions are independent — e.g. `activity=Eval` and `dialog=DynDialog`
+     * can be active simultaneously.  Every transition is logged via `setDiagHandler`
+     * with the `[State:<dim>]` category tag.
+     */
+    readonly kernelState: string;
+
     // ── Dynamic eval API ────────────────────────────────────────────────────
 
     /**

@@ -496,12 +496,35 @@ immediately with `"Session is closed"`.
 
 ---
 
-### `isOpen` / `isDialogOpen`
+### `isOpen` / `isDialogOpen` / `kernelState`
 
 ```ts
 session.isOpen:       boolean  // true while the link is open and the kernel is running
 session.isDialogOpen: boolean  // true while inside a Dialog[] subsession
+session.kernelState:  string   // multi-dimensional state snapshot
 ```
+
+`kernelState` returns a space-separated `dimension=value` string covering five
+independent state dimensions that can be active in parallel:
+
+| Dimension  | Values                                | Description |
+|------------|---------------------------------------|-------------|
+| `activity` | `Idle`, `Eval`, `SubIdle`, `WhenIdle` | Main job the kernel is doing |
+| `dialog`   | `None`, `UserDialog`, `DynDialog`     | Dialog subsession type |
+| `sub`      | `None`, `DynExpr`, `SubBusy`          | Sub-work inside a dialog |
+| `abort`    | `None`, `Aborting`                    | Abort in progress |
+| `link`     | `Alive`, `Dead`                       | WSTP link health |
+
+Example:
+```ts
+console.log(session.kernelState);
+// "activity=Eval dialog=DynDialog sub=DynExpr abort=None link=Alive"
+```
+
+Every transition is logged via `setDiagHandler` with a `[State:<dim>]` category
+tag (e.g. `[State:activity] Idle -> Eval (MaybeStartNext:eval)`).  Internal
+safeguards use these dimensions to prevent dangerous operations — e.g. blocking
+`WSInterruptMessage` when the link is dead or an abort is already in progress.
 
 ---
 
