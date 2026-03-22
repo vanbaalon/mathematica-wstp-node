@@ -104,6 +104,43 @@ struct AutoResultEntry {
 
 struct KernelStatus;   // forward decl (defined in kernel_state.h)
 
+// ---------------------------------------------------------------------------
+// SentLog — thread-safe timestamped rolling log of every WSTP message we SEND
+// to the kernel plus key packets we RECEIVE.  Used to trace which
+// WSInterruptMessage caused an unexpected MENUPKT inside a dialog.
+// Appended to from both the timer thread and drain.cc; dumped when a MENUPKT
+// arrives mid-evaluation so we can see the exact sequence of events.
+// ---------------------------------------------------------------------------
+struct SentLog {
+    struct Entry {
+        int64_t     deltaMs;   // ms since first entry
+        std::string tag;
+    };
+    mutable std::mutex            mu;
+    std::deque<Entry>             entries;
+    std::chrono::steady_clock::time_point epoch{};
+    bool                          epochSet = false;
+    static constexpr size_t       MAX = 80;
+
+    void append(std::string tag) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto now = std::chrono::steady_clock::now();
+        if (!epochSet) { epoch = now; epochSet = true; }
+        int64_t delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - epoch).count();
+        if (entries.size() >= MAX) entries.pop_front();
+        entries.push_back({delta, std::move(tag)});
+    }
+
+    std::string dump() const {
+        std::lock_guard<std::mutex> lk(mu);
+        std::string s = "[SentLog " + std::to_string(entries.size()) + " entries]:\n";
+        for (auto& e : entries)
+            s += "  +" + std::to_string(e.deltaMs) + "ms  " + e.tag + "\n";
+        return s;
+    }
+};
+
 struct EvalOptions {
     Napi::ThreadSafeFunction onPrint;         // fires once per Print[] line
     Napi::ThreadSafeFunction onMessage;       // fires once per kernel message
@@ -150,10 +187,20 @@ struct EvalOptions {
     // Link-dead flag — set by DrainToEvalResult on pkt=0; early-rejects
     // future evaluate/sub/subAuto calls without touching the broken link.
     std::atomic<bool>*         linkDead      = nullptr;
-    // Interrupt pending flag — set by StartDynTimer when WSInterruptMessage sent,
-    // cleared by MENUPKT handler after responding.  Prevents runaway interrupts.
-    std::atomic<bool>*         interruptPending = nullptr;
+    // menuPktPending flag — set by StartDynTimer immediately before WSPutMessage
+    // (WSInterruptMessage), cleared by EVERY MENUPKT handler after consuming the
+    // packet, regardless of the response character ('i', 'c', or 'a').
+    //
+    // Semantics: true iff WSInterruptMessage was sent AND the resulting MENUPKT
+    // has not yet been consumed from the WSTP pipe.  Used by the BEGINDLGPKT
+    // pre-drain to decide whether to wait for a MENUPKT before sending an
+    // expression.  NOTE: this is intentionally different from the old
+    // interruptPending_ which stayed true during the entire dialog cycle —
+    // that caused a bug when MENUPKT arrived in the outer loop before BEGINDLGPKT.
+    std::atomic<bool>*         menuPktPending   = nullptr;
     // Unified kernel status — multi-dimensional state tracking.
     // Updated via Set*() helpers which log every transition.
     KernelStatus*              kernelStatus     = nullptr;
+    // Registry of WSTP sends/receives for diagnosing spurious MENUPKTs.
+    SentLog*                   sentLog          = nullptr;
 };

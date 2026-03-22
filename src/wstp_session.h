@@ -117,7 +117,6 @@ private:
     std::queue<DialogRequest>   dialogQueue_;
     std::atomic<bool>           dialogPending_{false};
     std::atomic<bool>           dialogOpen_{false};
-    std::atomic<bool>           interruptPending_{false};
     KernelStatus                ks_;  // multi-dimensional kernel state
 
     // Dynamic evaluation state (Phase 2)
@@ -130,6 +129,10 @@ private:
     std::chrono::steady_clock::time_point dynLastEval_{};
     std::thread                           dynTimerThread_;
     std::atomic<bool>                     dynTimerRunning_{false};
+    // menuPktPending_: true iff WSInterruptMessage sent and MENUPKT not yet
+    // consumed.  See ARCHITECTURE.md §Interrupt/Dialog refactoring.
+    std::atomic<bool>                     menuPktPending_{false};
+    SentLog                               dynSentLog_;
 
     // subAuto() state
     std::atomic<size_t>                                autoNextId_{0};

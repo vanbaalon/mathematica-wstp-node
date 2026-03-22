@@ -226,10 +226,15 @@ bool drainUntilEndDialog(WSLINK lp, int timeoutMs,
         // hangs the kernel and corrupts the WSTP link.
         if (pkt == MENUPKT) {
             WSNewPacket(lp);
-            WSPutString(lp, "a");  // abort dialog-level expression to close fast
+            // Respond 'c' (continue) so the in-progress Return[] can
+            // complete and the dialog actually closes.  Responding 'a'
+            // (abort) kills the Return[], leaving the dialog open.
+            WSPutString(lp, "c");
             WSEndPacket(lp);
             WSFlush(lp);
-            DiagLog("[drainEndDlg] MENUPKT — responded 'a'");
+            DiagLog("[drainEndDlg] MENUPKT — responded 'c'");
+            deadline = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(timeoutMs);
             continue;
         }
         WSNewPacket(lp);  // discard TEXTPKT, MESSAGEPKT, INPUTNAMEPKT, etc.
@@ -249,9 +254,17 @@ bool drainUntilEndDialog(WSLINK lp, int timeoutMs,
 // the RETURNTEXTPKT that EnterTextPacket produces.
 // ---------------------------------------------------------------------------
 bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
-                              WExpr* capturedOuterResult) {
+                              WExpr* capturedOuterResult,
+                              const std::string* retryExpr,
+                              SentLog* log,
+                              std::atomic<bool>* menuPktPending) {
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeoutMs);
+    // Only re-send expression on INPUTNAMEPKT if a MENUPKT interrupt actually
+    // fired during this call.  A bare INPUTNAMEPKT after a successful eval is
+    // the kernel's normal next-prompt; re-sending it would evaluate the
+    // previous expression again and corrupt the result for the next entry.
+    bool hadInterrupt = false;
     while (std::chrono::steady_clock::now() < deadline) {
         if (!WSReady(lp)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -291,9 +304,34 @@ bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
             }
             return true;
         }
-        if (pkt == TEXTPKT || pkt == MESSAGEPKT ||
-            pkt == OUTPUTNAMEPKT || pkt == INPUTNAMEPKT) {
+        if (pkt == TEXTPKT || pkt == MESSAGEPKT || pkt == OUTPUTNAMEPKT) {
             WSNewPacket(lp);
+            continue;
+        }
+        // INPUTNAMEPKT: either (a) the kernel's normal next-prompt after a
+        // completed evaluation, or (b) the dialog re-prompting after a MENUPKT
+        // interrupt cleared our expression.  Only re-send the expression in
+        // case (b) — i.e. when a MENUPKT was actually handled in this call.
+        if (pkt == INPUTNAMEPKT) {
+            WSNewPacket(lp);
+            if (hadInterrupt && retryExpr && !retryExpr->empty()) {
+                if (log) log->append("RECV INPUTNAMEPKT(midRead) — re-sending expr");
+                DiagLog("[DynRead] INPUTNAMEPKT after interrupt — re-sending expr");
+                bool resent =
+                    WSPutFunction(lp, "EnterTextPacket", 1) &&
+                    WSPutUTF8String(lp,
+                        reinterpret_cast<const unsigned char*>(retryExpr->c_str()),
+                        static_cast<int>(retryExpr->size())) &&
+                    WSEndPacket(lp) &&
+                    WSFlush(lp);
+                if (!resent) {
+                    dr.error = "failed to re-send expression after interrupt";
+                    return false;
+                }
+                hadInterrupt = false;  // expression re-sent; reset for next occurrence
+            } else {
+                DiagLog("[DynRead] INPUTNAMEPKT — discarding (normal next-prompt)");
+            }
             continue;
         }
         // Nested dialog: ScheduledTask fired Dialog[] during our expression
@@ -353,22 +391,159 @@ bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
         // Stale WSInterruptMessage arrived inside dialog.  Respond 'c'
         // (continue) — the kernel resumes evaluating our expression.
         if (pkt == MENUPKT) {
+            wsint64 mtype = 0; WSGetInteger64(lp, &mtype);
+            const char* mprompt = nullptr; WSGetString(lp, &mprompt);
+            if (mprompt) WSReleaseString(lp, mprompt);
             WSNewPacket(lp);
             WSPutString(lp, "c");
             WSEndPacket(lp);
             WSFlush(lp);
-            DiagLog("[DynRead] MENUPKT — responded 'c' (continue)");
+            hadInterrupt = true;  // INPUTNAMEPKT after this should trigger re-send
+            // Clear menuPktPending — this MENUPKT is now consumed.
+            if (menuPktPending) menuPktPending->store(false);
+            if (log) {
+                log->append("RECV MENUPKT(midRead type=" + std::to_string(mtype) + ") → 'c'");
+                DiagLog("[DynRead] " + log->dump());
+            }
+            DiagLog("[DynRead] MENUPKT type=" + std::to_string(mtype) + " — responded 'c' (continue)");
             continue;
+        }
+        // Dialog closed before we got our result — don't silently time out.
+        if (pkt == ENDDLGPKT) {
+            WSNewPacket(lp);
+            DiagLog("[DynRead] ENDDLGPKT — dialog closed unexpectedly before result");
+            dr.error = "dialog closed before result";
+            return false;
         }
         if (pkt == 0 || pkt == ILLEGALPKT) {
             WSClearError(lp);
             dr.error = "WSTP link error during Dynamic eval";
             return false;
         }
+        DiagLog("[DynRead] unexpected pkt=" + std::to_string(pkt) + " — discarding");
         WSNewPacket(lp);
     }
+    DiagLog("[DynRead] TIMEOUT after " + std::to_string(timeoutMs) + "ms waiting for result");
     dr.error = "timeout";
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// DialogSession — implementation
+// ---------------------------------------------------------------------------
+
+DialogSession::DialogSession(WSLINK lp, EvalOptions* opts)
+    : lp_(lp), opts_(opts)
+{
+    // Pre-drain: consume INPUTNAMEPKT (the dialog's first prompt) and
+    // optionally MENUPKT if one is in the WSTP pipe from WSInterruptMessage.
+    bool waitForMenuPkt = opts_ && opts_->menuPktPending && opts_->menuPktPending->load();
+    bool foundInputName = false;
+    auto drainDl = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < drainDl) {
+        if (!WSReady(lp_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        int ipkt = WSNextPacket(lp_);
+        DiagLog("[DialogSession] pre-drain pkt=" + std::to_string(ipkt));
+        if (ipkt == INPUTNAMEPKT) {
+            WSNewPacket(lp_);
+            if (!foundInputName) {
+                foundInputName = true;
+                if (!waitForMenuPkt) {
+                    drainDl = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(100);
+                    DiagLog("[DialogSession] INPUTNAMEPKT — no MENUPKT expected, 100ms grace");
+                } else {
+                    DiagLog("[DialogSession] INPUTNAMEPKT — MENUPKT in pipe, waiting");
+                }
+                if (opts_ && opts_->sentLog)
+                    opts_->sentLog->append("RECV pre-drain INPUTNAMEPKT");
+            } else {
+                // Second (or later) INPUTNAMEPKT.
+                // Only break if no MENUPKT is pending — i.e. we already consumed it
+                // (or never expected one).  If menuPktPending is still set, a concurrent
+                // interrupt delivered another INPUTNAMEPKT before its MENUPKT; keep looping.
+                bool mpPending = opts_ && opts_->menuPktPending && opts_->menuPktPending->load();
+                if (!mpPending) {
+                    if (opts_ && opts_->sentLog)
+                        opts_->sentLog->append("RECV pre-drain INPUTNAMEPKT(2nd clean)");
+                    break;  // clean state — MENUPKT consumed or never expected
+                }
+                // else: another INPUTNAMEPKT while MENUPKT still in pipe — keep waiting
+                DiagLog("[DialogSession] INPUTNAMEPKT(2nd) while menuPktPending — keep waiting for MENUPKT");
+            }
+            continue;
+        }
+        if (ipkt == MENUPKT) {
+            WSNewPacket(lp_);
+            WSPutString(lp_, "c");
+            WSEndPacket(lp_); WSFlush(lp_);
+            if (opts_ && opts_->menuPktPending) opts_->menuPktPending->store(false);
+            waitForMenuPkt = false;
+            foundInputName = false;
+            DiagLog("[DialogSession] pre-drain MENUPKT — responded 'c', waiting for fresh INPUTNAMEPKT");
+            if (opts_ && opts_->sentLog)
+                opts_->sentLog->append("RECV pre-drain MENUPKT \u2192 'c'");
+            drainDl = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            continue;
+        }
+        if (foundInputName) {
+            // Stale packet in grace window after INPUTNAMEPKT — discard.
+            WSNewPacket(lp_);
+            continue;
+        }
+        if (ipkt == 0 || ipkt == ILLEGALPKT) {
+            WSClearError(lp_);
+            DiagLog("[DialogSession] pre-drain: link error — valid=false");
+            return;  // valid_ stays false
+        }
+        WSNewPacket(lp_);
+    }
+    if (waitForMenuPkt && foundInputName)
+        DiagLog("[DialogSession] WARNING — MENUPKT not seen within timeout");
+    else if (foundInputName)
+        DiagLog("[DialogSession] pre-drain done");
+    else
+        DiagLog("[DialogSession] pre-drain: no INPUTNAMEPKT — proceeding anyway");
+    valid_ = true;
+}
+
+bool DialogSession::evaluate(const std::string& id, const std::string& expr,
+                             DynResult& dr, WExpr* capturedOuter)
+{
+    if (!valid_ || closed_) { dr.error = "dialog not open"; return false; }
+    if (opts_ && opts_->sentLog)
+        opts_->sentLog->append("SEND EnterText[" + id + "]: " + expr.substr(0, 40));
+
+    bool sent = WSPutFunction(lp_, "EnterTextPacket", 1) &&
+                WSPutUTF8String(lp_,
+                    reinterpret_cast<const unsigned char*>(expr.c_str()),
+                    static_cast<int>(expr.size())) &&
+                WSEndPacket(lp_) && WSFlush(lp_);
+    if (!sent) {
+        dr.error = "failed to send Dynamic expression";
+        return false;
+    }
+    return readDynResultWithTimeout(lp_, dr, 2000,
+                                    capturedOuter, &expr,
+                                    opts_ ? opts_->sentLog : nullptr,
+                                    opts_ ? opts_->menuPktPending : nullptr);
+}
+
+bool DialogSession::close(WExpr* capturedOuter)
+{
+    if (closed_) return true;
+    closed_ = true;
+    static const char* kClose = "Return[$Failed]";
+    bool sent = WSPutFunction(lp_, "EnterTextPacket", 1) &&
+                WSPutUTF8String(lp_,
+                    reinterpret_cast<const unsigned char*>(kClose),
+                    static_cast<int>(std::strlen(kClose))) &&
+                WSEndPacket(lp_) && WSFlush(lp_);
+    if (!sent) return false;
+    return drainUntilEndDialog(lp_, 3000, capturedOuter);
 }
 
 // ---------------------------------------------------------------------------
@@ -817,13 +992,14 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 // Signal the timer thread that a dialog is open so it
                 // doesn't send WSInterruptMessage while we do link I/O.
                 if (opts && opts->dialogOpen) opts->dialogOpen->store(true);
+                if (opts && opts->sentLog) opts->sentLog->append("RECV BEGINDLGPKT");
                 if (opts && opts->kernelStatus)
                     SetDialog(*opts->kernelStatus, DialogState::DynDialog, "drain:BEGINDLGPKT:dynAuto");
                 // Safeguard: if abort is in progress, don't enter DynDialog — just close
                 if (opts && opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
                     DiagLog("[Eval] BEGINDLGPKT dynAuto: abort in progress — auto-closing");
                     if (opts->dialogOpen) opts->dialogOpen->store(false);
-                    if (opts->interruptPending) opts->interruptPending->store(false);
+                    if (opts->menuPktPending) opts->menuPktPending->store(false);
                     SetDialog(*opts->kernelStatus, DialogState::None, "drain:BEGINDLGPKT:abortReject");
                     const char* closeExpr = "Return[$Failed]";
                     WSPutFunction(lp, "EnterTextPacket", 1);
@@ -833,262 +1009,131 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                     drainUntilEndDialog(lp, 3000);
                     continue;
                 }
-                // Also gate interruptPending_ to prevent the timer from
-                // sending WSInterruptMessage even if it checked dialogOpen_
-                // a moment before we set it (TOCTOU race).
-                if (opts && opts->interruptPending) opts->interruptPending->store(true);
+                // Capture whether a MENUPKT is currently in the WSTP pipe
+                // menuPktPending is read inside DialogSession's constructor
+                // (which now owns the pre-drain logic); no need to read it here.
 
                 if (opts && opts->abortFlag && opts->abortFlag->load()) {
                     if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                    if (opts && opts->interruptPending) opts->interruptPending->store(false);
+                    if (opts && opts->menuPktPending) opts->menuPktPending->store(false);
                     r.result = WExpr::mkSymbol("System`$Aborted");
                     r.aborted = true;
                     drainDialogAbortResponse(lp);
                     return r;
                 }
 
-                WExpr capturedOuterResult;
+                // ── Open dialog session (pre-drains to INPUTNAMEPKT) ──────────
+                WExpr capturedOuter;
+                {
+                    DialogSession dlg(lp, opts);
 
-                if (opts && opts->dynMutex && opts->dynRegistry && opts->dynResults) {
-                    std::lock_guard<std::mutex> lk(*opts->dynMutex);
+                    if (dlg.valid()) {
+                        // ── dynRegistry: evaluate registered Dynamic expressions ──
+                        if (opts && opts->dynMutex && opts->dynRegistry && opts->dynResults) {
+                            std::lock_guard<std::mutex> lk(*opts->dynMutex);
+                            if (opts->kernelStatus)
+                                SetSubWork(*opts->kernelStatus, SubWork::DynExpr, "drain:dynExpr:start");
+                            auto nowMs = static_cast<double>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                            for (const auto& reg : *opts->dynRegistry) {
+                                if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
+                                    DiagLog("[Eval] dynExpr: link died, stopping"); break;
+                                }
+                                if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
+                                    DiagLog("[Eval] dynExpr: abort detected, stopping"); break;
+                                }
+                                DiagLog("[Eval] dynExpr id=" + reg.id + " expr='" + reg.expr + "'");
+                                DynResult dr; dr.id = reg.id; dr.timestamp = nowMs;
+                                dlg.evaluate(reg.id, reg.expr, dr, &capturedOuter);
+                                opts->dynResults->push_back(std::move(dr));
+                                bool outerSet = capturedOuter.kind != WExpr::WError ||
+                                               !capturedOuter.strVal.empty();
+                                if (outerSet) break;
+                                if (opts->abortFlag && opts->abortFlag->load()) break;
+                            }
+                            if (opts->dynLastEval)
+                                *opts->dynLastEval = std::chrono::steady_clock::now();
+                            if (opts->kernelStatus)
+                                SetSubWork(*opts->kernelStatus, SubWork::None, "drain:dynExpr:done");
+                        }
 
-                    {
-                        auto drainDl = std::chrono::steady_clock::now() +
-                                       std::chrono::milliseconds(500);
-                        while (std::chrono::steady_clock::now() < drainDl) {
-                            if (!WSReady(lp)) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                                continue;
+                        // ── subAuto: one-shot inline evaluations ──────────────
+                        bool outerSetBeforeAuto = capturedOuter.kind != WExpr::WError ||
+                                                  !capturedOuter.strVal.empty();
+                        if (!outerSetBeforeAuto &&
+                            opts && opts->autoMutex && opts->autoExprQueue && opts->autoCompleted) {
+                            std::lock_guard<std::mutex> aLk(*opts->autoMutex);
+                            while (!opts->autoExprQueue->empty()) {
+                                if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
+                                    DiagLog("[Eval] subAuto: link died, stopping"); break;
+                                }
+                                if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
+                                    DiagLog("[Eval] subAuto: abort detected, stopping"); break;
+                                }
+                                auto entry = std::move(opts->autoExprQueue->front());
+                                opts->autoExprQueue->pop_front();
+                                if (opts->kernelStatus)
+                                    SetSubWork(*opts->kernelStatus, SubWork::SubBusy, "drain:subAuto");
+                                DiagLog("[Eval] subAuto id=" + std::to_string(entry.id) + " expr='" + entry.expr + "'");
+                                DynResult dr;
+                                dlg.evaluate(std::to_string(entry.id), entry.expr, dr, &capturedOuter);
+                                opts->autoCompleted->push_back({entry.id, dr.value, dr.error});
+                                bool outerSet2 = capturedOuter.kind != WExpr::WError ||
+                                                 !capturedOuter.strVal.empty();
+                                if (outerSet2) break;
+                                if (opts->abortFlag && opts->abortFlag->load()) break;
                             }
-                            int ipkt = WSNextPacket(lp);
-                            DiagLog("[Eval] dynAutoMode(BEGINDLG): pre-drain pkt=" + std::to_string(ipkt));
-                            if (ipkt == INPUTNAMEPKT) {
-                                WSNewPacket(lp);
-                                break;
+                            if (opts->kernelStatus)
+                                SetSubWork(*opts->kernelStatus, SubWork::None, "drain:subAuto:done");
+                            if (!opts->autoCompleted->empty() &&
+                                opts->autoTsfnActive && opts->autoTsfnActive->load()) {
+                                opts->autoResolverTsfn->NonBlockingCall(
+                                    [](Napi::Env, Napi::Function fn) { fn.Call({}); });
                             }
-                            if (ipkt == 0 || ipkt == ILLEGALPKT) {
-                                WSClearError(lp);
-                                break;
-                            }
-                            // Stale interrupt from TOCTOU race — continue, not inspect.
-                            if (ipkt == MENUPKT) {
-                                WSNewPacket(lp);
-                                WSPutString(lp, "c");
-                                WSEndPacket(lp);
-                                WSFlush(lp);
-                                DiagLog("[Eval] dynAutoMode(BEGINDLG): pre-drain MENUPKT — responded 'c' (continue)");
-                                continue;
-                            }
-                            WSNewPacket(lp);
                         }
                     }
 
-                    // If the outer result was NOT already captured,
-                    // send Dynamic expressions.
-                    if (capturedOuterResult.kind == WExpr::WError &&
-                        capturedOuterResult.strVal.empty()) {
-
-                    if (opts->kernelStatus)
-                        SetSubWork(*opts->kernelStatus, SubWork::DynExpr, "drain:dynExpr:start");
-
-                    auto nowMs = static_cast<double>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                        .count());
-
-                    for (const auto& reg : *opts->dynRegistry) {
-                        // Safeguard: check link/abort before each expression
-                        if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
-                            DiagLog("[Eval] dynExpr: link died mid-loop, stopping");
-                            break;
-                        }
-                        if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
-                            DiagLog("[Eval] dynExpr: abort detected mid-loop, stopping");
-                            break;
-                        }
-                        DiagLog("[Eval] dynAutoMode(BEGINDLG): sending expr id=" + reg.id + " expr='" + reg.expr + "'");
-                        bool sentDyn =
-                            WSPutFunction(lp, "EnterTextPacket", 1) &&
-                            WSPutUTF8String(lp,
-                                reinterpret_cast<const unsigned char*>(reg.expr.c_str()),
-                                static_cast<int>(reg.expr.size())) &&
-                            WSEndPacket(lp) &&
-                            WSFlush(lp);
-
-                        DynResult dr;
-                        dr.id        = reg.id;
-                        dr.timestamp = nowMs;
-                        if (!sentDyn) {
-                            dr.error = "failed to send Dynamic expression";
-                        } else {
-                            readDynResultWithTimeout(lp, dr, 2000, &capturedOuterResult);
-                        }
-                        opts->dynResults->push_back(std::move(dr));
-
-                        if (capturedOuterResult.kind != WExpr::WError ||
-                            !capturedOuterResult.strVal.empty()) break;
-
-                        if (opts->abortFlag && opts->abortFlag->load()) break;
-                    }
-
-                    if (opts->dynLastEval)
-                        *opts->dynLastEval = std::chrono::steady_clock::now();
-
-                    if (opts->kernelStatus)
-                        SetSubWork(*opts->kernelStatus, SubWork::None, "drain:dynExpr:done");
-
-                    } else {
-                        DiagLog("[Eval] dynAutoMode: outer result captured during suppress — skipping Dynamic exprs");
-                    }
-
-                    bool outerCaptured = capturedOuterResult.kind != WExpr::WError ||
-                                         !capturedOuterResult.strVal.empty();
-                    if (outerCaptured) {
-                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured inside dialog — returning directly");
-                        {
-                            const char* closeExpr = "Return[$Failed]";
-                            WSPutFunction(lp, "EnterTextPacket", 1);
-                            WSPutUTF8String(lp,
-                                reinterpret_cast<const unsigned char*>(closeExpr),
-                                static_cast<int>(std::strlen(closeExpr)));
-                            WSEndPacket(lp);
-                            WSFlush(lp);
-                        }
-                        drainUntilEndDialog(lp, 3000);
-                        r.result = std::move(capturedOuterResult);
-                        if (r.result.kind == WExpr::Symbol &&
-                            stripCtx(r.result.strVal) == "$Aborted")
-                            r.aborted = true;
-                        if (opts && opts->interruptPending) opts->interruptPending->store(false);
+                    // ── Close dialog: Return[$Failed] + drain ENDDLGPKT ──────
+                    bool closeOk = dlg.close(&capturedOuter);
+                    if (!closeOk) {
+                        DiagLog("[Eval] dynAutoMode: drainUntilEndDialog timed out; aborting");
                         if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                        drainStalePackets(lp, opts);
+                        if (opts && opts->menuPktPending) opts->menuPktPending->store(false);
+                        if (opts && opts->kernelStatus)
+                            SetDialog(*opts->kernelStatus, DialogState::None, "drain:dynDialog:timeout");
+                        r.aborted = true;
+                        r.result = WExpr::mkSymbol("System`$Aborted");
+                        drainDialogAbortResponse(lp);
                         return r;
                     }
-                }
+                }  // DialogSession destroyed — dialog closed
 
-                // ---- Process one-shot subAuto() entries (dialog still open) ----
-                if (opts && opts->autoMutex && opts->autoExprQueue && opts->autoCompleted) {
-                    std::lock_guard<std::mutex> aLk(*opts->autoMutex);
-                    while (!opts->autoExprQueue->empty()) {
-                        // Safeguard: check link/abort before each subAuto entry
-                        if (opts->kernelStatus && GetLink(*opts->kernelStatus) != LinkState::Alive) {
-                            DiagLog("[Eval] subAuto: link died, stopping");
-                            break;
-                        }
-                        if (opts->kernelStatus && GetAbort(*opts->kernelStatus) != AbortState::None) {
-                            DiagLog("[Eval] subAuto: abort detected, stopping");
-                            break;
-                        }
-                        auto entry = std::move(opts->autoExprQueue->front());
-                        opts->autoExprQueue->pop_front();
-
-                        if (opts->kernelStatus)
-                            SetSubWork(*opts->kernelStatus, SubWork::SubBusy, "drain:subAuto");
-
-                        DiagLog("[Eval] dynAutoMode(BEGINDLG): subAuto id=" +
-                                std::to_string(entry.id) + " expr='" + entry.expr + "'");
-                        bool sentAuto =
-                            WSPutFunction(lp, "EnterTextPacket", 1) &&
-                            WSPutUTF8String(lp,
-                                reinterpret_cast<const unsigned char*>(entry.expr.c_str()),
-                                static_cast<int>(entry.expr.size())) &&
-                            WSEndPacket(lp) && WSFlush(lp);
-
-                        if (!sentAuto) {
-                            opts->autoCompleted->push_back({entry.id, "", "failed to send expression"});
-                        } else {
-                            DynResult dr;
-                            readDynResultWithTimeout(lp, dr, 2000, &capturedOuterResult);
-                            opts->autoCompleted->push_back({entry.id, dr.value, dr.error});
-                        }
-                        bool autoOuterCaptured =
-                            capturedOuterResult.kind != WExpr::WError ||
-                            !capturedOuterResult.strVal.empty();
-                        if (autoOuterCaptured) break;
-                        if (opts->abortFlag && opts->abortFlag->load()) break;
-                    }
-                    // Restore DynDialog state after subAuto processing
-                    if (opts->kernelStatus) {
-                        SetSubWork(*opts->kernelStatus, SubWork::None, "drain:subAuto:done");
-                    }
-                    if (!opts->autoCompleted->empty() &&
-                        opts->autoTsfnActive && opts->autoTsfnActive->load()) {
-                        opts->autoResolverTsfn->NonBlockingCall(
-                            [](Napi::Env, Napi::Function fn) { fn.Call({}); });
-                    }
-                }
-                // Check if the outer eval was captured during autoQueue processing.
-                {
-                    bool outerCapturedInAuto =
-                        capturedOuterResult.kind != WExpr::WError ||
-                        !capturedOuterResult.strVal.empty();
-                    if (outerCapturedInAuto) {
-                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured during subAuto — returning directly");
-                        if (opts && opts->interruptPending) opts->interruptPending->store(false);
-                        if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                        {
-                            const char* closeExpr = "Return[$Failed]";
-                            WSPutFunction(lp, "EnterTextPacket", 1);
-                            WSPutUTF8String(lp,
-                                reinterpret_cast<const unsigned char*>(closeExpr),
-                                static_cast<int>(std::strlen(closeExpr)));
-                            WSEndPacket(lp);
-                            WSFlush(lp);
-                        }
-                        drainUntilEndDialog(lp, 3000);
-                        r.result = std::move(capturedOuterResult);
-                        if (r.result.kind == WExpr::Symbol &&
-                            stripCtx(r.result.strVal) == "$Aborted")
-                            r.aborted = true;
-                        drainStalePackets(lp, opts);
-                        return r;
-                    }
-                }
-
-                // Close the dialog: send Return[$Failed] then drain ENDDLGPKT.
-                {
-                    const char* closeExpr = "Return[$Failed]";
-                    WSPutFunction(lp, "EnterTextPacket", 1);
-                    WSPutUTF8String(lp,
-                        reinterpret_cast<const unsigned char*>(closeExpr),
-                        static_cast<int>(std::strlen(closeExpr)));
-                    WSEndPacket(lp);
-                    WSFlush(lp);
-                }
-                bool exitOk = drainUntilEndDialog(lp, 3000, &capturedOuterResult);
-                if (!exitOk) {
-                    DiagLog("[Eval] dynAutoMode: drainUntilEndDialog timed out; aborting");
-                    if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                    if (opts && opts->interruptPending) opts->interruptPending->store(false);
-                    r.aborted = true;
-                    r.result = WExpr::mkSymbol("System`$Aborted");
-                    drainDialogAbortResponse(lp);
-                    return r;
-                }
-                {
-                    bool outerCapturedInDrain =
-                        capturedOuterResult.kind != WExpr::WError ||
-                        !capturedOuterResult.strVal.empty();
-                    if (outerCapturedInDrain) {
-                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured during drain — returning directly");
-                        if (opts && opts->interruptPending) opts->interruptPending->store(false);
-                        if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                        r.result = std::move(capturedOuterResult);
-                        if (r.result.kind == WExpr::Symbol &&
-                            stripCtx(r.result.strVal) == "$Aborted")
-                            r.aborted = true;
-                        drainStalePackets(lp, opts);
-                        return r;
-                    }
-                }
-                // Dialog closed — continue outer loop waiting for the original RETURNPKT.
+                // ── Clean up state, return or continue ───────────────────────
                 if (opts && opts->dialogOpen) opts->dialogOpen->store(false);
-                if (opts && opts->interruptPending) opts->interruptPending->store(false);
+                if (opts && opts->menuPktPending) opts->menuPktPending->store(false);
                 if (opts && opts->kernelStatus)
                     SetDialog(*opts->kernelStatus, DialogState::None, "drain:dynDialog:closed");
+
+                {
+                    bool outerCaptured = capturedOuter.kind != WExpr::WError ||
+                                         !capturedOuter.strVal.empty();
+                    if (outerCaptured) {
+                        DiagLog("[Eval] dynAutoMode: outer RETURNPKT captured — returning directly");
+                        r.result = std::move(capturedOuter);
+                        if (r.result.kind == WExpr::Symbol &&
+                            stripCtx(r.result.strVal) == "$Aborted")
+                            r.aborted = true;
+                        drainStalePackets(lp, opts);
+                        return r;
+                    }
+                }
+                // Dialog closed — continue outer loop waiting for RETURNPKT.
                 continue;
             }
 
+            // ---- Safety fallback: no onDialogBegin callback registered -----
             // ---- Safety fallback: no onDialogBegin callback registered -----
             if (!opts || !opts->hasOnDialogBegin) {
                 DiagLog("[Eval] BEGINDLGPKT: no onDialogBegin callback — auto-closing "
@@ -1265,9 +1310,23 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             break;
         }
         else if (pkt == RETURNTEXTPKT) {
-            DiagLog("[Eval] unexpected RETURNTEXTPKT — skipping");
+            // An EvaluatePacket may produce RETURNTEXTPKT instead of
+            // RETURNPKT when the eval was interrupted by a pending abort
+            // (MENUPKT type=0 from a prior 'a' response while idle).
+            // Capture the value as the eval result.
+            r.result = ReadExprRaw(lp);
             WSNewPacket(lp);
-            continue;
+            if (r.result.kind == WExpr::Symbol && stripCtx(r.result.strVal) == "$Aborted")
+                r.aborted = true;
+            gotResult = true;
+            DiagLog("[Eval] RETURNTEXTPKT captured kind=" +
+                    std::to_string(r.result.kind) +
+                    " val=" + (r.result.kind == WExpr::String ? r.result.strVal : "?"));
+            if (!opts || !opts->interactive) {
+                if (!r.aborted) drainStalePackets(lp, opts);
+                break;
+            }
+            // Interactive mode: fall through to consume trailing INPUTNAMEPKT.
         }
         else if (pkt == MENUPKT) {
             // ----------------------------------------------------------------
@@ -1303,12 +1362,13 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             WSPutString(lp, resp);
             WSEndPacket(lp);
             WSFlush(lp);
-            // Clear interrupt-pending flag when NOT entering dialog.
-            // For 'i' the flag stays set until the dialog cycle completes
-            // (cleared in the BEGINDLGPKT handler), preventing the timer
-            // from piling up another interrupt during dialog processing.
-            if (resp[0] != 'i' && opts && opts->interruptPending)
-                opts->interruptPending->store(false);
+            // Always clear menuPktPending when MENUPKT is consumed — regardless
+            // of the response character.  This is the critical fix for Path B:
+            // when MENUPKT arrives before BEGINDLGPKT and we respond 'i',
+            // menuPktPending must become false so the pre-drain does not wait
+            // for a MENUPKT that was already consumed here.
+            if (opts && opts->menuPktPending)
+                opts->menuPktPending->store(false);
         }
         else {
             DiagLog("[Eval] unknown pkt=" + std::to_string(pkt) + ", discarding");

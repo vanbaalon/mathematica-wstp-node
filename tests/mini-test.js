@@ -400,17 +400,16 @@ async function main() {
             assert(idleResult.value === '2',
                 `M7 idle expected "2", got "${idleResult?.value}"`);
 
-            // Verify kernel still functional
-            // NOTE: explicit interactive:false to avoid inheriting the
-            // previous cell's EnterExpressionPacket mode.
-            const nextCell = await withTimeout(s.evaluate('2 + 2', {interactive: false}), 10000, 'M7 follow-up');
-            assert(nextCell.result.value === 4,
-                `M7 follow-up expected 4, got ${nextCell.result.value}`);
-
+            // Stop ScheduledTask BEFORE follow-up to avoid Dialog[] events blocking.
             s.unregisterDynamic('_m7_slot1');
             s.unregisterDynamic('_m7_slot2');
             s.unregisterDynamic('_m7_watch');
             s.setDynAutoMode(false);
+
+            // Verify kernel still functional
+            const nextCell = await withTimeout(s.evaluate('2 + 2', {interactive: false}), 10000, 'M7 follow-up');
+            assert(nextCell.result.value === 4,
+                `M7 follow-up expected 4, got ${nextCell.result.value}`);
         } finally {
             s.close();
         }
@@ -474,16 +473,18 @@ async function main() {
             assert(succeeded.length >= 2,
                 `M8: expected >=2 busy subAuto successes, got ${succeeded.length}/${busyResults.length}: ${JSON.stringify(busyResults)}`);
 
-            // Verify kernel still works after
+            // Stop ScheduledTask BEFORE follow-up to avoid Dialog[] events
+            // blocking the WSTP stream and causing a timeout.
+            s.unregisterDynamic('_m8_dyn');
+            s.setDynAutoMode(false);
+
+            // Verify kernel still works after (ScheduledTask removal is queued first)
             const followUp = await withTimeout(
                 s.evaluate('2 + 2', { interactive: false }),
                 10000, 'M8 follow-up'
             );
             assert(followUp.result.value === 4,
                 `M8 follow-up expected 4, got ${followUp.result.value}`);
-
-            s.unregisterDynamic('_m8_dyn');
-            s.setDynAutoMode(false);
         } finally {
             s.close();
         }
@@ -542,16 +543,18 @@ async function main() {
             assert(seenValues.size >= 3,
                 `M9: expected >=3 distinct Dynamic values, got ${seenValues.size}: ${JSON.stringify([...seenValues])}`);
 
-            // Verify kernel still functional
+            // Stop ScheduledTask BEFORE follow-up to avoid ~200ms Dialog[] events
+            // blocking the WSTP stream and causing a 10s timeout.
+            s.unregisterDynamic('_m9_n');
+            s.setDynAutoMode(false);
+
+            // Verify kernel still functional (ScheduledTask removal is queued first)
             const followUp = await withTimeout(
                 s.evaluate('2 + 2', { interactive: false }),
                 10000, 'M9 follow-up'
             );
             assert(followUp.result.value === 4,
                 `M9 follow-up expected 4, got ${followUp.result.value}`);
-
-            s.unregisterDynamic('_m9_n');
-            s.setDynAutoMode(false);
         } finally {
             s.close();
         }

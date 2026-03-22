@@ -1,5 +1,5 @@
 // =============================================================================
-// wstp-backend/src/addon.cc   (v0.7.2 — thin entry point after refactor)
+// wstp-backend/src/addon.cc   (v1.0.0 — thin entry point after refactor)
 //
 // This file is intentionally minimal.  All implementation lives in the
 // other source files listed in binding.gyp:
@@ -47,7 +47,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     WstpReader::Init(env, exports);
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
-    exports.Set("version", Napi::String::New(env, "0.7.2"));
+    exports.Set("version", Napi::String::New(env, "1.0.0"));
     return exports;
 }
 

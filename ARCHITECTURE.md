@@ -94,3 +94,114 @@ Additionally, the ScheduledTask install expression in `EvaluateWorker` was chang
 
 **Tests:** mini-test M7, full-suite tests 65–70 (`tests/test_subauto_idle_hang.js`).
 Full details in `archive/SCHEDULEDTASK_DIALOG_RACE_FIX.md`.
+
+---
+
+## Interrupt/Dialog State Machine Refactoring (2026-03-22)
+
+### Problem: `MENUPKT` race between outer loop and pre-drain
+
+When `dynAutoMode` is active the timer sends `WSPutMessage(lp_, WSInterruptMessage)`
+periodically.  The kernel always responds with exactly **three packets**:
+
+```
+BEGINDLGPKT      ← opens a Dialog[] level
+INPUTNAMEPKT     ← the dialog's first input prompt
+MENUPKT type=1   ← the interrupt-menu (requires a string response: 'i'/'c'/'a')
+```
+
+These arrive on the WSTP pipe in order, but the **relative read order** of
+`BEGINDLGPKT` and `MENUPKT` as seen by the drain loop is non-deterministic.
+Two distinct paths exist:
+
+**Path A — `BEGINDLGPKT` first (always worked):**
+```
+outer loop  reads  BEGINDLGPKT
+pre-drain   reads  INPUTNAMEPKT  → wait for MENUPKT
+pre-drain   reads  MENUPKT       → respond 'c', reset
+pre-drain   reads  INPUTNAMEPKT  → break (second prompt = clean)
+expression sent correctly  ✓
+```
+
+**Path B — `MENUPKT` first (was broken):**
+```
+outer loop  reads  MENUPKT       → respond 'i',  interruptPending_ stays TRUE
+outer loop  reads  BEGINDLGPKT
+
+pre-drain:  interruptPending_.load() → true  (WRONG — MENUPKT already consumed)
+pre-drain   reads  INPUTNAMEPKT  → waiting for MENUPKT that never arrives
+             ... waits 500 ms ... TIMEOUT → expression sent in wrong state  ✗
+```
+
+### Root cause: overloaded `interruptPending_`
+
+`interruptPending_` served two incompatible purposes:
+
+| Purpose | Requirement |
+|---|---|
+| **Timer gate** — prevent a second interrupt while one is in-flight | Stay `true` for the entire dialog cycle |
+| **Pre-drain hint** — "a `MENUPKT` will arrive with this `BEGINDLGPKT`" | Become `false` as soon as `MENUPKT` is consumed |
+
+When Path B occurs the two requirements conflict: the flag stays `true` (timer
+gate requirement) but the `MENUPKT` has already been consumed (pre-drain hint
+now invalid).
+
+### Fix: replace `interruptPending_` with `menuPktPending_`
+
+Introduce a single-purpose flag:
+
+> **`menuPktPending_`** is `true` iff `WSInterruptMessage` was sent to the
+> kernel **and** the resulting `MENUPKT` has **not yet been consumed** by any
+> handler.
+
+**Set `true` by:** timer thread, immediately before `WSPutMessage(WSInterruptMessage)`.
+
+**Set `false` by:** every handler that reads a `MENUPKT` from the pipe — for
+**all** responses (`'i'`, `'c'`, `'a'`), including the outer drain loop when it
+responds `'i'` (previously the only place that did NOT clear the old flag).
+
+`dialogOpen_` remains the **primary** timer gate preventing re-interrupts
+during dialog processing.  `menuPktPending_` is the **secondary** gate that
+blocks a second interrupt while the first `MENUPKT` is still in the pipe.
+
+Side effect: the TOCTOU workaround (`opts->interruptPending->store(true)` inside
+the `BEGINDLGPKT` handler) is **removed** — it was both wrong (caused the bug)
+and unnecessary (the timer's `exchange(true)` on `menuPktPending_` already
+provides the needed atomicity guarantee together with `dialogOpen_`).
+
+### `DialogSession` — encapsulating the dialog lifecycle
+
+The dynAutoMode `BEGINDLGPKT` handler in `DrainToEvalResult` was ~300 lines of
+inline code.  It is refactored into a `DialogSession` RAII class:
+
+```
+DialogSession::DialogSession(lp, opts)
+    → drains to INPUTNAMEPKT (+ MENUPKT if menuPktPending_=true)
+    → valid() == true when ready to accept EnterTextPacket
+
+DialogSession::evaluate(id, expr, dr, capturedOuter)
+    → sends EnterTextPacket(expr)
+    → reads RETURNTEXTPKT into dr.value
+    → any MENUPKT during eval → respond 'c', re-send expr (retryExpr path)
+    → any RETURNPKT during eval → save into capturedOuter, stop loop
+
+DialogSession::close(capturedOuter)
+    → sends EnterTextPacket("Return[$Failed]")
+    → calls drainUntilEndDialog(3000)
+    → any RETURNPKT during drain → save into capturedOuter
+```
+
+After refactoring the entire dynAutoMode `BEGINDLGPKT` case is ~50 lines.
+
+### Invariants maintained
+
+1. `dialogOpen_` is set **before** any Dialog I/O and cleared **after**
+   `drainUntilEndDialog` returns — timer cannot fire during dialog.
+2. `menuPktPending_` tracks exactly one in-flight `MENUPKT` — cleared as soon
+   as the packet is consumed, regardless of the response character.
+3. Every `MENUPKT` read from the kernel **must** receive a string response
+   (`'i'`, `'c'`, or `'a'`) before the next `WSNextPacket` call, on all code paths.
+4. `Return[$Failed]` is always used to close an auto-managed dialog — never
+   leave a dialog level open.
+5. `drainUntilEndDialog` handles nested dialogs (e.g. from a concurrent
+   `ScheduledTask`) — safe to call even when additional `BEGINDLGPKT`s may arrive.
