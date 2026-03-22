@@ -11,6 +11,7 @@
 //   M5  — test 56: stale interrupt aborts cleanly     ~10s
 //   M6  — test 49: rapid cell transitions + Dynamic   ~8s
 //   M7  — test 65: post-eval idle subAuto hang         ~15s
+//   M8  — busy-path subAuto/Dynamic dead after ScheduledTask ~20s
 //
 // Total: ~65s vs ~300s+ for full suite.
 //
@@ -415,12 +416,86 @@ async function main() {
         }
     }, T(90000));
 
+    // ── M8: busy-path subAuto/Dynamic dead after ScheduledTask installed ──
+    // After a Dynamic cell completes (ScheduledTask installed,
+    // dynTaskInstalledInterval_>0), running a new long Do[] loop should
+    // still get busy-path subAuto results and print output.  The timer
+    // must send WSInterruptMessage even when a ScheduledTask is installed,
+    // because ScheduledTask can't fire during a busy kernel eval.
+    await run('M8. busy-path subAuto works after ScheduledTask installed', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, 'M8 warmup');
+
+            // Register a Dynamic → this triggers ScheduledTask installation
+            s.registerDynamic('_m8_dyn', 'ToString[nn$$]');
+            s.setDynamicInterval(300);
+
+            // Cell 1: short eval with Dynamic active → ScheduledTask gets installed
+            const cell1 = await withTimeout(
+                s.evaluate('nn$$ = 0; "cell1done"', { interactive: true }),
+                15000, 'M8 cell1'
+            );
+            assert(cell1.result.value === 'cell1done',
+                `M8 cell1 expected "cell1done", got ${JSON.stringify(cell1.result)}`);
+
+            // At this point dynTaskInstalledInterval_ == 300 (task installed)
+            // Now run a long computation — subAuto should work during it
+            const busyResults = [];
+            const evalPromise = s.evaluate(
+                'Do[nn$$ = k; Pause[0.5], {k, 1, 8}]; "cell2done"',
+                { interactive: true }
+            );
+
+            await sleep(800); // let the Do loop start
+            assert(!s.isReady, 'M8: kernel should be busy during Do loop');
+
+            // Fire several subAuto calls during the busy eval
+            for (let i = 0; i < 6; i++) {
+                if (s.isReady) break;
+                try {
+                    const r = await withTimeout(
+                        s.subAuto('ToString[nn$$]'),
+                        4000, `M8 busy subAuto #${i + 1}`
+                    );
+                    busyResults.push(r.value);
+                } catch (e) {
+                    busyResults.push('TIMEOUT');
+                }
+                await sleep(600);
+            }
+
+            const mainResult = await withTimeout(evalPromise, 30000, 'M8 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'cell2done',
+                `M8 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            // At least 2 of the 6 busy subAuto calls should have succeeded
+            const succeeded = busyResults.filter(v => v !== 'TIMEOUT');
+            assert(succeeded.length >= 2,
+                `M8: expected >=2 busy subAuto successes, got ${succeeded.length}/${busyResults.length}: ${JSON.stringify(busyResults)}`);
+
+            // Verify kernel still works after
+            const followUp = await withTimeout(
+                s.evaluate('2 + 2', { interactive: false }),
+                10000, 'M8 follow-up'
+            );
+            assert(followUp.result.value === 4,
+                `M8 follow-up expected 4, got ${followUp.result.value}`);
+
+            s.unregisterDynamic('_m8_dyn');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, T(60000));
+
     // ── Summary ───────────────────────────────────────────────────────────
-    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 7`);
+    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 8`);
     if (failedTests.length > 0) {
         console.log('Failed:', failedTests.join(', '));
     }
     console.log(failed === 0 ? 'All mini-tests PASSED \u2713' : 'Some mini-tests FAILED \u2717');
+    console.log(`out of 8`);
 
     _watchdogProc.kill('SIGKILL');
     process.exit(failed > 0 ? 1 : 0);

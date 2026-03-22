@@ -115,6 +115,7 @@ private:
     std::queue<DialogRequest>   dialogQueue_;
     std::atomic<bool>           dialogPending_{false};
     std::atomic<bool>           dialogOpen_{false};
+    std::atomic<bool>           interruptPending_{false};
 
     // Dynamic evaluation state (Phase 2)
     std::mutex                            dynMutex_;

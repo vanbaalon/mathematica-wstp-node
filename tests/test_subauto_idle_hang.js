@@ -50,16 +50,16 @@ function withTimeout(p, ms, label) {
     ]);
 }
 
-// Suite watchdog — force-kills if anything hangs beyond 3 minutes.
+// Suite watchdog — force-kills if anything hangs beyond 2 minutes.
 const watchdog = setTimeout(() => {
     console.log('\nFATAL: suite watchdog expired — force-exiting.');
     process.exit(2);
-}, 180_000);
+}, 120_000);
 watchdog.unref();
 
 let passed = 0, failed = 0;
 
-async function run(name, fn, timeoutMs = 60_000) {
+async function run(name, fn, timeoutMs = 45_000) {
     console.log(`\n${'─'.repeat(70)}`);
     console.log(`TEST: ${name}`);
     const t0 = Date.now();
@@ -73,6 +73,11 @@ async function run(name, fn, timeoutMs = 60_000) {
         console.log(`  [FAIL]  (${ms} ms)`);
         console.log(`  ERROR: ${err.message}`);
         failed++;
+        // If the kernel is hosed, we might want to exit early rather than hanging on every subsequent test
+        if (err.message.includes('TIMEOUT')) {
+            console.log('Detected TIMEOUT - kernel likely hosed. Exiting suite to free terminal.');
+            process.exit(1);
+        }
     }
 }
 

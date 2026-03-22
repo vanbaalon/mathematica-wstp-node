@@ -183,6 +183,7 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
     opts.dialogQueue   = &dialogQueue_;
     opts.dialogPending = &dialogPending_;
     opts.dialogOpen    = &dialogOpen_;
+    opts.interruptPending = &interruptPending_;
     opts.abortFlag     = &abortFlag_;
     opts.linkDead      = &linkDead_;
     opts.dynMutex      = &dynMutex_;
@@ -202,6 +203,8 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
         std::lock_guard<std::mutex> lk(queueMutex_);
         queue_.push(QueuedEval{ std::move(expr), std::move(opts), std::move(deferred), interactiveOverride });
     }
+    DiagLog("[Session] Evaluate: queued, busy=" + std::to_string(busy_.load()) +
+            " linkDead=" + std::to_string(linkDead_.load()));
     MaybeStartNext();
     return promise;
 }
@@ -211,10 +214,16 @@ Napi::Value WstpSession::Evaluate(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 void WstpSession::MaybeStartNext() {
     bool expected = false;
-    if (!busy_.compare_exchange_strong(expected, true))
+    if (!busy_.compare_exchange_strong(expected, true)) {
+        DiagLog("[Session] MaybeStartNext: busy CAS failed");
         return;
+    }
+    DiagLog("[Session] MaybeStartNext: acquired busy lock");
 
     std::unique_lock<std::mutex> lk(queueMutex_);
+    DiagLog("[Session] queues: subIdle=" + std::to_string(subIdleQueue_.size()) +
+            " main=" + std::to_string(queue_.size()) +
+            " whenIdle=" + std::to_string(whenIdleQueue_.size()));
 
     if (!subIdleQueue_.empty()) {
         auto item = std::move(subIdleQueue_.front());
@@ -250,6 +259,8 @@ void WstpSession::MaybeStartNext() {
     queue_.pop();
     lk.unlock();
 
+    DiagLog("[Session] MaybeStartNext: starting EvaluateWorker expr=" +
+            item.expr.substr(0, 40));
     bool evalInteractive = (item.interactiveOverride == -1)
                             ? interactiveMode_
                             : (item.interactiveOverride == 1);
@@ -267,6 +278,7 @@ void WstpSession::MaybeStartNext() {
         evalInteractive
     );
     worker->Queue();
+    DiagLog("[Session] MaybeStartNext: worker queued");
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +314,10 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
                 SetError("sub (idle): failed to send EvaluatePacket");
                 return;
             }
-            result_ = DrainToEvalResult(lp_);
+            // rejectDialog: stale timer interrupts should not abort idle evals
+            EvalOptions idleOpts;
+            idleOpts.rejectDialog = true;
+            result_ = DrainToEvalResult(lp_, &idleOpts);
             workerReadingLink_.store(false, std::memory_order_release);
         }
         void OnOK() override {
@@ -344,112 +359,415 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
     bool hadTask = (dynTaskInstalledInterval_ > 0);
     if (hadTask) {
         dynTaskInstalledInterval_ = 0;
-        DiagLog("[when-idle] will stop ScheduledTask before eval");
+        DiagLog("[when-idle] will remove ScheduledTask (close-while-idle approach)");
     }
+    // Suppress the timer thread during idle eval — it would send
+    // WSInterruptMessage (because busy_=true and dynRegistry not empty)
+    // which interferes with the eval.
+    dynIntervalMs_.store(0);
     struct WhenIdleWorker : public Napi::AsyncWorker {
-        WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
+        WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp,
+                       bool needStop, std::string expr,
                        std::atomic<bool>& workerReadingLink,
-                       std::function<void()> done, bool stopTask)
+                       std::function<void()> done)
             : Napi::AsyncWorker(d.Env()),
-              deferred_(std::move(d)), lp_(lp), expr_(std::move(expr)),
-              workerReadingLink_(workerReadingLink), done_(std::move(done)),
-              stopTask_(stopTask) {}
+              deferred_(std::move(d)), lp_(lp),
+              needStop_(needStop), expr_(std::move(expr)),
+              workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
+
+        // Close any stale dialog, setting $wstpDynTaskStop=True inside
+        // so that future task fires are suppressed.  Works because the
+        // dialog was opened while the kernel was IDLE — Return[$Failed]
+        // inside it doesn't abort any ongoing evaluation.
+        void closeStaleDialogs() {
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (!WSReady(lp_)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                int pkt = WSNextPacket(lp_);
+                if (pkt == BEGINDLGPKT) {
+                    wsint64 lvl = 0;
+                    if (WSGetType(lp_) == WSTKINT) WSGetInteger64(lp_, &lvl);
+                    WSNewPacket(lp_);
+                    DiagLog("[when-idle] stale BEGINDLGPKT — closing with stop flag");
+                    // Wait for dialog's INPUTNAMEPKT
+                    auto preDl = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(500);
+                    while (std::chrono::steady_clock::now() < preDl) {
+                        if (!WSReady(lp_)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int ip = WSNextPacket(lp_);
+                        WSNewPacket(lp_);
+                        if (ip == INPUTNAMEPKT) break;
+                        if (ip == 0 || ip == ILLEGALPKT) { WSClearError(lp_); return; }
+                    }
+                    // Set the task-stop flag inside the dialog
+                    const char* stopExpr = "$wstpDynTaskStop=True";
+                    WSPutFunction(lp_, "EnterTextPacket", 1);
+                    WSPutUTF8String(lp_,
+                        reinterpret_cast<const unsigned char*>(stopExpr),
+                        static_cast<int>(std::strlen(stopExpr)));
+                    WSEndPacket(lp_); WSFlush(lp_);
+                    // Consume result packets until next INPUTNAMEPKT
+                    auto aDl = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(2000);
+                    while (std::chrono::steady_clock::now() < aDl) {
+                        if (!WSReady(lp_)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int ap = WSNextPacket(lp_);
+                        WSNewPacket(lp_);
+                        if (ap == INPUTNAMEPKT) break;
+                        if (ap == ENDDLGPKT || ap == 0 || ap == ILLEGALPKT) return;
+                    }
+                    // Close the dialog with separate Return[$Failed]
+                    const char* closeExpr = "Return[$Failed]";
+                    WSPutFunction(lp_, "EnterTextPacket", 1);
+                    WSPutUTF8String(lp_,
+                        reinterpret_cast<const unsigned char*>(closeExpr),
+                        static_cast<int>(std::strlen(closeExpr)));
+                    WSEndPacket(lp_); WSFlush(lp_);
+                    // Drain until ENDDLGPKT
+                    auto bDl = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(2000);
+                    while (std::chrono::steady_clock::now() < bDl) {
+                        if (!WSReady(lp_)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int rp = WSNextPacket(lp_);
+                        WSNewPacket(lp_);
+                        if (rp == ENDDLGPKT) break;
+                        if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp_); return; }
+                    }
+                    DiagLog("[when-idle] stale dialog closed, flag set");
+                    // Reset the idle deadline — more stale data might follow
+                    deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(500);
+                } else if (pkt == MENUPKT) {
+                    wsint64 menuType = 0; WSGetInteger64(lp_, &menuType);
+                    const char* prompt = nullptr; WSGetString(lp_, &prompt);
+                    if (prompt) WSReleaseString(lp_, prompt);
+                    WSNewPacket(lp_);
+                    WSPutString(lp_, "a"); WSEndPacket(lp_); WSFlush(lp_);
+                    deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(500);
+                } else {
+                    WSNewPacket(lp_);
+                    deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(500);
+                }
+            }
+        }
 
         void Execute() override {
-            // ---- Phase A: drain ALL stale Dialogs from the ScheduledTask ----
-            // The ScheduledTask fires Dialog[] every ~300 ms.  We need to
-            // close every pending Dialog AND stop the task so that no new
-            // Dialog opens while we send our EvaluatePacket.
+            // Strategy: if ScheduledTask is active, its dialog opens while
+            // idling.  Instead of closing the dialog and sending a NEW eval
+            // (which hangs), we evaluate the user expression INSIDE the
+            // dialog, capture the result, and then close.
             //
-            // Strategy: read packets from the link.  When we see a
-            // BEGINDLGPKT, enter the Dialog, send a command that both
-            // suppresses the task AND exits the Dialog (via Return[]),
-            // then drain until ENDDLGPKT.  Repeat until 400 ms of silence
-            // (longer than one ScheduledTask interval).
-            if (stopTask_) {
-                auto lastActivity = std::chrono::steady_clock::now();
-                auto hardDeadline = std::chrono::steady_clock::now() +
-                                    std::chrono::milliseconds(2000);
-                while (std::chrono::steady_clock::now() < hardDeadline) {
+            // Key insight: Return[] inside Dialog during EvaluatePacket
+            // kills the outer eval.  So we must NEVER send EvaluatePacket
+            // while a periodic Dialog is possible.  Instead, enter the
+            // dialog, do our work there, and exit.
+            if (needStop_) {
+                DiagLog("[when-idle] phase1: looking for idle dialog");
+                bool gotResult = false;
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(2000);
+                while (std::chrono::steady_clock::now() < deadline) {
                     if (!WSReady(lp_)) {
-                        auto silence = std::chrono::steady_clock::now() - lastActivity;
-                        if (silence > std::chrono::milliseconds(400))
-                            break;  // 400 ms of silence — task stopped
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(5));
                         continue;
                     }
-                    lastActivity = std::chrono::steady_clock::now();
                     int pkt = WSNextPacket(lp_);
-                    DiagLog("[when-idle] drain pkt=" + std::to_string(pkt));
+                    DiagLog("[when-idle] phase1: pkt=" +
+                            std::to_string(pkt));
                     if (pkt == BEGINDLGPKT) {
+                        wsint64 lvl = 0;
+                        if (WSGetType(lp_) == WSTKINT)
+                            WSGetInteger64(lp_, &lvl);
                         WSNewPacket(lp_);
-                        // Pre-drain until INPUTNAMEPKT (Dialog prompt).
+                        // Wait for INPUTNAMEPKT
                         {
-                            auto dl = std::chrono::steady_clock::now() +
+                            auto pd = std::chrono::steady_clock::now() +
                                       std::chrono::milliseconds(500);
-                            while (std::chrono::steady_clock::now() < dl) {
+                            while (std::chrono::steady_clock::now() < pd) {
                                 if (!WSReady(lp_)) {
                                     std::this_thread::sleep_for(
                                         std::chrono::milliseconds(2));
                                     continue;
                                 }
                                 int ipkt = WSNextPacket(lp_);
-                                DiagLog("[when-idle] dlg pre-drain pkt=" +
+                                DiagLog("[when-idle] phase1: prompt pkt=" +
                                         std::to_string(ipkt));
                                 WSNewPacket(lp_);
                                 if (ipkt == INPUTNAMEPKT) break;
                                 if (ipkt == 0 || ipkt == ILLEGALPKT) {
-                                    WSClearError(lp_);
-                                    break;
+                                    WSClearError(lp_); break;
                                 }
                             }
                         }
-                        // Stop the ScheduledTask AND close the Dialog
-                        // in one EnterTextPacket (the correct packet type
-                        // for Dialog input).
-                        const char* stopClose =
+                        // Evaluate: stop task + user expression, all at once
+                        // Also set a global flag to ignore the next interrupt.
+                        std::string dialogExpr =
                             "$wstpDynTaskStop=True;"
-                            "Quiet[If[ValueQ[$wstpDynTask],"
-                            "RemoveScheduledTask[$wstpDynTask]]];"
+                            "Quiet[If[System`ValueQ[$wstpDynTask],System`RemoveScheduledTask[$wstpDynTask]]];"
                             "$wstpDynTask=.;"
-                            "Return[$Failed]";
+                            "WSTP`IgnoreNextInterrupt=True;"
+                            "Result = " + expr_ + ";"
+                            "System`Pause[0.5];" // Wait for any extra backend packets to arrive
+                            "Result";
                         WSPutFunction(lp_, "EnterTextPacket", 1);
-                        WSPutUTF8String(
-                            lp_,
-                            reinterpret_cast<const unsigned char*>(stopClose),
-                            static_cast<int>(std::strlen(stopClose)));
-                        WSEndPacket(lp_);
-                        WSFlush(lp_);
-                        DiagLog("[when-idle] sent stop+Return inside Dialog");
-                        drainUntilEndDialog(lp_, 3000);
-                        lastActivity = std::chrono::steady_clock::now();
-                    } else if (pkt == 0 || pkt == ILLEGALPKT) {
-                        WSClearError(lp_);
-                        break;
+                        WSPutUTF8String(lp_,
+                            reinterpret_cast<const unsigned char*>(
+                                dialogExpr.c_str()),
+                            static_cast<int>(dialogExpr.size()));
+                        WSEndPacket(lp_); WSFlush(lp_);
+                        DiagLog("[when-idle] phase1: sent expr inside dialog");
+                        // Read response packets, capture RETURNTEXTPKT
+                        {
+                            auto rd = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(5000);
+                            while (std::chrono::steady_clock::now() < rd) {
+                                if (!WSReady(lp_)) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::milliseconds(2));
+                                    continue;
+                                }
+                                int rp = WSNextPacket(lp_);
+                                DiagLog("[when-idle] phase1: resp pkt=" +
+                                        std::to_string(rp));
+                                if (rp == RETURNTEXTPKT) {
+                                    const unsigned char* s = nullptr;
+                                    int bytes = 0, chars = 0;
+                                    if (WSGetUTF8String(lp_, &s, &bytes, &chars)) {
+                                        std::string val(
+                                            reinterpret_cast<const char*>(s),
+                                            bytes);
+                                        WSReleaseUTF8String(lp_, s, bytes);
+                                        DiagLog("[when-idle] phase1: result='" +
+                                                val + "'");
+                                        WExpr w;
+                                        w.kind = WExpr::String;
+                                        w.strVal = val;
+                                        result_.result = w;
+                                        gotResult = true;
+                                    }
+                                    WSNewPacket(lp_);
+                                } else if (rp == RETURNPKT) {
+                                    // Read full expression result
+                                    WExpr w = ReadExprRaw(lp_);
+                                    DiagLog("[when-idle] phase1: RETURNPKT val=" +
+                                            std::to_string(w.kind));
+                                    if (!gotResult) {
+                                        result_.result = w;
+                                        gotResult = true;
+                                    }
+                                    WSNewPacket(lp_);
+                                } else if (rp == MENUPKT) {
+                                    // Kernel wants to show an interrupt menu (stale WSInterruptMessage).
+                                    // Respond 'i' to stay inside the dialog and keep waiting.
+                                    wsint64 mt = 0; WSGetInteger64(lp_, &mt);
+                                    const char* pr = nullptr; WSGetString(lp_, &pr);
+                                    if (pr) WSReleaseString(lp_, pr);
+                                    WSNewPacket(lp_);
+                                    DiagLog("[when-idle] phase1: resp MENUPKT type=" +
+                                            std::to_string(mt) + " — responding 'i'");
+                                    WSPutString(lp_, "i"); WSEndPacket(lp_); WSFlush(lp_);
+                                    rd = std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(5000);
+                                    continue;
+                                } else if (rp == BEGINDLGPKT) {
+                                    // Re-entered dialog after 'i' menu response.
+                                    // Drain until INPUTNAMEPKT, then re-send the expression.
+                                    WSNewPacket(lp_);
+                                    auto pd2 = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(500);
+                                    while (std::chrono::steady_clock::now() < pd2) {
+                                        if (!WSReady(lp_)) {
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                            continue;
+                                        }
+                                        int ipkt2 = WSNextPacket(lp_);
+                                        DiagLog("[when-idle] phase1: re-dialog pkt=" + std::to_string(ipkt2));
+                                        WSNewPacket(lp_);
+                                        if (ipkt2 == INPUTNAMEPKT) break;
+                                        if (ipkt2 == 0 || ipkt2 == ILLEGALPKT) {
+                                            WSClearError(lp_); break;
+                                        }
+                                    }
+                                    // Re-send the expression inside the new dialog
+                                    WSPutFunction(lp_, "EnterTextPacket", 1);
+                                    WSPutUTF8String(lp_,
+                                        reinterpret_cast<const unsigned char*>(dialogExpr.c_str()),
+                                        static_cast<int>(dialogExpr.size()));
+                                    WSEndPacket(lp_); WSFlush(lp_);
+                                    DiagLog("[when-idle] phase1: re-sent expr inside re-entered dialog");
+                                    rd = std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(5000);
+                                    continue;
+                                } else if (rp == TEXTPKT) {
+                                    // Kernel output (Print, messages) — skip
+                                    WSNewPacket(lp_);
+                                    continue;
+                                } else {
+                                    WSNewPacket(lp_);
+                                }
+                                if (rp == INPUTNAMEPKT) break;
+                                if (rp == 0 || rp == ILLEGALPKT) {
+                                    WSClearError(lp_); break;
+                                }
+                            }
+                        }
+                        // Close dialog with standalone Return[]
+                        {
+                            // Before closing, send a newline to flush any unfinished kernel prompt
+                            WSPutFunction(lp_, "EnterTextPacket", 1);
+                            WSPutUTF8String(lp_, (const unsigned char*)"\n", 1);
+                            WSEndPacket(lp_); WSFlush(lp_);
+
+                            const char* closeExpr = "Return[]";
+                            WSPutFunction(lp_, "EnterTextPacket", 1);
+                            WSPutUTF8String(lp_,
+                                reinterpret_cast<const unsigned char*>(
+                                    closeExpr),
+                                static_cast<int>(std::strlen(closeExpr)));
+                            WSEndPacket(lp_); WSFlush(lp_);
+                            DiagLog("[when-idle] phase1: sent Return[]");
+                            auto ed = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(3000);
+                            while (std::chrono::steady_clock::now() < ed) {
+                                if (!WSReady(lp_)) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::milliseconds(2));
+                                    continue;
+                                }
+                                int rp = WSNextPacket(lp_);
+                                DiagLog("[when-idle] phase1: close pkt=" +
+                                        std::to_string(rp));
+                                if (rp == RETURNTEXTPKT) {
+                                    // Capture/discard the Null result from Return[]
+                                    const unsigned char* s = nullptr;
+                                    int b = 0, c = 0;
+                                    if (WSGetUTF8String(lp_, &s, &b, &c)) {
+                                        DiagLog("[when-idle] phase1: close-loop result='" + std::string((const char*)s, b) + "'");
+                                        WSReleaseUTF8String(lp_, s, b);
+                                    }
+                                    WSNewPacket(lp_);
+                                    continue;
+                                }
+                                if (rp == 0 || rp == ILLEGALPKT) {
+                                    WSNextPacket(lp_); // skip content if any
+                                    WSClearError(lp_); break;
+                                }
+                                if (rp == INPUTNAMEPKT) {
+                                    // Captured the follow-up prompt — we ARE out!
+                                    WSNewPacket(lp_);
+                                    gotResult = true;
+                                    break;
+                                }
+                                WSNewPacket(lp_);
+                                if (rp == ENDDLGPKT) break;
+                            }
+                        }
+                        
+                        DiagLog("[when-idle] phase1: dialog done, gotResult=" +
+                                std::to_string(gotResult));
+                        
+                        // After dialog resolve, if we are still getting any packets, 
+                        // it means there's a pending interrupt or leftover response. 
+                        // Explicitly clear the link.
+                        {
+                            auto menuWait = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                            while (std::chrono::steady_clock::now() < menuWait) {
+                                if (WSReady(lp_)) {
+                                    int mp = WSNextPacket(lp_);
+                                    DiagLog("[when-idle] phase1: post-dlg cleanup pkt=" + std::to_string(mp));
+                                    if (mp == MENUPKT) {
+                                        wsint64 mt = 0; WSGetInteger64(lp_, &mt);
+                                        const char* pr = nullptr; WSGetString(lp_, &pr);
+                                        if (pr) WSReleaseString(lp_, pr);
+                                        WSNewPacket(lp_);
+                                        DiagLog("[when-idle] phase1: post-dlg MENUPKT type=" + std::to_string(mt) + " — responding 'c'");
+                                        WSPutString(lp_, "c"); WSEndPacket(lp_); WSFlush(lp_);
+                                        
+                                        menuWait = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                                        continue;
+                                    }
+                                    WSNewPacket(lp_);
+                                    if (mp == INPUTNAMEPKT) break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                            }
+                            // FINAL WAKEUP: send an empty packet to ensure the kernel is listening.
+                            WSPutFunction(lp_, "EnterTextPacket", 1);
+                            WSPutUTF8String(lp_, (const unsigned char*)"", 0);
+                            WSEndPacket(lp_); WSFlush(lp_);
+                            DiagLog("[when-idle] phase1: sent final wakeup EnterTextPacket");
+                        }
+
+                        break;  // exit outer drain loop
+                    } else if (pkt == MENUPKT) {
+                        wsint64 menuType = 0;
+                        WSGetInteger64(lp_, &menuType);
+                        const char* prompt = nullptr;
+                        WSGetString(lp_, &prompt);
+                        if (prompt) WSReleaseString(lp_, prompt);
+                        WSNewPacket(lp_);
+                        DiagLog("[when-idle] phase1: MENUPKT type=" +
+                                std::to_string(menuType));
+                        WSPutString(lp_, "a");
+                        WSEndPacket(lp_); WSFlush(lp_);
                     } else {
-                        WSNewPacket(lp_);  // discard INPUTNAMEPKT, etc.
+                        WSNewPacket(lp_);
                     }
                 }
-                DiagLog("[when-idle] drain complete — ScheduledTask stopped");
+                if (gotResult) {
+                    // Already have the result from evaluating inside dialog.
+                    workerReadingLink_.store(false, std::memory_order_release);
+                    return;
+                }
+                DiagLog("[when-idle] phase1: no dialog found, falling through to EvaluatePacket");
             } else {
-                // No ScheduledTask — just drain any stale packets.
                 if (WSReady(lp_)) {
-                    DiagLog("[when-idle] pre-eval: stale data on link — draining");
+                    DiagLog("[when-idle] pre-eval: stale data — draining");
                     drainStalePackets(lp_, nullptr);
                 }
             }
 
-            // ---- Phase B: send the actual eval (no more Dialog expected) ----
-            if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
-                !WSPutFunction(lp_, "ToExpression",   1) ||
-                !WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) ||
-                !WSEndPacket(lp_)                        ||
-                !WSFlush(lp_)) {
+            // Fallback: send a normal EvaluatePacket
+            // (needStop_==false, or no stale dialog was found)
+            std::string fullExpr;
+            if (needStop_) {
+                fullExpr = "Quiet[$wstpDynTaskStop=True;"
+                           "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
+                           "$wstpDynTask=.];" + expr_;
+            } else {
+                fullExpr = expr_;
+            }
+            DiagLog("[when-idle] phase2: sending EvaluatePacket");
+            bool sendOk =
+                WSPutFunction(lp_, "EvaluatePacket", 1) &&
+                WSPutFunction(lp_, "ToExpression",   1) &&
+                WSPutUTF8String(lp_, (const unsigned char *)fullExpr.c_str(), (int)fullExpr.size()) &&
+                WSEndPacket(lp_) &&
+                WSFlush(lp_);
+            if (!sendOk) {
                 workerReadingLink_.store(false, std::memory_order_release);
                 SetError("subWhenIdle: failed to send EvaluatePacket");
                 return;
             }
-            result_ = DrainToEvalResult(lp_);
+            EvalOptions idleOpts;
+            idleOpts.rejectDialog = true;
+            result_ = DrainToEvalResult(lp_, &idleOpts);
             workerReadingLink_.store(false, std::memory_order_release);
         }
         void OnOK() override {
@@ -472,18 +790,25 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
     private:
         Napi::Promise::Deferred deferred_;
         WSLINK                  lp_;
+        bool                    needStop_;
         std::string             expr_;
         std::atomic<bool>&      workerReadingLink_;
         std::function<void()>   done_;
-        bool                    stopTask_;
         EvalResult              result_;
     };
 
     workerReadingLink_.store(true, std::memory_order_release);
-    (new WhenIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
+    (new WhenIdleWorker(std::move(item.deferred), lp_,
+                        hadTask, std::move(item.expr),
                         workerReadingLink_,
-                        [this]() { PromoteAutoToWhenIdle(); busy_.store(false); MaybeStartNext(); },
-                        hadTask))->Queue();
+                        [this]() {
+                            DiagLog("[when-idle] done — promoting + next");
+                            PromoteAutoToWhenIdle();
+                            busy_.store(false);
+                            DiagLog("[when-idle] whenIdleQ=" + std::to_string(whenIdleQueue_.size()) +
+                                    " queue=" + std::to_string(queue_.size()));
+                            MaybeStartNext();
+                        }))->Queue();
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,11 +1359,14 @@ void WstpSession::StartDynTimer() {
             if (elapsed < dynIntervalMs_.load()) continue;
 
             if (workerReadingLink_.load() && !dialogOpen_.load()) {
-                bool taskInstalled = dynAutoMode_.load() && (dynTaskInstalledInterval_ > 0);
-                bool needInterrupt = false;
-                if (!dynAutoMode_.load() && hasDynRegs) needInterrupt = true;
-                if (hasAutoEntries && !taskInstalled) needInterrupt = true;
-                if (needInterrupt) {
+                // Always interrupt when busy and there are pending entries.
+                // ScheduledTask cannot fire during a busy kernel eval (Do[] etc.),
+                // so WSInterruptMessage is the only way to trigger Dialog[].
+                // Gate with interruptPending_ to allow only one in-flight
+                // interrupt — prevents runaway MENUPKT→Dialog loops after
+                // the main eval completes.
+                bool needInterrupt = (hasDynRegs || hasAutoEntries);
+                if (needInterrupt && !interruptPending_.exchange(true)) {
                     WSPutMessage(lp_, WSInterruptMessage);
                 }
             }

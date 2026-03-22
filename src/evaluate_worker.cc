@@ -25,6 +25,7 @@ EvaluateWorker::EvaluateWorker(Napi::Promise::Deferred       deferred,
 
 // ---- thread-pool thread: send packet; block until response ----
 void EvaluateWorker::Execute() {
+    DiagLog("[Eval] Execute() start — expr=" + expr_.substr(0, 40));
     // ---- Pre-eval drain: consume stale packets on the link --------
     // If an interrupt was sent just as the previous eval completed,
     // the kernel may have opened a Dialog[] (via the interrupt handler)
@@ -39,6 +40,8 @@ void EvaluateWorker::Execute() {
     }
 
     // ---- Phase 2: ScheduledTask[Dialog[], interval] management ----
+    DiagLog("[Eval] phase2 check: dynAutoMode=" + std::to_string(opts_.dynAutoMode)
+            + " dynIntervalMs=" + std::to_string(opts_.dynIntervalMs));
     if (opts_.dynAutoMode && opts_.dynIntervalMs > 0) {
         bool hasRegs = false;
         if (opts_.dynMutex && opts_.dynRegistry) {
@@ -90,6 +93,7 @@ void EvaluateWorker::Execute() {
     // ---- ScheduledTask Dialog[] suppression ----
     int installedTask = opts_.dynTaskInstalledInterval
                       ? *opts_.dynTaskInstalledInterval : 0;
+    DiagLog("[Eval] suppress check: installedTask=" + std::to_string(installedTask));
     std::string sendExpr = expr_;
     if (installedTask > 0) {
         if (opts_.rejectDialog) {
@@ -101,6 +105,8 @@ void EvaluateWorker::Execute() {
         }
     }
 
+    DiagLog("[Eval] about to send " + std::string(interactive_ ? "EnterExpressionPacket" : "EvaluatePacket")
+            + " expr=" + sendExpr.substr(0, 60));
     bool sent;
     if (!interactive_) {
         sent = WSPutFunction(lp_, "EvaluatePacket", 1) &&
@@ -115,11 +121,13 @@ void EvaluateWorker::Execute() {
                WSEndPacket  (lp_)                             &&
                WSFlush      (lp_);
     }
+    DiagLog("[Eval] send result: sent=" + std::to_string(sent));
     if (!sent) {
         workerReadingLink_.store(false, std::memory_order_release);
         SetError("Failed to send packet to kernel");
     } else {
         opts_.interactive = interactive_;
+        DiagLog("[Eval] entering DrainToEvalResult");
         result_ = DrainToEvalResult(lp_, &opts_);
         if (opts_.dialogOpen) opts_.dialogOpen->store(false);
 

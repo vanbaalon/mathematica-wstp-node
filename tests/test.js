@@ -133,7 +133,7 @@ const TEST_TIMEOUT_MS = 30_000;
 // because setTimeout callbacks can't fire while the JS event loop is blocked
 // by synchronous C++ code (e.g. CleanUp() spin-waiting for a stuck worker
 // thread, or the constructor's WSActivate blocking on kernel launch).
-const SUITE_TIMEOUT_S = 300;  // 5 minutes
+const SUITE_TIMEOUT_S = 900;  // 15 minutes — 78 tests, some up to 90s each
 const { spawn } = require('child_process');
 const _watchdogProc = spawn('sh',
     ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],
@@ -2316,6 +2316,75 @@ async function main() {
             s.unregisterDynamic('_t70_slot1');
             s.unregisterDynamic('_t70_slot2');
             s.unregisterDynamic('_t70_watch');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, 90000);
+
+    // ── 71. busy-path subAuto dead after ScheduledTask installed ──────────
+    // After a Dynamic cell completes (ScheduledTask installed), running a
+    // new long Do[] loop should still get busy-path subAuto results.  The
+    // timer must send WSInterruptMessage even when a ScheduledTask is
+    // installed, because ScheduledTask can't fire during a busy kernel eval.
+    await run('71. busy-path subAuto works after ScheduledTask installed', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, '71 warmup');
+
+            s.registerDynamic('_t71_dyn', 'ToString[nn71$$]');
+            s.setDynamicInterval(300);
+
+            // Cell 1: short eval with Dynamic — installs ScheduledTask
+            const cell1 = await withTimeout(
+                s.evaluate('nn71$$ = 0; "cell1ok"', { interactive: true }),
+                15000, '71 cell1'
+            );
+            assert(cell1.result.value === 'cell1ok',
+                `71 cell1 expected "cell1ok", got ${JSON.stringify(cell1.result)}`);
+
+            // Now dynTaskInstalledInterval_ == 300 (task installed)
+            // Cell 2: long computation — subAuto must work during it
+            const busyResults = [];
+            const evalPromise = s.evaluate(
+                'Do[nn71$$ = k; Pause[0.5], {k, 1, 20}]; "cell2ok"',
+                { interactive: true }
+            );
+
+            await sleep(800);
+            assert(!s.isReady, '71: kernel should be busy during Do loop');
+
+            for (let i = 0; i < 6; i++) {
+                if (s.isReady) break;
+                try {
+                    const r = await withTimeout(
+                        s.subAuto('ToString[nn71$$]'),
+                        4000, `71 busy subAuto #${i + 1}`
+                    );
+                    busyResults.push(r.value);
+                } catch (_) {
+                    busyResults.push('TIMEOUT');
+                }
+                await sleep(600);
+            }
+
+            const mainResult = await withTimeout(evalPromise, 30000, '71 main eval');
+            assert(!mainResult.aborted && mainResult.result.value === 'cell2ok',
+                `71 main eval: ${JSON.stringify(mainResult.result)}`);
+
+            const succeeded = busyResults.filter(v => v !== 'TIMEOUT');
+            assert(succeeded.length >= 1,
+                `71: expected >=1 busy subAuto successes, got ${succeeded.length}/${busyResults.length}: ${JSON.stringify(busyResults)}`);
+
+            // Post-eval: kernel still works
+            const followUp = await withTimeout(
+                s.evaluate('2 + 2'),
+                10000, '71 follow-up'
+            );
+            assert(followUp.result.value === 4,
+                `71 follow-up expected 4, got ${followUp.result.value}`);
+
+            s.unregisterDynamic('_t71_dyn');
             s.setDynAutoMode(false);
         } finally {
             s.close();

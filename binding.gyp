@@ -3,7 +3,7 @@
     # Cross-platform WSTP DeveloperKit path.
     # Override by setting WSTP_DIR in the environment.
     # See scripts/wstp_dir.js for auto-detection logic.
-    "wstp_dir%": "<!@(node scripts/wstp_dir.js)"
+    "wstp_dir%": "<!(node scripts/wstp_dir.js)"
   },
   "targets": [
     {
@@ -19,7 +19,7 @@
       ],
 
       "include_dirs": [
-        "<!@(node -p \"require('node-addon-api').include\")",
+        "<!(node -p \"require('node-addon-api').include.replace(/\\\"/g,'')\")",
         "<(wstp_dir)"
       ],
 

@@ -148,4 +148,7 @@ struct EvalOptions {
     // Link-dead flag — set by DrainToEvalResult on pkt=0; early-rejects
     // future evaluate/sub/subAuto calls without touching the broken link.
     std::atomic<bool>*         linkDead      = nullptr;
+    // Interrupt pending flag — set by StartDynTimer when WSInterruptMessage sent,
+    // cleared by MENUPKT handler after responding.  Prevents runaway interrupts.
+    std::atomic<bool>*         interruptPending = nullptr;
 };
