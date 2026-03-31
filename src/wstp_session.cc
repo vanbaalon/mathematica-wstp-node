@@ -9,6 +9,24 @@
 #include <sys/types.h>
 #include <thread>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  ifndef SIGTERM
+#    define SIGTERM 15
+#  endif
+#  ifndef SIGKILL
+#    define SIGKILL 9
+#  endif
+// On Windows, kill() doesn't exist — use TerminateProcess instead.
+static int kill(pid_t pid, int /*sig*/) {
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (!h) return -1;
+    BOOL ok = TerminateProcess(h, 1);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+}
+#endif
+
 static const char* kDefaultKernel =
     "/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel";
 
