@@ -50,7 +50,12 @@
           "msvs_settings": {
             "VCCLCompilerTool": { "ExceptionHandling": 1 }
           },
-          "libraries": ["<(wstp_dir)/wstp64i4s.lib"]
+          "libraries": [
+            "<(wstp_dir)/wstp64i4s.lib",
+            "-lws2_32",
+            "-lrpcrt4",
+            "-lmswsock"
+          ]
         }]
       ]
     }

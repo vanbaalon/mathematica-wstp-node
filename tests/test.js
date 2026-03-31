@@ -18,7 +18,7 @@ const { WstpSession, WstpReader, setDiagHandler, version } = wstp;
 const fs = require('fs');
 const path = require('path');
 
-const KERNEL_PATH = '/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel';
+const KERNEL_PATH = 'C:\\Program Files\\Wolfram Research\\Mathematica\\12.3\\WolframKernel.exe';
 
 function printBuildInfo() {
     const nodePath = path.join(__dirname, '../build/Release/wstp.node');
@@ -134,11 +134,26 @@ const TEST_TIMEOUT_MS = 30_000;
 // by synchronous C++ code (e.g. CleanUp() spin-waiting for a stuck worker
 // thread, or the constructor's WSActivate blocking on kernel launch).
 const SUITE_TIMEOUT_S = 900;  // 15 minutes — 78 tests, some up to 90s each
+// Watchdog: force-kill this process after SUITE_TIMEOUT_S seconds.
+// Uses a detached child process on both platforms so it fires even when the
+// JS event loop is blocked by a synchronous C++ call (e.g. WSActivate).
 const { spawn } = require('child_process');
-const _watchdogProc = spawn('sh',
-    ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],
-    { stdio: 'ignore', detached: true });
-_watchdogProc.unref();
+if (process.platform === 'win32') {
+    // PowerShell: sleep then force-kill this PID.  Detached so it survives
+    // even if the main JS event loop is blocked on native code.
+    const _watchdogProc = spawn(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command',
+         `Start-Sleep -Seconds ${SUITE_TIMEOUT_S}; Stop-Process -Id ${process.pid} -Force -ErrorAction SilentlyContinue`],
+        { stdio: 'ignore', detached: true }
+    );
+    _watchdogProc.unref();
+} else {
+    const _watchdogProc = spawn('sh',
+        ['-c', `sleep ${SUITE_TIMEOUT_S}; kill -9 ${process.pid} 2>/dev/null`],
+        { stdio: 'ignore', detached: true });
+    _watchdogProc.unref();
+}
 
 // ── Test filtering ─────────────────────────────────────────────────────────
 // Usage:  node test.js --only 38,39,40   or  --only 38-52
@@ -796,6 +811,7 @@ async function main() {
     // Uses a subsession so the main session stays intact for tests 25 and 18.
     // Verifies: return value = true, isDialogOpen cleared, queued promises rejected.
     await run('29. closeAllDialogs() rejects queued dialogEval promises', async () => {
+        if (process.env.SKIP_MULTI_KERNEL) { console.log('  [SKIP] requires multi-kernel license'); return; }
         const sub = session.createSubsession();
         try {
             // Open a Dialog[] on the subsession.
@@ -1181,6 +1197,7 @@ async function main() {
 
     // ── 31. kernelPid is distinct for main + subsessions ──────────────────
     await run('31. kernelPid distinct across subsessions', async () => {
+        if (process.env.SKIP_MULTI_KERNEL) { console.log('  [SKIP] requires multi-kernel license'); return; }
         const s = mkSession();
         try {
             const child1 = s.createSubsession();

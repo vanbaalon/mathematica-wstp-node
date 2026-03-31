@@ -2,8 +2,8 @@
 build/
 *.node
 
-# Dependencies
-node_modules/
+# Allow prebuilt platform binaries
+!prebuilds/**/*.node
 
 # Auth tokens — never commit
 .npmrc

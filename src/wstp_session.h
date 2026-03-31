@@ -12,10 +12,18 @@
 #include <mutex>
 #include <queue>
 #include <string>
-#include <sys/types.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#  include <sys/types.h>
+#  ifndef pid_t
+     typedef int pid_t;
+#  endif
+#else
+#  include <sys/types.h>
+#endif
 
 // ===========================================================================
 // WstpSession  —  JS class:  new WstpSession(kernelPath?)
