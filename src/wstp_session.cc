@@ -570,6 +570,11 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                     DiagLog("[when-idle] pre-eval: stale data — draining");
                     drainStalePackets(lp_, nullptr);
                 }
+                if (WSError(lp_) != WSEOK) {
+                    DiagLog("[when-idle] pre-eval: clearing stale WSError=" +
+                            std::to_string(WSError(lp_)));
+                    WSClearError(lp_);
+                }
             }
 
             // --------------------------------------------------------
@@ -585,6 +590,13 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
                            "$wstpDynTask=.];" + expr_;
             } else {
                 fullExpr = expr_;
+            }
+            // Clear any link error left by Phase A's packet reading (e.g. on
+            // Windows where INPUTNAMEPKT timing differs from macOS/Linux).
+            if (WSError(lp_) != WSEOK) {
+                DiagLog("[when-idle] phase B: clearing stale WSError=" +
+                        std::to_string(WSError(lp_)) + " before EvaluatePacket");
+                WSClearError(lp_);
             }
             DiagLog("[when-idle] phase B: sending EvaluatePacket");
             bool sendOk =
