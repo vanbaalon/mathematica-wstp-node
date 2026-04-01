@@ -9,6 +9,24 @@
 #include <sys/types.h>
 #include <thread>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  ifndef SIGTERM
+#    define SIGTERM 15
+#  endif
+#  ifndef SIGKILL
+#    define SIGKILL 9
+#  endif
+// On Windows, kill() doesn't exist — use TerminateProcess instead.
+static int kill(pid_t pid, int /*sig*/) {
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (!h) return -1;
+    BOOL ok = TerminateProcess(h, 1);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+}
+#endif
+
 static const char* kDefaultKernel =
     "/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel";
 
@@ -111,8 +129,54 @@ WstpSession::WstpSession(const Napi::CallbackInfo& info)
             Napi::Error::New(env, s).ThrowAsJavaScriptException();
             return;
         }
+        // Startup drain: the kernel may send CALLPKT (FrontEnd function calls)
+        // immediately after activation.  If we don't respond, the kernel stalls
+        // and eventually closes the link (WSError=WSECLOSED=11).
+        // Poll for up to 2 s, responding to CALLPKT with ReturnPacket[$Failed]
+        // and discarding other startup packets, stopping once the link is quiet.
+        {
+            auto startupDl = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            auto quietSince = std::chrono::steady_clock::now();
+            int callpktCount = 0, otherCount = 0;
+            while (std::chrono::steady_clock::now() < startupDl) {
+                if (!WSReady(lp_)) {
+                    // Link is quiet – stop if quiet for 200 ms or WSError set
+                    if (WSError(lp_) != 0) break;
+                    if (std::chrono::steady_clock::now() - quietSince >
+                            std::chrono::milliseconds(200))
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                quietSince = std::chrono::steady_clock::now();
+                int pkt = WSNextPacket(lp_);
+                DiagLog("[Session] startup pkt=" + std::to_string(pkt));
+                if (pkt == CALLPKT) {
+                    ++callpktCount;
+                    WSNewPacket(lp_);
+                    WSPutFunction(lp_, "ReturnPacket", 1);
+                    WSPutSymbol  (lp_, "$Failed");
+                    WSEndPacket  (lp_);
+                    WSFlush      (lp_);
+                } else if (pkt == 0 || pkt == ILLEGALPKT) {
+                    WSClearError(lp_);
+                    break;
+                } else {
+                    ++otherCount;
+                    WSNewPacket(lp_);
+                }
+            }
+            DiagLog("[Session] startup drain done: callpkt=" + std::to_string(callpktCount) +
+                    " other=" + std::to_string(otherCount) +
+                    " WSError=" + std::to_string(WSError(lp_)));
+        }
+        DiagLog("[Session] post-activate WSError=" + std::to_string(WSError(lp_)) +
+                " WSReady=" + std::to_string(WSReady(lp_)));
 
         kernelPid_ = FetchKernelPid(lp_);
+        DiagLog("[Session] FetchKernelPid done, pid=" + std::to_string(kernelPid_) +
+                " WSError=" + std::to_string(WSError(lp_)) +
+                " WSReady=" + std::to_string(WSReady(lp_)));
 
         if (WarmUpOutputRouting(lp_)) break;
 
@@ -273,6 +337,13 @@ void WstpSession::MaybeStartNext() {
                             : (item.interactiveOverride == 1);
     SetActivity(ks_, Activity::Eval, "MaybeStartNext:eval");
     evalActive_.store(true);
+    // Reset dynLastEval_ so the timer waits a full interval before sending
+    // its first WSInterruptMessage into this evaluation.  Without this, the
+    // timer fires immediately on short evals (< dynIntervalMs) because
+    // dynLastEval_ still holds the timestamp of the PREVIOUS dynamic cycle.
+    // The resulting stale MENUPKT arrives after the short eval finishes and
+    // corrupts the next evaluation's WSTP stream.
+    dynLastEval_ = std::chrono::steady_clock::now();
     workerReadingLink_.store(true, std::memory_order_release);
     auto* worker = new EvaluateWorker(
         std::move(item.deferred),
@@ -293,25 +364,35 @@ void WstpSession::MaybeStartNext() {
 // StartSubIdleWorker
 // ---------------------------------------------------------------------------
 void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
-    if (dynTaskInstalledInterval_ > 0) {
-        item.expr = "Quiet["
-                    "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
-                    "$wstpDynTask=.];" + item.expr;
-        dynTaskInstalledInterval_ = 0;
-        DiagLog("[sub-idle] prepending ScheduledTask stop");
-    }
     struct SubIdleWorker : public Napi::AsyncWorker {
         SubIdleWorker(Napi::Promise::Deferred d, WSLINK lp, std::string expr,
                       std::atomic<bool>& workerReadingLink,
+                      std::atomic<bool>& menuPktPending,
                       std::function<void()> done)
             : Napi::AsyncWorker(d.Env()),
               deferred_(std::move(d)), lp_(lp), expr_(std::move(expr)),
-              workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
+              workerReadingLink_(workerReadingLink),
+              menuPktPending_(menuPktPending), done_(std::move(done)) {}
 
         void Execute() override {
+            // Active wait if an interrupt was sent but MENUPKT not yet consumed
+            if (menuPktPending_.load()) {
+                DiagLog("[sub-idle] pre-drain: menuPktPending — waiting for stale MENUPKT");
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                while (menuPktPending_.load() && std::chrono::steady_clock::now() < deadline) {
+                    if (WSReady(lp_)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                if (menuPktPending_.load() && !WSReady(lp_)) {
+                    DiagLog("[sub-idle] pre-drain: force-clearing menuPktPending after 3 s");
+                    menuPktPending_.store(false);
+                }
+            }
             if (WSReady(lp_)) {
                 DiagLog("[sub-idle] pre-eval: stale data on link — draining");
-                drainStalePackets(lp_, nullptr);
+                EvalOptions drainOpts;
+                drainOpts.menuPktPending = &menuPktPending_;
+                drainStalePackets(lp_, &drainOpts);
             }
             if (!WSPutFunction(lp_, "EvaluatePacket", 1) ||
                 !WSPutFunction(lp_, "ToExpression",   1) ||
@@ -322,9 +403,9 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
                 SetError("sub (idle): failed to send EvaluatePacket");
                 return;
             }
-            // rejectDialog: stale timer interrupts should not abort idle evals
             EvalOptions idleOpts;
             idleOpts.rejectDialog = true;
+            idleOpts.menuPktPending = &menuPktPending_;
             result_ = DrainToEvalResult(lp_, &idleOpts);
             workerReadingLink_.store(false, std::memory_order_release);
         }
@@ -350,13 +431,14 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
         WSLINK                  lp_;
         std::string             expr_;
         std::atomic<bool>&      workerReadingLink_;
+        std::atomic<bool>&      menuPktPending_;
         std::function<void()>   done_;
         EvalResult              result_;
     };
 
     workerReadingLink_.store(true, std::memory_order_release);
     (new SubIdleWorker(std::move(item.deferred), lp_, std::move(item.expr),
-                       workerReadingLink_,
+                       workerReadingLink_, menuPktPending_,
                        [this]() { PromoteAutoToWhenIdle(); SetActivity(ks_, Activity::Idle, "SubIdleWorker:done"); busy_.store(false); MaybeStartNext(); }))->Queue();
 }
 
@@ -364,215 +446,54 @@ void WstpSession::StartSubIdleWorker(QueuedSubIdle item) {
 // StartWhenIdleWorker
 // ---------------------------------------------------------------------------
 void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
-    bool hadTask = (dynTaskInstalledInterval_ > 0);
-    if (hadTask) {
-        dynTaskInstalledInterval_ = 0;
-        DiagLog("[when-idle] will remove ScheduledTask (close-while-idle approach)");
-    }
+    // The C++ timer thread only fires while busy_==true, so no kernel
+    // ScheduledTask cleanup is needed here.
     // Suppress the timer thread during idle eval — it would send
-    // WSInterruptMessage (because busy_=true and dynRegistry not empty)
-    // which interferes with the eval.
+    // WSInterruptMessage which interferes with idle-eval packet flow.
     dynIntervalMs_.store(0);
     struct WhenIdleWorker : public Napi::AsyncWorker {
         WhenIdleWorker(Napi::Promise::Deferred d, WSLINK lp,
-                       bool needStop, std::string expr,
+                       std::string expr,
                        std::atomic<bool>& workerReadingLink,
+                       std::atomic<bool>& menuPktPending,
                        std::function<void()> done)
             : Napi::AsyncWorker(d.Env()),
               deferred_(std::move(d)), lp_(lp),
-              needStop_(needStop), expr_(std::move(expr)),
-              workerReadingLink_(workerReadingLink), done_(std::move(done)) {}
-
-        // Close any stale dialog that opened while the kernel was idle.
-        // No kernel-level flags needed — just close with Return[$Failed].
-        void closeStaleDialogs() {
-            auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(500);
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (!WSReady(lp_)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    continue;
-                }
-                int pkt = WSNextPacket(lp_);
-                if (pkt == BEGINDLGPKT) {
-                    wsint64 lvl = 0;
-                    if (WSGetType(lp_) == WSTKINT) WSGetInteger64(lp_, &lvl);
-                    WSNewPacket(lp_);
-                    DiagLog("[when-idle] stale BEGINDLGPKT — closing");
-                    // Wait for dialog's INPUTNAMEPKT
-                    auto preDl = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(500);
-                    while (std::chrono::steady_clock::now() < preDl) {
-                        if (!WSReady(lp_)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                            continue;
-                        }
-                        int ip = WSNextPacket(lp_);
-                        WSNewPacket(lp_);
-                        if (ip == INPUTNAMEPKT) break;
-                        if (ip == 0 || ip == ILLEGALPKT) { WSClearError(lp_); return; }
-                    }
-                    // Close the dialog directly
-                    const char* closeExpr = "Return[$Failed]";
-                    WSPutFunction(lp_, "EnterTextPacket", 1);
-                    WSPutUTF8String(lp_,
-                        reinterpret_cast<const unsigned char*>(closeExpr),
-                        static_cast<int>(std::strlen(closeExpr)));
-                    WSEndPacket(lp_); WSFlush(lp_);
-                    // Drain until ENDDLGPKT
-                    auto bDl = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(2000);
-                    while (std::chrono::steady_clock::now() < bDl) {
-                        if (!WSReady(lp_)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                            continue;
-                        }
-                        int rp = WSNextPacket(lp_);
-                        WSNewPacket(lp_);
-                        if (rp == ENDDLGPKT) break;
-                        if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp_); return; }
-                    }
-                    DiagLog("[when-idle] stale dialog closed");
-                    // Reset the idle deadline — more stale data might follow
-                    deadline = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(500);
-                } else if (pkt == MENUPKT) {
-                    wsint64 menuType = 0; WSGetInteger64(lp_, &menuType);
-                    const char* prompt = nullptr; WSGetString(lp_, &prompt);
-                    if (prompt) WSReleaseString(lp_, prompt);
-                    WSNewPacket(lp_);
-                    WSPutString(lp_, "a"); WSEndPacket(lp_); WSFlush(lp_);
-                    deadline = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(500);
-                } else {
-                    WSNewPacket(lp_);
-                    deadline = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(500);
-                }
-            }
-        }
+              expr_(std::move(expr)),
+              workerReadingLink_(workerReadingLink),
+              menuPktPending_(menuPktPending), done_(std::move(done)) {}
 
         void Execute() override {
-            if (needStop_) {
-                // --------------------------------------------------------
-                // Phase A — remove ScheduledTask from inside its Dialog.
-                //
-                // The task fires Dialog[] every ~300ms even when the kernel
-                // is idle.  We wait for the next BEGINDLGPKT, then send
-                // RemoveScheduledTask + Return[$Failed] inside that dialog.
-                // Once the task is removed, no more dialogs arrive.
-                // --------------------------------------------------------
-                DiagLog("[when-idle] phase A: waiting for ScheduledTask dialog");
-                bool taskRemoved = false;
-                auto deadline = std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(2000);
-                while (std::chrono::steady_clock::now() < deadline) {
-                    if (!WSReady(lp_)) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(5));
-                        continue;
-                    }
-                    int pkt = WSNextPacket(lp_);
-                    DiagLog("[when-idle] phase A: pkt=" +
-                            std::to_string(pkt));
-                    if (pkt == BEGINDLGPKT) {
-                        wsint64 lvl = 0;
-                        if (WSGetType(lp_) == WSTKINT)
-                            WSGetInteger64(lp_, &lvl);
-                        WSNewPacket(lp_);
-                        // Wait for INPUTNAMEPKT (dialog prompt)
-                        {
-                            auto pd = std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(500);
-                            while (std::chrono::steady_clock::now() < pd) {
-                                if (!WSReady(lp_)) {
-                                    std::this_thread::sleep_for(
-                                        std::chrono::milliseconds(2));
-                                    continue;
-                                }
-                                int ipkt = WSNextPacket(lp_);
-                                WSNewPacket(lp_);
-                                if (ipkt == INPUTNAMEPKT) break;
-                                if (ipkt == 0 || ipkt == ILLEGALPKT) {
-                                    WSClearError(lp_); break;
-                                }
-                            }
-                        }
-                        // Stop task + close dialog in ONE EnterTextPacket.
-                        // Wrapped in AbortProtect so a pending abort (from
-                        // 'a' response to a prior MENUPKT) cannot prevent
-                        // Return from executing.
-                        std::string stopExpr =
-                            "AbortProtect["
-                            "Quiet[If[ValueQ[$wstpDynTask],"
-                            "RemoveScheduledTask[$wstpDynTask]];"
-                            "$wstpDynTask=.];"
-                            "Return[$Failed]]";
-                        WSPutFunction(lp_, "EnterTextPacket", 1);
-                        WSPutUTF8String(lp_,
-                            reinterpret_cast<const unsigned char*>(
-                                stopExpr.c_str()),
-                            static_cast<int>(stopExpr.size()));
-                        WSEndPacket(lp_); WSFlush(lp_);
-                        DiagLog("[when-idle] phase A: sent RemoveScheduledTask + Return inside dialog");
-                        // Use a short timeout: the dialog may not send
-                        // ENDDLGPKT due to interaction with pending abort.
-                        // Phase B will work regardless.
-                        drainUntilEndDialog(lp_, 500);
-                        taskRemoved = true;
-                        DiagLog("[when-idle] phase A: dialog closed, task removed");
-                        break;
-                    } else if (pkt == MENUPKT) {
-                        // Stale interrupt from WSInterruptMessage.
-                        // Respond 'a' (abort) — safe when kernel is idle.
-                        wsint64 menuType = 0;
-                        WSGetInteger64(lp_, &menuType);
-                        const char* prompt = nullptr;
-                        WSGetString(lp_, &prompt);
-                        if (prompt) WSReleaseString(lp_, prompt);
-                        WSNewPacket(lp_);
-                        DiagLog("[when-idle] phase A: MENUPKT type=" +
-                                std::to_string(menuType) +
-                                " — responding 'a'");
-                        WSPutString(lp_, "a");
-                        WSEndPacket(lp_); WSFlush(lp_);
-                        // Reset deadline — dialog should follow shortly.
-                        deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::milliseconds(2000);
-                    } else {
-                        WSNewPacket(lp_);
-                    }
+            // Active wait if an interrupt was sent but MENUPKT not yet consumed
+            if (menuPktPending_.load()) {
+                DiagLog("[when-idle] pre-drain: menuPktPending — waiting for stale MENUPKT");
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                while (menuPktPending_.load() && std::chrono::steady_clock::now() < deadline) {
+                    if (WSReady(lp_)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                if (!taskRemoved) {
-                    DiagLog("[when-idle] phase A: no dialog found — "
-                            "task may already be inactive");
-                }
-            } else {
-                if (WSReady(lp_)) {
-                    DiagLog("[when-idle] pre-eval: stale data — draining");
-                    drainStalePackets(lp_, nullptr);
+                if (menuPktPending_.load() && !WSReady(lp_)) {
+                    DiagLog("[when-idle] pre-drain: force-clearing menuPktPending after 3 s");
+                    menuPktPending_.store(false);
                 }
             }
-
-            // --------------------------------------------------------
-            // Phase B — evaluate user expression on a clean link.
-            // Prepend RemoveScheduledTask as defence in case Phase A
-            // missed the task.  rejectDialog=true handles any stale
-            // Dialog[] that slipped through.
-            // --------------------------------------------------------
-            std::string fullExpr;
-            if (needStop_) {
-                fullExpr = "Quiet["
-                           "If[ValueQ[$wstpDynTask],RemoveScheduledTask[$wstpDynTask]];"
-                           "$wstpDynTask=.];" + expr_;
-            } else {
-                fullExpr = expr_;
+            if (WSReady(lp_)) {
+                DiagLog("[when-idle] pre-eval: stale data — draining");
+                EvalOptions drainOpts;
+                drainOpts.menuPktPending = &menuPktPending_;
+                drainStalePackets(lp_, &drainOpts);
             }
-            DiagLog("[when-idle] phase B: sending EvaluatePacket");
+            // Clear any stale link error before sending (needed on Windows).
+            if (WSError(lp_) != WSEOK) {
+                DiagLog("[when-idle] pre-eval: clearing stale WSError=" +
+                        std::to_string(WSError(lp_)));
+                WSClearError(lp_);
+            }
+            DiagLog("[when-idle] sending EvaluatePacket");
             bool sendOk =
                 WSPutFunction(lp_, "EvaluatePacket", 1) &&
                 WSPutFunction(lp_, "ToExpression",   1) &&
-                WSPutUTF8String(lp_, (const unsigned char *)fullExpr.c_str(), (int)fullExpr.size()) &&
+                WSPutUTF8String(lp_, (const unsigned char *)expr_.c_str(), (int)expr_.size()) &&
                 WSEndPacket(lp_) &&
                 WSFlush(lp_);
             if (!sendOk) {
@@ -582,9 +503,11 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
             }
             EvalOptions idleOpts;
             idleOpts.rejectDialog = true;
+            idleOpts.menuPktPending = &menuPktPending_;
             result_ = DrainToEvalResult(lp_, &idleOpts);
             workerReadingLink_.store(false, std::memory_order_release);
         }
+
         void OnOK() override {
             Napi::Env env = Env();
             if (result_.result.kind == WExpr::WError) {
@@ -605,17 +528,17 @@ void WstpSession::StartWhenIdleWorker(QueuedWhenIdle item) {
     private:
         Napi::Promise::Deferred deferred_;
         WSLINK                  lp_;
-        bool                    needStop_;
         std::string             expr_;
         std::atomic<bool>&      workerReadingLink_;
+        std::atomic<bool>&      menuPktPending_;
         std::function<void()>   done_;
         EvalResult              result_;
     };
 
     workerReadingLink_.store(true, std::memory_order_release);
     (new WhenIdleWorker(std::move(item.deferred), lp_,
-                        hadTask, std::move(item.expr),
-                        workerReadingLink_,
+                        std::move(item.expr),
+                        workerReadingLink_, menuPktPending_,
                         [this]() {
                             DiagLog("[when-idle] done — promoting + next");
                             PromoteAutoToWhenIdle();
@@ -1158,15 +1081,54 @@ void WstpSession::StartDynTimer() {
     if (dynTimerRunning_.exchange(true)) return;
     if (dynTimerThread_.joinable()) dynTimerThread_.join();
     dynTimerThread_ = std::thread([this]() {
+        // ── Sequential dynamic-evaluation loop ──
+        // The timer only sends WSInterruptMessage AFTER the previous
+        // dialog cycle is fully closed (menuPktPending=false,
+        // dialogOpen=false) AND the spacing interval has elapsed since
+        // the last Dynamic evaluation finished (dynLastEval_).
+        // This guarantees at most one interrupt is ever "in flight".
         while (open_) {
             int ms = dynIntervalMs_.load();
             if (ms <= 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+
+            // ── Gate 1: previous cycle must be fully closed ──
+            if (menuPktPending_.load() || dialogOpen_.load()) {
+                // Safety: if menuPktPending has been true for >5s, the kernel
+                // never sent a MENUPKT (e.g. eval finished before interrupt was
+                // processed).  Force-clear so the timer can proceed.
+                if (menuPktPending_.load()) {
+                    auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - menuPktSentAt_).count();
+                    if (age > 5000) {
+                        DiagLog("[DynTimer] Force-clearing stale menuPktPending after " + std::to_string(age) + "ms");
+                        menuPktPending_.store(false);
+                        continue;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+
+            // ── Gate 2: spacing — wait until ms elapsed since last eval ──
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - dynLastEval_).count();
+            if (elapsed < ms) {
+                auto remaining = ms - elapsed;
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    std::min(remaining, (long long)50)));
+                continue;
+            }
+
             if (!open_) break;
             if (!busy_.load()) continue;
+            if (!workerReadingLink_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+
             bool hasDynRegs = false;
             {
                 std::lock_guard<std::mutex> lk(dynMutex_);
@@ -1177,34 +1139,26 @@ void WstpSession::StartDynTimer() {
                 std::lock_guard<std::mutex> lk(autoMutex_);
                 hasAutoEntries = !autoExprQueue_.empty();
             }
-            if (!hasDynRegs && !hasAutoEntries) continue;
-            // In dynAutoMode the kernel's own ScheduledTask[Dialog[],…] opens
-            // dialogs at each interval.  Sending WSInterruptMessage here would
-            // race with an already-queued BEGINDLGPKT, leaving menuPktPending_
-            // true for a dialog that has no MENUPKT → DialogSession pre-drain
-            // hangs then the 'c' response closes the dialog prematurely.
-            if (dynAutoMode_.load()) continue;
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - dynLastEval_).count();
-            if (elapsed < dynIntervalMs_.load()) continue;
+            if (!hasDynRegs && !hasAutoEntries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
 
-            if (workerReadingLink_.load() && !dialogOpen_.load()) {
-                bool needInterrupt = (hasDynRegs || hasAutoEntries);
-                if (needInterrupt && !menuPktPending_.exchange(true)) {
-                    // Safeguard: verify state is safe before sending interrupt
-                    if (GetLink(ks_) != LinkState::Alive) {
-                        DiagLog("[DynTimer] Skip interrupt: link dead");
-                        menuPktPending_.store(false);
-                    } else if (GetAbort(ks_) != AbortState::None) {
-                        DiagLog("[DynTimer] Skip interrupt: abort in progress");
-                        menuPktPending_.store(false);
-                    } else if (GetDialog(ks_) != DialogState::None) {
-                        DiagLog("[DynTimer] Skip interrupt: dialog already open");
-                        menuPktPending_.store(false);
-                    } else {
-                        dynSentLog_.append("SEND WSInterrupt");
-                        WSPutMessage(lp_, WSInterruptMessage);
-                    }
+            // ── Send interrupt (at most one in flight) ──
+            if (!menuPktPending_.exchange(true)) {
+                menuPktSentAt_ = std::chrono::steady_clock::now();
+                if (GetLink(ks_) != LinkState::Alive) {
+                    DiagLog("[DynTimer] Skip: link dead");
+                    menuPktPending_.store(false);
+                } else if (GetAbort(ks_) != AbortState::None) {
+                    DiagLog("[DynTimer] Skip: abort in progress");
+                    menuPktPending_.store(false);
+                } else if (GetDialog(ks_) != DialogState::None) {
+                    DiagLog("[DynTimer] Skip: dialog already open");
+                    menuPktPending_.store(false);
+                } else {
+                    dynSentLog_.append("SEND WSInterrupt");
+                    WSPutMessage(lp_, WSInterruptMessage);
                 }
             }
         }
@@ -1294,16 +1248,27 @@ bool WstpSession::WarmUpOutputRouting(WSLINK lp) {
         bool gotText = false;
         while (true) {
             int pkt = WSNextPacket(lp);
+            DiagLog("[WarmUp] pkt=" + std::to_string(pkt));
             if (pkt == TEXTPKT) {
                 WSNewPacket(lp);
                 gotText = true;
             } else if (pkt == RETURNPKT) {
                 WSNewPacket(lp);
                 break;
+            } else if (pkt == CALLPKT) {
+                // Wolfram Engine sends CALLPKT (FrontEnd call) during/after init.
+                // Must respond with ReturnPacket[$Failed] or kernel blocks.
+                DiagLog("[WarmUp] CALLPKT — responding ReturnPacket[$Failed]");
+                WSNewPacket(lp);
+                WSPutFunction(lp, "ReturnPacket", 1);
+                WSPutSymbol  (lp, "$Failed");
+                WSEndPacket  (lp);
+                WSFlush      (lp);
             } else if (pkt == 0 || pkt == ILLEGALPKT) {
                 WSClearError(lp);
                 return false;
             } else {
+                DiagLog("[WarmUp] unexpected pkt=" + std::to_string(pkt) + " — skipping");
                 WSNewPacket(lp);
             }
         }
@@ -1321,12 +1286,16 @@ bool WstpSession::WarmUpOutputRouting(WSLINK lp) {
 // FetchKernelPid
 // ---------------------------------------------------------------------------
 pid_t WstpSession::FetchKernelPid(WSLINK lp) {
+    DiagLog("[FetchPid] sending EvaluatePacket, WSError=" + std::to_string(WSError(lp)));
     if (!WSPutFunction(lp, "EvaluatePacket", 1) ||
         !WSPutFunction(lp, "ToExpression",   1) ||
         !WSPutString  (lp, "$ProcessID")        ||
         !WSEndPacket  (lp)                      ||
-        !WSFlush      (lp))
+        !WSFlush      (lp)) {
+        DiagLog("[FetchPid] send failed, WSError=" + std::to_string(WSError(lp)));
         return 0;
+    }
+    DiagLog("[FetchPid] sent OK, waiting for response");
 
     pid_t pid = 0;
     while (true) {
@@ -1340,7 +1309,21 @@ pid_t WstpSession::FetchKernelPid(WSLINK lp) {
             WSNewPacket(lp);
             break;
         }
-        if (pkt == 0 || pkt == ILLEGALPKT) { WSClearError(lp); break; }
+        if (pkt == CALLPKT) {
+            // Wolfram Engine may send CALLPKT before responding — must reply.
+            DiagLog("[FetchPid] CALLPKT — responding ReturnPacket[$Failed]");
+            WSNewPacket(lp);
+            WSPutFunction(lp, "ReturnPacket", 1);
+            WSPutSymbol  (lp, "$Failed");
+            WSEndPacket  (lp);
+            WSFlush      (lp);
+            continue;
+        }
+        if (pkt == 0 || pkt == ILLEGALPKT) { 
+            DiagLog("[FetchPid] ILLEGALPKT/err pkt=" + std::to_string(pkt) + " WSError=" + std::to_string(WSError(lp)));
+            WSClearError(lp); break; 
+        }
+        DiagLog("[FetchPid] unexpected pkt=" + std::to_string(pkt) + " — skipping");
         WSNewPacket(lp);
     }
     return pid;

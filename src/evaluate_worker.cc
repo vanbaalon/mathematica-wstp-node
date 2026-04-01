@@ -1,6 +1,8 @@
 #include "evaluate_worker.h"
 #include "diag.h"
 #include "wstp_expr.h"
+#include <thread>
+#include <chrono>
 
 EvaluateWorker::EvaluateWorker(Napi::Promise::Deferred       deferred,
                                WSLINK                        lp,
@@ -34,61 +36,33 @@ void EvaluateWorker::Execute() {
     // the stale Dialog context and its RETURNPKT is consumed during the
     // BEGINDLGPKT handler's drain — leaving the outer DrainToEvalResult
     // loop waiting forever for a RETURNPKT that was already eaten.
+    // ── Active drain: if the timer sent an interrupt whose MENUPKT has
+    // not been consumed yet, wait for it.  The MENUPKT may still be in
+    // transit (kernel processing the interrupt handler), so poll with a
+    // timeout.  This is the primary defense against stale MENUPKTs
+    // leaking across evaluation boundaries.
+    if (opts_.menuPktPending && opts_.menuPktPending->load()) {
+        DiagLog("[Eval] pre-drain: menuPktPending — waiting for stale MENUPKT");
+        auto waitDeadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(3);
+        while (opts_.menuPktPending->load() &&
+               std::chrono::steady_clock::now() < waitDeadline) {
+            if (WSReady(lp_)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (opts_.menuPktPending->load() && !WSReady(lp_)) {
+            DiagLog("[Eval] pre-drain: menuPktPending still true after 3 s — force-clearing");
+            opts_.menuPktPending->store(false);
+        }
+    }
     if (WSReady(lp_)) {
         DiagLog("[Eval] pre-eval: stale data on link — draining");
-        drainStalePackets(lp_, nullptr);
+        drainStalePackets(lp_, &opts_);
     }
 
-    // ---- Phase 2: ScheduledTask[Dialog[], interval] management ----
-    DiagLog("[Eval] phase2 check: dynAutoMode=" + std::to_string(opts_.dynAutoMode)
-            + " dynIntervalMs=" + std::to_string(opts_.dynIntervalMs));
-    if (opts_.dynAutoMode && opts_.dynIntervalMs > 0) {
-        bool hasRegs = false;
-        if (opts_.dynMutex && opts_.dynRegistry) {
-            std::lock_guard<std::mutex> lk(*opts_.dynMutex);
-            hasRegs = !opts_.dynRegistry->empty();
-        }
-        if (!hasRegs && opts_.autoMutex && opts_.autoExprQueue) {
-            std::lock_guard<std::mutex> lk(*opts_.autoMutex);
-            hasRegs = !opts_.autoExprQueue->empty();
-        }
-
-        int installedInterval = opts_.dynTaskInstalledInterval
-                              ? *opts_.dynTaskInstalledInterval : 0;
-        bool needInstall = hasRegs && (installedInterval != opts_.dynIntervalMs);
-
-        if (needInstall) {
-            double intervalSec = opts_.dynIntervalMs / 1000.0;
-            // ScheduledTask always calls Dialog[] unconditionally.
-            // C++ handles every BEGINDLGPKT based on its state tracking
-            // (dialogOpen_, workerReadingLink_, dynAutoMode, etc.).
-            std::string taskExpr =
-                "Quiet["
-                " If[ValueQ[$wstpDynTask], RemoveScheduledTask[$wstpDynTask]];"
-                " $wstpDynTask = RunScheduledTask[Dialog[], " +
-                std::to_string(intervalSec) + "]]";
-            DiagLog("[Eval] dynAutoMode: installing ScheduledTask interval=" +
-                    std::to_string(intervalSec) + "s");
-            EvalOptions taskOpts;
-            taskOpts.rejectDialog = true;
-            bool sentT =
-                WSPutFunction(lp_, "EvaluatePacket", 1) &&
-                WSPutFunction(lp_, "ToExpression",   1) &&
-                WSPutUTF8String(lp_,
-                    reinterpret_cast<const unsigned char*>(taskExpr.c_str()),
-                    static_cast<int>(taskExpr.size())) &&
-                WSEndPacket(lp_) &&
-                WSFlush(lp_);
-            if (sentT) {
-                DrainToEvalResult(lp_, &taskOpts);
-                if (opts_.dynTaskInstalledInterval)
-                    *opts_.dynTaskInstalledInterval = opts_.dynIntervalMs;
-            }
-        }
-    }
-
-    // No kernel-level flag manipulation needed — C++ handles all
-    // BEGINDLGPKT packets based on its own state tracking.
+    // Dynamic polling is handled entirely by the C++ timer thread
+    // (wstp_session.cc dynTimerThread_) which sends WSInterruptMessage
+    // only while busy_ == true.  No kernel-level ScheduledTask needed.
     std::string sendExpr = expr_;
 
     DiagLog("[Eval] about to send " + std::string(interactive_ ? "EnterExpressionPacket" : "EvaluatePacket")

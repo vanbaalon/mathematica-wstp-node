@@ -138,15 +138,91 @@ void drainStalePackets(WSLINK lp, EvalOptions* opts) {
                 if (rp == 0 || rp == ILLEGALPKT) { WSClearError(lp); break; }
             }
         } else if (pkt == MENUPKT) {
-            // Stale interrupt menu — dismiss with empty response.
+            // Stale interrupt menu from a previous eval's WSInterruptMessage.
+            // Respond 'i' (inspect) and immediately close the Dialog, matching
+            // the normal dynamic-eval path.  Responding 'c' or 'a' can leave
+            // the kernel in a broken state when it's idle between evals.
             wsint64 menuType = 0; WSGetInteger64(lp, &menuType);
             const char* menuPrompt = nullptr; WSGetString(lp, &menuPrompt);
             if (menuPrompt) WSReleaseString(lp, menuPrompt);
             WSNewPacket(lp);
-            DiagLog("[Eval] drainStalePackets: stale MENUPKT type=" + std::to_string(menuType) + " — aborting");
-            WSPutString(lp, "a");  // abort — clean response to stale interrupt
+            DiagLog("[Eval] drainStalePackets: stale MENUPKT type=" + std::to_string(menuType) + " — opening dialog to close cleanly");
+            WSPutString(lp, "i");  // open Dialog so we can close it cleanly
             WSEndPacket(lp); WSFlush(lp);
+            if (opts && opts->menuPktPending) opts->menuPktPending->store(false);
+            // Now expect BEGINDLGPKT → INPUTNAMEPKT → send Return[$Failed] → ENDDLGPKT
+            auto dlgDl = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(3000);
+            bool gotBegin = false;
+            while (std::chrono::steady_clock::now() < dlgDl) {
+                if (!WSReady(lp)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                int dp = WSNextPacket(lp);
+                DiagLog("[Eval] drainStale(MENUPKT): pkt=" + std::to_string(dp));
+                if (dp == BEGINDLGPKT) {
+                    if (WSGetType(lp) == WSTKINT) { wsint64 lv = 0; WSGetInteger64(lp, &lv); }
+                    WSNewPacket(lp);
+                    gotBegin = true;
+                    // Wait for INPUTNAMEPKT
+                    auto inDl = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(500);
+                    while (std::chrono::steady_clock::now() < inDl) {
+                        if (!WSReady(lp)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                            continue;
+                        }
+                        int ip = WSNextPacket(lp);
+                        DiagLog("[Eval] drainStale(MENUPKT): inner pkt=" + std::to_string(ip));
+                        WSNewPacket(lp);
+                        if (ip == INPUTNAMEPKT) break;
+                        if (ip == 0 || ip == ILLEGALPKT) { WSClearError(lp); break; }
+                    }
+                    // Close dialog
+                    const char* closeExpr = "Return[$Failed]";
+                    WSPutFunction(lp, "EnterTextPacket", 1);
+                    WSPutUTF8String(lp,
+                        reinterpret_cast<const unsigned char*>(closeExpr),
+                        static_cast<int>(std::strlen(closeExpr)));
+                    WSEndPacket(lp); WSFlush(lp);
+                    DiagLog("[Eval] drainStale(MENUPKT): sent Return[$Failed]");
+                    drainUntilEndDialog(lp, 2000);
+                    DiagLog("[Eval] drainStale(MENUPKT): dialog closed cleanly");
+                    break;
+                }
+                WSNewPacket(lp);
+                if (dp == ENDDLGPKT) break;
+                if (dp == 0 || dp == ILLEGALPKT) { WSClearError(lp); break; }
+            }
+            if (!gotBegin) {
+                DiagLog("[Eval] drainStale(MENUPKT): no BEGINDLGPKT after 'i' — timeout");
+            }
+            // Reset idle deadline for continued draining
+            idleDeadline = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(idleMs);
+        } else if (pkt == CALLPKT) {
+            // Wolfram Engine (and sometimes Mathematica) sends CALLPKT to invoke a
+            // FrontEnd function.  Without a ReturnPacket response the kernel stalls,
+            // causing every subsequent WSPutFunction call to fail ("failed to send
+            // EvaluatePacket").  Respond with ReturnPacket[$Failed] so the kernel
+            // can continue.
+            DiagLog("[Eval] drainStalePackets: CALLPKT — responding ReturnPacket[$Failed]");
+            WSNewPacket(lp);
+            if (WSPutFunction(lp, "ReturnPacket", 1) &&
+                WSPutSymbol  (lp, "$Failed"       ) &&
+                WSEndPacket  (lp)) {
+                WSFlush(lp);
+            }
+            idleDeadline = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(idleMs);
+        } else if (pkt == 0 || pkt == ILLEGALPKT) {
+            // Link error or invalid packet — clear error and stop draining.
+            DiagLog("[Eval] drainStalePackets: ILLEGALPKT/err \u2014 clearing and breaking");
+            WSClearError(lp);
+            break;
         } else {
+            DiagLog("[Eval] drainStalePackets: unexpected pkt=" + std::to_string(pkt) + " \u2014 discarding");
             WSNewPacket(lp);  // discard any other stale packet
         }
     }
@@ -861,8 +937,23 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
     bool gotOutputName = false;
     bool gotResult     = false;
     while (true) {
-        if (opts && opts->rejectDialog)
+        // Safety: in rejectDialog mode, poll with timeout before blocking
+        // WSNextPacket. Prevents permanent deadlock if the kernel stops
+        // sending packets (e.g. after a stale MENUPKT 'a' response).
+        if (opts && opts->rejectDialog) {
             DiagLog("[Eval] WSNextPacket waiting... (rejectDialog)");
+            auto rdDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(15);
+            while (!WSReady(lp)) {
+                if (std::chrono::steady_clock::now() > rdDeadline) {
+                    DiagLog("[Eval] TIMEOUT: no data after 15s in rejectDialog — returning $Aborted");
+                    r.aborted = true;
+                    r.result = WExpr::mkSymbol("System`$Aborted");
+                    return r;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
         int pkt = WSNextPacket(lp);
         DiagLog("[Eval] pkt=" + std::to_string(pkt));
 
@@ -1349,10 +1440,33 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 if (!opts->autoExprQueue->empty()) wantInspect = true;
             }
             const char* resp;
-            if (wantInspect) {
+            // menuPktConfirmed: true iff the C++ timer thread sent this
+            // interrupt (menuPktPending_ was set by StartDynTimer).
+            // User-initiated interrupts (s.interrupt() / hasOnDialogBegin)
+            // bypass this check — they're always legitimate.
+            bool menuPktConfirmed = opts && opts->menuPktPending && opts->menuPktPending->load();
+            bool userDialog = wantInspect && opts && !opts->dynAutoMode && opts->hasOnDialogBegin;
+            if (wantInspect && (userDialog || menuPktConfirmed)) {
                 resp = "i";
+                // Reset dynLastEval_ so the timer's Gate 2 forces a full
+                // interval wait before firing another interrupt.  This gives
+                // enough time for BEGINDLGPKT to arrive (~200ms observed)
+                // and set dialogOpen_=true, which blocks Gate 1.
+                if (!userDialog && opts && opts->dynLastEval)
+                    *opts->dynLastEval = std::chrono::steady_clock::now();
+            } else if (wantInspect && !menuPktConfirmed) {
+                // Stale interrupt — timer didn't send this one.
+                resp = "a";
+                DiagLog("[Eval] MENUPKT: stale (menuPktPending=false) — aborting instead of inspect");
             } else if (opts && opts->rejectDialog) {
-                resp = "c";
+                // CRITICAL FIX: respond 'a' (abort) not 'c' (continue).
+                // A stale WSInterruptMessage from the Dynamic timer thread
+                // can arrive during WhenIdleWorker evals (subWhenIdle).
+                // Responding 'c' leaves WSNextPacket blocking forever because
+                // the kernel doesn't send any more packets after continuing
+                // a stale interrupt.  Responding 'a' causes the kernel to
+                // return $Aborted promptly, releasing the busy lock.
+                resp = "a";
             } else if (menuType_ == 1) {
                 resp = "a";
             } else {
@@ -1362,11 +1476,9 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             WSPutString(lp, resp);
             WSEndPacket(lp);
             WSFlush(lp);
-            // Always clear menuPktPending when MENUPKT is consumed — regardless
-            // of the response character.  This is the critical fix for Path B:
-            // when MENUPKT arrives before BEGINDLGPKT and we respond 'i',
-            // menuPktPending must become false so the pre-drain does not wait
-            // for a MENUPKT that was already consumed here.
+            // Always clear menuPktPending when MENUPKT is consumed.
+            // The timer's Gate 2 (dynLastEval_ spacing) prevents double-fires
+            // between the 'i' response and BEGINDLGPKT arrival.
             if (opts && opts->menuPktPending)
                 opts->menuPktPending->store(false);
         }

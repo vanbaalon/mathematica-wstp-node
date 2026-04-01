@@ -12,7 +12,14 @@
 #include <mutex>
 #include <queue>
 #include <string>
-#include <sys/types.h>
+#ifdef _WIN32
+#  include <sys/types.h>
+#  ifndef pid_t
+     typedef int pid_t;
+#  endif
+#else
+#  include <sys/types.h>
+#endif
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -131,7 +138,10 @@ private:
     std::atomic<bool>                     dynTimerRunning_{false};
     // menuPktPending_: true iff WSInterruptMessage sent and MENUPKT not yet
     // consumed.  See ARCHITECTURE.md §Interrupt/Dialog refactoring.
+    // ONLY cleared by MENUPKT handlers in drain.cc — never by done callbacks.
     std::atomic<bool>                     menuPktPending_{false};
+    // Timestamp when menuPktPending_ was last set true (timer thread only writes).
+    std::chrono::steady_clock::time_point menuPktSentAt_{};
     SentLog                               dynSentLog_;
 
     // subAuto() state

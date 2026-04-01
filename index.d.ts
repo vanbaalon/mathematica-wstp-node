@@ -144,6 +144,19 @@ export class WstpSession {
     evaluate(expr: string, opts?: EvalOptions): Promise<EvalResult>;
 
     /**
+     * Auto-routing evaluator that transparently chooses the best evaluation
+     * path based on the kernel's current state.
+     *
+     * - Idle: runs immediately via `subWhenIdle` (lowest-priority queue).
+     * - Busy: runs inside the next `Dialog[]` cycle (via the timer thread's
+     *   auto-interrupt mechanism — no JS round-trip needed).
+     *
+     * @param expr  Wolfram Language expression string to evaluate.
+     * @returns     Promise that resolves with the WExpr result.
+     */
+    subAuto(expr: string): Promise<WExpr>;
+
+    /**
      * Exit the currently-open Dialog[] subsession.
      *
      * Sends `Return[retVal]` as `EnterTextPacket` — the interactive-context
@@ -185,6 +198,21 @@ export class WstpSession {
      * @returns true if the message was posted to the link successfully.
      */
     interrupt(): boolean;
+
+    /**
+     * Unconditionally reset all dialog state on the Node.js side.
+     *
+     * Drains the internal dialog queue, immediately rejecting every pending
+     * dialogEval() and exitDialog() promise with an error — no callers are
+     * left waiting forever.  Clears `isDialogOpen` to `false`.
+     *
+     * This does *not* send any packet to the kernel — it only fixes Node-side
+     * bookkeeping. Use it in error-recovery paths, before abort(), or
+     * whenever you need to guarantee clean dialog state.
+     *
+     * @returns  true if `isDialogOpen` was true before the call.
+     */
+    closeAllDialogs(): boolean;
 
     /** True while a Dialog[] subsession is open on this link. */
     readonly isDialogOpen: boolean;

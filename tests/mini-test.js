@@ -12,8 +12,10 @@
 //   M6  — test 49: rapid cell transitions + Dynamic   ~8s
 //   M7  — test 65: post-eval idle subAuto hang         ~15s
 //   M8  — busy-path subAuto/Dynamic dead after ScheduledTask ~20s
+//   M9  — Dynamic updates throughout long Do loop     ~25s
+//   M10 — Dynamic updates on SECOND run of same loop  ~40s
 //
-// Total: ~65s vs ~300s+ for full suite.
+// Total: ~100s vs ~300s+ for full suite.
 //
 // Usage:
 //   node tests/mini-test.js                    # run all 6
@@ -560,13 +562,82 @@ async function main() {
         }
     }, T(60000));
 
+    // ── M10: Dynamic updates on second run of same Do loop ─────────────────
+    // Regression: second evaluation of Dynamic[n] + Do[...] cell should see
+    // live ScheduledTask updates throughout, not just the final value.
+    await run('M10. Dynamic updates on second run of same Do loop', async () => {
+        const s = mkSession();
+        try {
+            await withTimeout(s.evaluate('1+1'), 15000, 'M10 warmup');
+            await installHandler(s);
+
+            s.registerDynamic('_m10_n', 'ToString[n$$m10]');
+            s.setDynamicInterval(300);
+
+            // Short first eval to install ScheduledTask in the kernel
+            const cell1 = await withTimeout(
+                s.evaluate('n$$m10 = 0; "ready"', { interactive: true }),
+                15000, 'M10 cell1'
+            );
+            assert(cell1.result.value === 'ready',
+                `M10 cell1: ${JSON.stringify(cell1.result)}`);
+
+            // ── First run ────────────────────────────────────────────────
+            const seen1 = new Set();
+            const poll1 = setInterval(() => {
+                try {
+                    const v = s.getDynamicResults()['_m10_n']?.value;
+                    if (v) seen1.add(v);
+                } catch (_) {}
+            }, 500);
+
+            const run1 = await withTimeout(
+                s.evaluate('Do[n$$m10 = k; Pause[1], {k, 1, 4}]; "run1-done"', { interactive: true }),
+                30000, 'M10 run1'
+            );
+            clearInterval(poll1);
+            assert(!run1.aborted && run1.result.value === 'run1-done',
+                `M10 run1: ${JSON.stringify(run1.result)}`);
+            console.log(`    M10 run1 saw ${seen1.size} distinct values: ${JSON.stringify([...seen1])}`);
+            assert(seen1.size >= 2,
+                `M10 run1: expected >=2 distinct Dynamic values, got ${seen1.size}`);
+
+            // ── Second run — regression: must also see live updates ───────
+            // Between runs we do NOT reset dynAutoMode, mimicking the real
+            // extension where the user simply re-evaluates the same cell.
+            const seen2 = new Set();
+            const poll2 = setInterval(() => {
+                try {
+                    const v = s.getDynamicResults()['_m10_n']?.value;
+                    if (v) seen2.add(v);
+                } catch (_) {}
+            }, 500);
+
+            const run2 = await withTimeout(
+                s.evaluate('Do[n$$m10 = k; Pause[1], {k, 1, 4}]; "run2-done"', { interactive: true }),
+                30000, 'M10 run2'
+            );
+            clearInterval(poll2);
+            assert(!run2.aborted && run2.result.value === 'run2-done',
+                `M10 run2: ${JSON.stringify(run2.result)}`);
+            console.log(`    M10 run2 saw ${seen2.size} distinct values: ${JSON.stringify([...seen2])}`);
+            assert(seen2.size >= 2,
+                `M10 run2 regression: expected >=2 distinct Dynamic values on second run, got ${seen2.size}: ${JSON.stringify([...seen2])}`);
+
+            s.unregisterDynamic('_m10_n');
+            s.setDynAutoMode(false);
+        } finally {
+            s.close();
+        }
+    }, T(90000));
+
     // ── Summary ───────────────────────────────────────────────────────────
-    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 9`);
+    console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped out of 10`);
     if (failedTests.length > 0) {
         console.log('Failed:', failedTests.join(', '));
     }
     console.log(failed === 0 ? 'All mini-tests PASSED \u2713' : 'Some mini-tests FAILED \u2717');
-    console.log(`out of 9`);
+    console.log(`out of 10`);
 
     _watchdogProc.kill('SIGKILL');
     process.exit(failed > 0 ? 1 : 0);

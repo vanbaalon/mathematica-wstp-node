@@ -56,6 +56,9 @@ session.evaluate('Prime[10]').then(r => {
 
 See [API.md](./API.md) for full API details, usage examples, and advanced features.
    - [Priority `sub()` calls](#priority-sub-calls)
+   - [Background queries with `subWhenIdle()`](#background-queries-with-subwhenidle)
+   - [Auto-routing evaluations with `subAuto()`](#auto-routing-evaluations-with-subauto)
+   - [Abort a long computation](#abort-a-long-computation)
    - [Abort a long computation](#abort-a-long-computation)
    - [Dialog subsessions](#dialog-subsessions)
    - [Variable monitor — peeking at a running loop](#variable-monitor--peeking-at-a-running-loop)
