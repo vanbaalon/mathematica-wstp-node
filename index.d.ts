@@ -214,8 +214,15 @@ export class WstpSession {
      */
     closeAllDialogs(): boolean;
 
-    /** True while a Dialog[] subsession is open on this link. */
+    /**
+     * True while a Dialog[] subsession is open on this link.
+     */
     readonly isDialogOpen: boolean;
+
+    /**
+     * True if the WSTP link is dead or has encountered a fatal error.
+     */
+    readonly isLinkDead: boolean;
 
     /**
      * True when the session is fully ready to accept a new evaluation:

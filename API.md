@@ -1205,3 +1205,15 @@ cat diag.txt
 ```
 
 Timestamps are module-relative milliseconds (since the addon was loaded).
+
+---
+
+### `isLinkDead`
+
+```ts
+session.isLinkDead: boolean
+```
+
+Returns `true` if the WSTP link is dead or has encountered a fatal error that
+requires a session restart. This property is also part of the `link` dimension
+in [`kernelState`](#kernelstate).
