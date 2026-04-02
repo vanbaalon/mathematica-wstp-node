@@ -64,6 +64,7 @@ See [API.md](./API.md) for full API details, usage examples, and advanced featur
    - [Variable monitor — peeking at a running loop](#variable-monitor--peeking-at-a-running-loop)
    - [Real-time side channel (`WstpReader`)](#real-time-side-channel-wstpreader)
    - [Parallel independent kernels](#parallel-independent-kernels)
+   - [Synchronous syntax check (`syntaxCheck`)](#syntaxcheck)
 6. [Error handling](#error-handling)
 7. [Diagnostic logging](#diagnostic-logging)
 

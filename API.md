@@ -35,7 +35,8 @@ const { WstpSession, WstpReader, setDiagHandler } = require('./build/Release/wst
    - [Dynamic eval API](#dynamic-eval-api) — register expressions for automatic periodic evaluation
 4. [`WstpReader` — kernel-pushed side channel](#wstpreader)
 5. [`setDiagHandler(fn)`](#setdiaghandlerfn)
-6. [Usage examples](#usage-examples)
+6. [`syntaxCheck(code)`](#syntaxcheckcode) — synchronous C++ bracket/string syntax validator; no kernel required
+7. [Usage examples](#usage-examples)
    - [Basic evaluation](#basic-evaluation)
    - [Streaming output](#streaming-output)
    - [Concurrent evaluations](#concurrent-evaluations)
@@ -843,6 +844,40 @@ directly to `stderr` (no JS handler needed, useful in scripts):
 ```bash
 DEBUG_WSTP=1 node compute.js 2>diag.txt
 ```
+
+---
+
+## `syntaxCheck(code)`
+
+```ts
+syntaxCheck(code: string): string
+```
+
+Pure C++ synchronous syntax validator for Wolfram Language code.  Checks bracket
+balance (`[]`, `{}`, `()`), string delimiters (`"`), and comment nesting (`(* … *)`).
+**Does not start a kernel** — the check runs entirely in the addon's C++ layer and
+returns immediately.
+
+Returns a JSON string with an `"errors"` array.  Each error object has:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | `string` | Human-readable description of the problem |
+| `line` | `number` | 1-based line number of the error |
+| `column` | `number` | 1-based column number of the error |
+
+```js
+const { syntaxCheck } = require('./build/Release/wstp.node');
+
+const ok = syntaxCheck('1 + 2 * Prime[10]');
+console.log(JSON.parse(ok).errors);   // []
+
+const bad = syntaxCheck('f[x, g(y]');
+console.log(JSON.parse(bad).errors);
+// [ { message: "unmatched '('", line: 1, column: 6 } ]
+```
+
+Empty `errors` array means the code passed all checks.
 
 ---
 
