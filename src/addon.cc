@@ -64,7 +64,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
     exports.Set("syntaxCheck",
         Napi::Function::New(env, SyntaxCheck, "syntaxCheck"));
-    exports.Set("version", Napi::String::New(env, "1.0.0"));
+    exports.Set("version", Napi::String::New(env, "1.1.0"));
     return exports;
 }
 
