@@ -107,6 +107,7 @@ SOURCES=(
     "$SCRIPT_DIR/src/evaluate_worker.cc"
     "$SCRIPT_DIR/src/wstp_session.cc"
     "$SCRIPT_DIR/src/wstp_reader.cc"
+    "$SCRIPT_DIR/src/syntax_check.cc"
 )
 
 OBJECTS=()

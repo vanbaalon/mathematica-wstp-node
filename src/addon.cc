@@ -14,6 +14,7 @@
 #include "diag.h"
 #include "wstp_session.h"
 #include "wstp_reader.h"
+#include "syntax_check.h"
 
 // ---------------------------------------------------------------------------
 // setDiagHandler(fn | null) — register the global diagnostic callback.
@@ -40,6 +41,20 @@ static Napi::Value SetDiagHandler(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
+// syntaxCheck(code) — pure C++ structural syntax check, no kernel needed.
+// Returns the same JSON format as the WL VsCodeSyntaxCheck function.
+// ---------------------------------------------------------------------------
+static Napi::Value SyntaxCheck(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) {
+        return Napi::String::New(env, "{\"errors\":[]}");
+    }
+    const std::string code   = info[0].As<Napi::String>().Utf8Value();
+    const std::string result = wlSyntaxCheck(code);
+    return Napi::String::New(env, result);
+}
+
+// ---------------------------------------------------------------------------
 // Module entry point
 // ---------------------------------------------------------------------------
 Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
@@ -47,6 +62,8 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     WstpReader::Init(env, exports);
     exports.Set("setDiagHandler",
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
+    exports.Set("syntaxCheck",
+        Napi::Function::New(env, SyntaxCheck, "syntaxCheck"));
     exports.Set("version", Napi::String::New(env, "1.0.0"));
     return exports;
 }

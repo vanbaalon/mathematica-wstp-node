@@ -18,7 +18,9 @@ const { WstpSession, WstpReader, setDiagHandler, version } = wstp;
 const fs = require('fs');
 const path = require('path');
 
-const KERNEL_PATH = 'C:\\Program Files\\Wolfram Research\\Mathematica\\12.3\\WolframKernel.exe';
+const KERNEL_PATH = process.env.WSTP_TEST_KERNEL || (process.platform === 'win32'
+    ? 'C:\\Program Files\\Wolfram Research\\Mathematica\\12.3\\WolframKernel.exe'
+    : '/Applications/Wolfram 3.app/Contents/MacOS/WolframKernel');
 
 function printBuildInfo() {
     const nodePath = path.join(__dirname, '../build/Release/wstp.node');

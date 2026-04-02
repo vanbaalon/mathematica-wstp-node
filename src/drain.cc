@@ -586,6 +586,37 @@ DialogSession::DialogSession(WSLINK lp, EvalOptions* opts)
     valid_ = true;
 }
 
+// ---------------------------------------------------------------------------
+// stripOutputFormContinuation — remove Mathematica OutputForm line-continuation
+// sequences from a string.  EnterTextPacket results go through OutputForm which
+// wraps long lines by inserting: \\\012 \012>   (all literal ASCII chars, where
+// \012 is Mathematica's octal escape for newline).  This corrupts HTML/MathML
+// output.  We strip these sequences so busy-path results match idle-path ones.
+//
+// Pattern: \ \ \ 0 1 2  SP  \ 0 1 2 >  SP SP SP   (15 bytes)
+//          ─────────────────────────────────────────
+// Replaced with: nothing (empty string).
+// ---------------------------------------------------------------------------
+static void stripOutputFormContinuation(std::string& s) {
+    // 14-byte literal:  \\\012 \012>   (exactly 1 SP between, 2 SP after >)
+    static const char kSeq[] = "\\\\\\" "012 \\" "012>  ";
+    const size_t seqLen = 14;
+
+    size_t pos = s.find(kSeq, 0, seqLen);
+    if (pos == std::string::npos) return;
+
+    std::string out;
+    out.reserve(s.size());
+    size_t prev = 0;
+    while (pos != std::string::npos) {
+        out.append(s, prev, pos - prev);
+        prev = pos + seqLen;
+        pos = s.find(kSeq, prev, seqLen);
+    }
+    out.append(s, prev, s.size() - prev);
+    s = std::move(out);
+}
+
 bool DialogSession::evaluate(const std::string& id, const std::string& expr,
                              DynResult& dr, WExpr* capturedOuter)
 {
@@ -593,19 +624,28 @@ bool DialogSession::evaluate(const std::string& id, const std::string& expr,
     if (opts_ && opts_->sentLog)
         opts_->sentLog->append("SEND EnterText[" + id + "]: " + expr.substr(0, 40));
 
+    // Prepend SetOptions[$Output, PageWidth->Infinity] so EnterTextPacket's
+    // RETURNTEXTPKT formatter (which uses $Output's PageWidth) never wraps.
+    // Dialog[] resets $Output's PageWidth to 78 on entry; this overrides it.
+    static const std::string kPageWidthPrefix =
+        "SetOptions[$Output, PageWidth -> Infinity]; ";
+    std::string fullExpr = kPageWidthPrefix + expr;
     bool sent = WSPutFunction(lp_, "EnterTextPacket", 1) &&
                 WSPutUTF8String(lp_,
-                    reinterpret_cast<const unsigned char*>(expr.c_str()),
-                    static_cast<int>(expr.size())) &&
+                    reinterpret_cast<const unsigned char*>(fullExpr.c_str()),
+                    static_cast<int>(fullExpr.size())) &&
                 WSEndPacket(lp_) && WSFlush(lp_);
     if (!sent) {
         dr.error = "failed to send Dynamic expression";
         return false;
     }
-    return readDynResultWithTimeout(lp_, dr, 2000,
-                                    capturedOuter, &expr,
-                                    opts_ ? opts_->sentLog : nullptr,
-                                    opts_ ? opts_->menuPktPending : nullptr);
+    bool ok = readDynResultWithTimeout(lp_, dr, 2000,
+                                       capturedOuter, &expr,
+                                       opts_ ? opts_->sentLog : nullptr,
+                                       opts_ ? opts_->menuPktPending : nullptr);
+    if (ok && !dr.value.empty())
+        stripOutputFormContinuation(dr.value);
+    return ok;
 }
 
 bool DialogSession::close(WExpr* capturedOuter)

@@ -15,7 +15,8 @@
         "src/drain.cc",
         "src/evaluate_worker.cc",
         "src/wstp_session.cc",
-        "src/wstp_reader.cc"
+        "src/wstp_reader.cc",
+        "src/syntax_check.cc"
       ],
 
       "include_dirs": [
