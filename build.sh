@@ -93,6 +93,10 @@ if [[ ! -f "$WSTP_SDK/wstp.h" ]]; then
 fi
 echo "WSTP SDK      : $WSTP_SDK"
 
+# ── read version from package.json ───────────────────────────────────────────
+ADDON_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$SCRIPT_DIR/package.json','utf8')).version")"
+echo "Addon version : $ADDON_VERSION"
+
 # ── find the node shared library for linking ──────────────────────────────────
 # On macOS the node binary itself acts as the import library.
 NODE_LIB="$(node -p "process.execPath")"
@@ -124,6 +128,7 @@ for SRC in "${SOURCES[@]}"; do
         -fvisibility=hidden \
         -DBUILDING_NODE_EXTENSION \
         -DNAPI_DISABLE_CPP_EXCEPTIONS \
+        "-DWSTP_ADDON_VERSION=\"$ADDON_VERSION\"" \
         -I "$NODE_HEADERS" \
         -I "$NAPI_INCLUDE" \
         -I "$WSTP_SDK" \

@@ -64,7 +64,10 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
         Napi::Function::New(env, SetDiagHandler, "setDiagHandler"));
     exports.Set("syntaxCheck",
         Napi::Function::New(env, SyntaxCheck, "syntaxCheck"));
-    exports.Set("version", Napi::String::New(env, "1.1.0"));
+#ifndef WSTP_ADDON_VERSION
+#  define WSTP_ADDON_VERSION "dev"
+#endif
+    exports.Set("version", Napi::String::New(env, WSTP_ADDON_VERSION));
     return exports;
 }
 
