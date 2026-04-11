@@ -67,7 +67,11 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
 #ifndef WSTP_ADDON_VERSION
 #  define WSTP_ADDON_VERSION "dev"
 #endif
-    exports.Set("version", Napi::String::New(env, WSTP_ADDON_VERSION));
+#ifndef WSTP_ADDON_BUILD_DATE
+#  define WSTP_ADDON_BUILD_DATE "unknown"
+#endif
+    exports.Set("version",   Napi::String::New(env, WSTP_ADDON_VERSION));
+    exports.Set("buildDate", Napi::String::New(env, WSTP_ADDON_BUILD_DATE));
     return exports;
 }
 

@@ -1128,6 +1128,31 @@ async function safeEval(session, expr) {
 
 ---
 
+## Module-level exports
+
+The addon exports these properties at the top level (no session needed):
+
+```js
+const wstp = require('./build/Release/wstp.node');
+
+console.log(wstp.version);    // e.g. "1.1.3"  — semver from package.json
+console.log(wstp.buildDate);  // e.g. "2026-04-06"  — UTC date embedded at compile time
+
+wstp.setDiagHandler((msg) => console.error('[wstp]', msg));
+
+const { ok, error } = wstp.syntaxCheck('x + ');
+// ok: false, error: "syntax error at position 4"
+```
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `version` | `string` | Addon semver, e.g. `"1.1.3"`. Matches `package.json`. |
+| `buildDate` | `string` | UTC build date `"YYYY-MM-DD"`, embedded at compile time. |
+| `setDiagHandler(fn\|null)` | function | Install/remove a JS diagnostic log callback. |
+| `syntaxCheck(expr)` | function | Synchronous C++ syntax check — returns `{ ok: boolean, error: string\|null }`. |
+
+---
+
 ## Diagnostic Logging
 
 Two mechanisms — both disabled by default, zero overhead when off:

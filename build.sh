@@ -129,6 +129,7 @@ for SRC in "${SOURCES[@]}"; do
         -DBUILDING_NODE_EXTENSION \
         -DNAPI_DISABLE_CPP_EXCEPTIONS \
         "-DWSTP_ADDON_VERSION=\"$ADDON_VERSION\"" \
+        "-DWSTP_ADDON_BUILD_DATE=\"$(date -u '+%Y-%m-%d')\"" \
         -I "$NODE_HEADERS" \
         -I "$NAPI_INCLUDE" \
         -I "$WSTP_SDK" \
