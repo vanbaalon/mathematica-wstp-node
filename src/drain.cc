@@ -999,7 +999,7 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
         int pkt = WSNextPacket(lp);
         DiagLog("[Eval] pkt=" + std::to_string(pkt));
 
-        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT) {
+        if (pkt == RETURNPKT || pkt == RETURNEXPRPKT || pkt == RETURNTEXTPKT) {
             if (opts && opts->interactive && pkt == RETURNEXPRPKT) {
                 int tok = WSGetType(lp);
                 if (tok == WSTKSYM || tok == WSTKINT || tok == WSTKREAL || tok == WSTKSTR) {
@@ -1441,25 +1441,6 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
             if (opts && opts->kernelStatus) SetLink(*opts->kernelStatus, LinkState::Dead, "drain:outerLoop:linkDead");
             r.result = WExpr::mkError(s);
             break;
-        }
-        else if (pkt == RETURNTEXTPKT) {
-            // An EvaluatePacket may produce RETURNTEXTPKT instead of
-            // RETURNPKT when the eval was interrupted by a pending abort
-            // (MENUPKT type=0 from a prior 'a' response while idle).
-            // Capture the value as the eval result.
-            r.result = ReadExprRaw(lp);
-            WSNewPacket(lp);
-            if (r.result.kind == WExpr::Symbol && stripCtx(r.result.strVal) == "$Aborted")
-                r.aborted = true;
-            gotResult = true;
-            DiagLog("[Eval] RETURNTEXTPKT captured kind=" +
-                    std::to_string(r.result.kind) +
-                    " val=" + (r.result.kind == WExpr::String ? r.result.strVal : "?"));
-            if (!opts || !opts->interactive) {
-                if (!r.aborted) drainStalePackets(lp, opts);
-                break;
-            }
-            // Interactive mode: fall through to consume trailing INPUTNAMEPKT.
         }
         else if (pkt == MENUPKT) {
             // ----------------------------------------------------------------

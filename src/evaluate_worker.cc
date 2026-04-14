@@ -65,7 +65,7 @@ void EvaluateWorker::Execute() {
     // only while busy_ == true.  No kernel-level ScheduledTask needed.
     std::string sendExpr = expr_;
 
-    DiagLog("[Eval] about to send " + std::string(interactive_ ? "EnterExpressionPacket" : "EvaluatePacket")
+    DiagLog("[Eval] about to send " + std::string(interactive_ ? "EnterTextPacket" : "EvaluatePacket")
             + " expr=" + sendExpr.substr(0, 60));
     bool sent;
     if (!interactive_) {
@@ -75,10 +75,11 @@ void EvaluateWorker::Execute() {
                WSEndPacket  (lp_)                      &&
                WSFlush      (lp_);
     } else {
-        sent = WSPutFunction(lp_, "EnterExpressionPacket", 1) &&
-               WSPutFunction(lp_, "ToExpression",          1) &&
+        // Interactive mode mirrors front-end semantics: send raw text for
+        // top-level evaluation instead of pre-wrapping with ToExpression.
+        sent = WSPutFunction(lp_, "EnterTextPacket", 1) &&
                WSPutUTF8String(lp_, (const unsigned char *)sendExpr.c_str(), (int)sendExpr.size()) &&
-               WSEndPacket  (lp_)                             &&
+               WSEndPacket  (lp_)                       &&
                WSFlush      (lp_);
     }
     DiagLog("[Eval] send result: sent=" + std::to_string(sent));
