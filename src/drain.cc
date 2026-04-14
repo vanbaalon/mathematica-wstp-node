@@ -355,6 +355,7 @@ bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
                     " kind=" + std::to_string(val.kind) +
                     " val=" + (val.kind == WExpr::String ? val.strVal :
                                val.kind == WExpr::Integer ? std::to_string(val.intVal) :
+                               val.kind == WExpr::BigInteger ? val.strVal :
                                val.kind == WExpr::Symbol ? val.strVal :
                                val.kind == WExpr::Real ? std::to_string(val.realVal) :
                                val.head.empty() ? "?" : val.head));
@@ -372,11 +373,12 @@ bool readDynResultWithTimeout(WSLINK lp, DynResult& dr, int timeoutMs,
                 return false;
             }
             switch (val.kind) {
-                case WExpr::String:  dr.value = val.strVal;                        break;
-                case WExpr::Integer: dr.value = std::to_string(val.intVal);        break;
-                case WExpr::Real:    dr.value = std::to_string(val.realVal);       break;
-                case WExpr::Symbol:  dr.value = val.strVal;                        break;
-                default:             dr.value = val.head.empty() ? "?" : val.head; break;
+                case WExpr::String:     dr.value = val.strVal;                        break;
+                case WExpr::Integer:    dr.value = std::to_string(val.intVal);        break;
+                case WExpr::BigInteger: dr.value = val.strVal;                        break;
+                case WExpr::Real:       dr.value = std::to_string(val.realVal);       break;
+                case WExpr::Symbol:     dr.value = val.strVal;                        break;
+                default:                dr.value = val.head.empty() ? "?" : val.head; break;
             }
             return true;
         }

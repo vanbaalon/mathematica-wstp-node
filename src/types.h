@@ -16,7 +16,7 @@
 // Plain C++ expression tree — no NAPI, safe to build on any thread.
 // ===========================================================================
 struct WExpr {
-    enum Kind { Integer, Real, String, Symbol, Function, WError } kind = WError;
+    enum Kind { Integer, BigInteger, Real, String, Symbol, Function, WError } kind = WError;
 
     int64_t     intVal  = 0;
     double      realVal = 0.0;

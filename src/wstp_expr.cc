@@ -9,11 +9,23 @@ WExpr ReadExprRaw(WSLINK lp, int depth) {
     int type = WSGetType(lp);
 
     if (type == WSTKINT) {
-        wsint64 i = 0;
-        if (!WSGetInteger64(lp, &i))
-            return WExpr::mkError("WSGetInteger64 failed");
-        WExpr e; e.kind = WExpr::Integer; e.intVal = i;
-        return e;
+        // Use WSGetNumberAsString so arbitrarily-large integers don't crash the link.
+        // WSGetInteger64 closes the link on overflow; WSGetNumberAsString is safe for any size.
+        const char* s = nullptr;
+        if (!WSGetNumberAsString(lp, &s))
+            return WExpr::mkError("WSGetNumberAsString failed for integer");
+        std::string str(s);
+        WSReleaseString(lp, s);
+        // Try to parse as int64 first (common case — small integers).
+        try {
+            size_t pos = 0;
+            int64_t iv = std::stoll(str, &pos);
+            if (pos == str.size()) {
+                WExpr e; e.kind = WExpr::Integer; e.intVal = iv; return e;
+            }
+        } catch (...) {}
+        // Doesn't fit in int64 — return as BigInteger (decimal string).
+        WExpr e; e.kind = WExpr::BigInteger; e.strVal = std::move(str); return e;
     }
     if (type == WSTKREAL) {
         double d = 0.0;
@@ -67,6 +79,12 @@ Napi::Value WExprToNapi(Napi::Env env, const WExpr& e) {
             Napi::Object o = Napi::Object::New(env);
             o.Set("type",  Napi::String::New(env, "integer"));
             o.Set("value", Napi::Number::New(env, static_cast<double>(e.intVal)));
+            return o;
+        }
+        case WExpr::BigInteger: {
+            Napi::Object o = Napi::Object::New(env);
+            o.Set("type",  Napi::String::New(env, "biginteger"));
+            o.Set("value", Napi::String::New(env, e.strVal));
             return o;
         }
         case WExpr::Real: {
