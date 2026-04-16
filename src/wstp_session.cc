@@ -715,7 +715,17 @@ void WstpSession::PromoteAutoToWhenIdle() {
         std::lock_guard<std::mutex> lk(autoMutex_);
         remaining.swap(autoExprQueue_);
     }
-    if (remaining.empty()) return;
+    if (remaining.empty()) {
+        // autoExprQueue_ was already empty.  If the timer interval was only
+        // elevated for transient subAuto() calls (not for real Dynamic widgets),
+        // reset it so the timer thread goes dormant (sleeps 200ms) instead of
+        // the shorter 50ms idle sleep.
+        {
+            std::lock_guard<std::mutex> lk(dynMutex_);
+            if (dynRegistry_.empty()) dynIntervalMs_.store(0);
+        }
+        return;
+    }
     DiagLog("[subAuto] promoting " + std::to_string(remaining.size()) +
             " pending entries to whenIdleQueue");
     std::lock_guard<std::mutex> qlk(queueMutex_);
@@ -729,6 +739,12 @@ void WstpSession::PromoteAutoToWhenIdle() {
             });
             autoDeferreds_.erase(it);
         }
+    }
+    // After promoting all entries, if no Dynamic widgets are registered the
+    // timer interval is no longer needed — reset it so the thread goes dormant.
+    {
+        std::lock_guard<std::mutex> lk(dynMutex_);
+        if (dynRegistry_.empty()) dynIntervalMs_.store(0);
     }
 }
 
@@ -1123,7 +1139,15 @@ void WstpSession::StartDynTimer() {
             }
 
             if (!open_) break;
-            if (!busy_.load()) continue;
+            if (!busy_.load()) {
+                // Kernel is idle — nothing to interrupt.  Sleep so we do not
+                // busy-spin while dynIntervalMs_ > 0 but no eval is running.
+                // (dynIntervalMs_ is set to 300 by the subAuto() busy path even
+                // for transient livewatch calls, and is not reset until the next
+                // setDynAutoMode(false) / setDynamicInterval(0).)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
             if (!workerReadingLink_.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
