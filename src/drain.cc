@@ -673,17 +673,6 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
     DiagLog("[Drain] DrainToEvalResult entered, rejectDialog=" +
             std::to_string(opts ? opts->rejectDialog : false) +
             " interactive=" + std::to_string(opts ? opts->interactive : false));
-    // Diagnostic: poll for 3s to see if kernel will ever respond
-    for (int i = 0; i < 60; ++i) {
-        if (WSReady(lp)) {
-            DiagLog("[Drain] data arrived after " + std::to_string(i * 50) + "ms");
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    if (!WSReady(lp)) {
-        DiagLog("[Drain] WARNING: no data from kernel after 3s poll");
-    }
     EvalResult r;
 
     // Parse "In[42]:=" → 42
@@ -752,8 +741,20 @@ EvalResult DrainToEvalResult(WSLINK lp, EvalOptions* opts) {
                 while (sp < raw.size() && raw[sp] == ' ') ++sp;
                 raw = raw.substr(sp);
                 for (size_t i = 0; i < raw.size(); ) {
-                    if (raw.compare(i, 4, NL) == 0) { msg += ' '; i += 4; }
-                    else { msg += raw[i++]; }
+                    // Decode WL octal escapes: \NNN → actual byte (UTF-8 passthrough).
+                    // \012 (newline) is converted to space to keep lines compact.
+                    if (i + 3 < raw.size() && raw[i] == '\\' &&
+                        raw[i+1] >= '0' && raw[i+1] <= '7' &&
+                        raw[i+2] >= '0' && raw[i+2] <= '7' &&
+                        raw[i+3] >= '0' && raw[i+3] <= '7') {
+                        unsigned char byte =
+                            static_cast<unsigned char>((raw[i+1]-'0')*64 + (raw[i+2]-'0')*8 + (raw[i+3]-'0'));
+                        if (byte == 0x0A) msg += ' ';  // newline → space
+                        else              msg += static_cast<char>(byte);
+                        i += 4;
+                    } else {
+                        msg += raw[i++];
+                    }
                 }
                 // Both outer and dialog messages go onto r.messages.
                 r.messages.push_back(msg);

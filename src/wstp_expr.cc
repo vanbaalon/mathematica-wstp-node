@@ -35,19 +35,26 @@ WExpr ReadExprRaw(WSLINK lp, int depth) {
         return e;
     }
     if (type == WSTKSTR) {
-        const char* s = nullptr;
-        if (!WSGetString(lp, &s))
-            return WExpr::mkError("WSGetString failed");
-        WExpr e; e.kind = WExpr::String; e.strVal = s;
-        WSReleaseString(lp, s);
+        // Use UTF-8 variant so Wolfram char escapes like \|01F605 and \[Alpha]
+        // are decoded to actual UTF-8 bytes instead of being returned verbatim.
+        const unsigned char* s = nullptr;
+        int bytes = 0, chars = 0;
+        if (!WSGetUTF8String(lp, &s, &bytes, &chars))
+            return WExpr::mkError("WSGetUTF8String failed");
+        WExpr e; e.kind = WExpr::String;
+        e.strVal.assign(reinterpret_cast<const char*>(s), bytes);
+        WSReleaseUTF8String(lp, s, bytes);
         return e;
     }
     if (type == WSTKSYM) {
-        const char* s = nullptr;
-        if (!WSGetSymbol(lp, &s))
-            return WExpr::mkError("WSGetSymbol failed");
-        WExpr e; e.kind = WExpr::Symbol; e.strVal = s;
-        WSReleaseSymbol(lp, s);
+        // UTF-8 variant — decodes \|NNNN / \[Name] into UTF-8 bytes.
+        const unsigned char* s = nullptr;
+        int bytes = 0, chars = 0;
+        if (!WSGetUTF8Symbol(lp, &s, &bytes, &chars))
+            return WExpr::mkError("WSGetUTF8Symbol failed");
+        WExpr e; e.kind = WExpr::Symbol;
+        e.strVal.assign(reinterpret_cast<const char*>(s), bytes);
+        WSReleaseUTF8Symbol(lp, s, bytes);
         return e;
     }
     if (type == WSTKFUNC) {
