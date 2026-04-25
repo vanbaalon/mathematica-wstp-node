@@ -17,3 +17,6 @@ build/
 
 # VSIX release archives — published directly to GitHub Releases, not committed to git
 releases/*.vsix
+
+# Internal AI agent reference
+AGENTS.md
