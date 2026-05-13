@@ -125,15 +125,38 @@ function resolve () {
     const { execSync } = require('child_process');
     const machine = execSync('uname -m').toString().trim();
     const archDir  = machine === 'aarch64' ? 'Linux-ARM64' : 'Linux-x86-64';
-    const candidates = [
-      path.join(process.env.HOME || '/root', 'Wolfram', 'WolframEngine',
-                'SystemFiles', 'Links', 'WSTP', 'DeveloperKit', archDir, 'CompilerAdditions'),
-      path.join('/usr/local/Wolfram/WolframEngine',
-                'SystemFiles', 'Links', 'WSTP', 'DeveloperKit', archDir, 'CompilerAdditions'),
+
+    const productRoots = [
+      path.join('/usr/local/Wolfram/WolframEngine'),
+      path.join('/usr/local/Wolfram/Mathematica'),
+      path.join('/usr/local/Wolfram/Wolfram'),
+      path.join(process.env.HOME || '/root', 'Wolfram', 'WolframEngine'),
     ];
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
+
+    for (const productDir of productRoots) {
+      let entries;
+      try { entries = fs.readdirSync(productDir); } catch (e) { continue; }
+
+      const versions = entries
+        .filter(d => {
+          if (!/^\d/.test(d)) return false;
+          try { return fs.statSync(path.join(productDir, d)).isDirectory(); } catch (e) { return false; }
+        })
+        .sort()
+        .reverse();
+
+      if (!versions.length) continue;
+
+      const wstp = path.join(
+        productDir, versions[0],
+        'SystemFiles', 'Links', 'WSTP', 'DeveloperKit', archDir, 'CompilerAdditions'
+      );
+
+      const hasHeader = fs.existsSync(path.join(wstp, 'wstp.h'));
+      const hasLib    = fs.existsSync(path.join(wstp, 'libWSTP64i4.a'));
+      if (hasHeader && hasLib) return wstp;
     }
+
     throw new Error(
       'WSTP DeveloperKit not found for Linux.\n' +
       'Set WSTP_DIR to the CompilerAdditions directory.'
