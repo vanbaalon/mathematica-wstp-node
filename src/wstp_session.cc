@@ -1187,7 +1187,7 @@ void WstpSession::StartDynTimer() {
             if (elapsed < ms) {
                 auto remaining = ms - elapsed;
                 std::this_thread::sleep_for(std::chrono::milliseconds(
-                    std::min(remaining, (long long)50)));
+                    std::min<long long>(remaining, 50LL)));
                 continue;
             }
 
