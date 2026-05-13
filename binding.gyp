@@ -43,9 +43,9 @@
           }
         }],
         ["OS=='linux'", {
-          "libraries": ["<(wstp_dir)/libWSTPi4.a"],
-          "cflags_cc": ["-std=c++17", "-Wall", "-Wextra"],
-          "link_settings": { "libraries": ["-lrt", "-lpthread", "-ldl", "-lm"] }
+          "libraries": ["<(wstp_dir)/libWSTP64i4.a"],
+          "cflags_cc": ["-std=c++17", "-fexceptions", "-Wall", "-Wextra"],
+          "link_settings": { "libraries": ["-lrt", "-lpthread", "-ldl", "-lm", "-luuid"] }
         }],
         ["OS=='win'", {
           "msvs_settings": {
