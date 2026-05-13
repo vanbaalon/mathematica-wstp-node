@@ -314,6 +314,25 @@ export class WstpSession {
      */
     close(): void;
 
+    /**
+     * Activate a passive WSTP link previously opened in listen mode by the
+     * constructor.  Callers spawn the kernel externally (e.g. via
+     * `child_process.spawn(kernelPath, ['-wstp', '-linkname', session.linkName,
+     * '-linkmode', 'connect', '-linkprotocol', 'SharedMemory'])`), then call
+     * `connect()` to perform `WSActivate`, the startup CALLPKT drain, and the
+     * $Output-routing warm-up.  Required on Linux/Electron, where `linkmode
+     * launch` from inside the constructor would trip Electron's FD-ownership
+     * enforcement and SIGTRAP.  Throws if called on an already-open session.
+     */
+    connect(): void;
+
+    /**
+     * The WSTP link name created by the listen-mode constructor.  Pass this to
+     * the kernel at spawn time as `-linkname <linkName>`.  Empty string when
+     * the session has been closed.
+     */
+    readonly linkName: string;
+
     /** True while the link is open and the kernel is running. */
     readonly isOpen: boolean;
 

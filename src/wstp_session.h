@@ -45,6 +45,8 @@ public:
     Napi::Value CloseAllDialogs  (const Napi::CallbackInfo& info);
     Napi::Value CreateSubsession (const Napi::CallbackInfo& info);
     Napi::Value Close            (const Napi::CallbackInfo& info);
+    Napi::Value Connect          (const Napi::CallbackInfo& info);
+    Napi::Value LinkName         (const Napi::CallbackInfo& info);
     Napi::Value RegisterDynamic      (const Napi::CallbackInfo& info);
     Napi::Value UnregisterDynamic    (const Napi::CallbackInfo& info);
     Napi::Value ClearDynamicRegistry (const Napi::CallbackInfo& info);
@@ -105,6 +107,7 @@ private:
     WSEnvironment               wsEnv_;
     WSLINK                      lp_;
     bool                        open_;
+    std::string                 linkName_;
     bool                        interactiveMode_ = false;
     pid_t                       kernelPid_    = 0;
     bool                        kernelKilled_ = false;
