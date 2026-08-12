@@ -76,7 +76,7 @@ case "$ARCH" in
 esac
 
 # WSTP_DIR overrides everything; otherwise derive from WOLFRAM_APP (default: Wolfram 3.app)
-WOLFRAM_APP_DEFAULT="/Applications/Wolfram 3.app"
+WOLFRAM_APP_DEFAULT="/Applications/Mathematica.app"
 if [[ -z "${WSTP_DIR:-}" ]]; then
     WOLFRAM_APP="${WOLFRAM_APP:-$WOLFRAM_APP_DEFAULT}"
     WSTP_SDK="$WOLFRAM_APP/Contents/SystemFiles/Links/WSTP/DeveloperKit/$WSTP_SUBDIR/CompilerAdditions"
