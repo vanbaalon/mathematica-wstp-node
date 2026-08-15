@@ -35,6 +35,22 @@ mkdir -p "$OUT_DIR"
 
 OUTPUT="$OUT_DIR/wstp.node"
 
+# ── compiler / SDK ───────────────────────────────────────────────────────────────────────────────
+# A direct `clang++` invocation can select the compiler from Xcode but the
+# headers from a newer Command Line Tools SDK. Resolve both through xcrun and
+# pass the SDK explicitly so libc++ and Clang always form a compatible pair.
+CXX_BIN="${CXX:-clang++}"
+SDK_FLAGS=()
+if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun >/dev/null 2>&1; then
+    CXX_BIN="${CXX:-$(xcrun --sdk macosx --find clang++)}"
+    MACOS_SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+    SDK_FLAGS=(-isysroot "$MACOS_SDKROOT")
+fi
+echo "C++ compiler : $CXX_BIN"
+if [[ ${#SDK_FLAGS[@]} -gt 0 ]]; then
+    echo "macOS SDK    : $MACOS_SDKROOT"
+fi
+
 # ── locate node headers ───────────────────────────────────────────────────────
 NODE_BIN="$(which node)"
 NODE_PREFIX="$(node -p "'$NODE_BIN'.replace(/\\/(bin|MacOS)\\/node$/,'')" 2>/dev/null)"
@@ -120,9 +136,10 @@ for SRC in "${SOURCES[@]}"; do
     OBJ="$OUT_DIR/${BASE}.o"
     OBJECTS+=("$OBJ")
     echo "Compiling $SRC …"
-    clang++ \
+    "$CXX_BIN" \
         -std=c++17 \
         "${OPT_FLAGS[@]}" \
+        "${SDK_FLAGS[@]}" \
         -Wall -Wextra \
         -fPIC \
         -fvisibility=hidden \
@@ -140,7 +157,8 @@ done
 
 echo "Linking $OUTPUT …"
 
-clang++ \
+"$CXX_BIN" \
+    "${SDK_FLAGS[@]}" \
     -dynamiclib \
     -undefined dynamic_lookup \
     -o "$OUTPUT" \
