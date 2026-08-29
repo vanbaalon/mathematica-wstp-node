@@ -46,6 +46,8 @@ Napi::Object WstpSession::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod<&WstpSession::CloseAllDialogs>  ("closeAllDialogs"),
         InstanceMethod<&WstpSession::CreateSubsession>("createSubsession"),
         InstanceMethod<&WstpSession::Close>           ("close"),
+        InstanceMethod<&WstpSession::Connect>         ("connect"),
+        InstanceAccessor<&WstpSession::LinkName>      ("linkName"),
         InstanceMethod<&WstpSession::RegisterDynamic>     ("registerDynamic"),
         InstanceMethod<&WstpSession::UnregisterDynamic>   ("unregisterDynamic"),
         InstanceMethod<&WstpSession::ClearDynamicRegistry>("clearDynamicRegistry"),
@@ -97,50 +99,101 @@ WstpSession::WstpSession(const Napi::CallbackInfo& info)
         return;
     }
 
-    std::string linkName = "\"" + kernelPath + "\" -wstp";
-    const char* argv[] = { "wstp", "-linkname", linkName.c_str(),
-                                    "-linkmode",  "launch" };
-
+    // Use linkmode listen so WSTP creates the link without forking a process.
+    // JS spawns the kernel externally (child_process.spawn) then calls connect().
+    // This avoids MLFileManager::closeFileReferences() triggering Electron's
+    // FD-ownership enforcement (SIGTRAP crash on Linux with linkmode launch).
+    const char* listenArgv[] = { "wstp", "-linkmode", "listen",
+                                          "-linkprotocol", "SharedMemory" };
     int err = 0;
+    lp_ = WSOpenArgcArgv(wsEnv_, 5, const_cast<char**>(listenArgv), &err);
+    if (!lp_ || err != WSEOK) {
+        std::string msg = "WSOpenArgcArgv (listen) failed (code " + std::to_string(err) + ")";
+        WSDeinitialize(wsEnv_); wsEnv_ = nullptr;
+        Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+        return;
+    }
+
+    // Retrieve the link name so JS can pass it to the kernel at spawn time.
+    const char* name = WSLinkName(lp_);
+    linkName_ = name ? name : "";
+    DiagLog("[Session] listening on SharedMemory link: " + linkName_);
+    // open_ stays false until Connect() completes activation.
+}
+
+WstpSession::~WstpSession() { CleanUp(); }
+
+// ---------------------------------------------------------------------------
+// linkName (accessor) → string
+// Returns the WSTP link name JS should pass to the kernel at spawn time.
+// ---------------------------------------------------------------------------
+Napi::Value WstpSession::LinkName(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), linkName_);
+}
+
+// ---------------------------------------------------------------------------
+// connect() → void
+// Called by JS after it has spawned the kernel with the link name.
+// Runs WSActivate, startup drain, and WarmUpOutputRouting — everything that
+// was previously in the constructor's attempt loop.
+// ---------------------------------------------------------------------------
+Napi::Value WstpSession::Connect(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (open_) {
+        Napi::Error::New(env, "connect() called on already-open session")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (!lp_) {
+        Napi::Error::New(env, "connect() called but no WSTP link exists")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
     for (int attempt = 0; attempt <= 2; ++attempt) {
         if (attempt > 0) {
-            DiagLog("[Session] restart attempt " + std::to_string(attempt) +
-                    " — $Output routing broken on previous kernel");
-            WSClose(lp_);           lp_       = nullptr;
+            DiagLog("[Session] connect() restart attempt " + std::to_string(attempt));
+            WSClose(lp_); lp_ = nullptr;
             if (kernelPid_ > 0 && !kernelKilled_) { kernelKilled_ = true; kill(kernelPid_, SIGTERM); }
             kernelKilled_ = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
 
-        err = 0;
-        lp_ = WSOpenArgcArgv(wsEnv_, 5, const_cast<char**>(argv), &err);
-        if (!lp_ || err != WSEOK) {
-            std::string msg = "WSOpenArgcArgv failed (code " + std::to_string(err) + ")";
-            WSDeinitialize(wsEnv_); wsEnv_ = nullptr;
-            Napi::Error::New(env, msg).ThrowAsJavaScriptException();
-            return;
+            // Re-open listen link for re-attempt
+            const char* listenArgv[] = { "wstp", "-linkmode", "listen",
+                                                  "-linkprotocol", "SharedMemory" };
+            int err2 = 0;
+            lp_ = WSOpenArgcArgv(wsEnv_, 5, const_cast<char**>(listenArgv), &err2);
+            if (!lp_ || err2 != WSEOK) {
+                std::string msg = "WSOpenArgcArgv (listen re-attempt) failed (code " +
+                                  std::to_string(err2) + ")";
+                Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+            const char* name2 = WSLinkName(lp_);
+            linkName_ = name2 ? name2 : "";
+            DiagLog("[Session] new listen link for re-attempt: " + linkName_);
         }
 
         if (!WSActivate(lp_)) {
             const char* m = WSErrorMessage(lp_);
             std::string s = std::string("WSActivate failed: ") + (m ? m : "?");
-            WSClose(lp_); lp_ = nullptr;
-            WSDeinitialize(wsEnv_); wsEnv_ = nullptr;
-            Napi::Error::New(env, s).ThrowAsJavaScriptException();
-            return;
+            if (attempt == 2) {
+                WSClose(lp_); lp_ = nullptr;
+                WSDeinitialize(wsEnv_); wsEnv_ = nullptr;
+                Napi::Error::New(env, s).ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+            continue;
         }
-        // Startup drain: the kernel may send CALLPKT (FrontEnd function calls)
-        // immediately after activation.  If we don't respond, the kernel stalls
-        // and eventually closes the link (WSError=WSECLOSED=11).
-        // Poll for up to 2 s, responding to CALLPKT with ReturnPacket[$Failed]
-        // and discarding other startup packets, stopping once the link is quiet.
+
+        // Startup drain: respond to CALLPKT, discard others, stop when quiet.
         {
             auto startupDl = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             auto quietSince = std::chrono::steady_clock::now();
             int callpktCount = 0, otherCount = 0;
             while (std::chrono::steady_clock::now() < startupDl) {
                 if (!WSReady(lp_)) {
-                    // Link is quiet – stop if quiet for 200 ms or WSError set
                     if (WSError(lp_) != 0) break;
                     if (std::chrono::steady_clock::now() - quietSince >
                             std::chrono::milliseconds(200))
@@ -170,6 +223,7 @@ WstpSession::WstpSession(const Napi::CallbackInfo& info)
                     " other=" + std::to_string(otherCount) +
                     " WSError=" + std::to_string(WSError(lp_)));
         }
+
         DiagLog("[Session] post-activate WSError=" + std::to_string(WSError(lp_)) +
                 " WSReady=" + std::to_string(WSReady(lp_)));
 
@@ -186,9 +240,8 @@ WstpSession::WstpSession(const Napi::CallbackInfo& info)
 
     open_ = true;
     abortFlag_.store(false);
+    return env.Undefined();
 }
-
-WstpSession::~WstpSession() { CleanUp(); }
 
 // ---------------------------------------------------------------------------
 // evaluate(expr, opts?) → Promise<EvalResult>
@@ -1134,7 +1187,7 @@ void WstpSession::StartDynTimer() {
             if (elapsed < ms) {
                 auto remaining = ms - elapsed;
                 std::this_thread::sleep_for(std::chrono::milliseconds(
-                    std::min(remaining, (long long)50)));
+                    std::min<long long>(remaining, 50LL)));
                 continue;
             }
 
